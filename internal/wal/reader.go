@@ -3,7 +3,9 @@ package wal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -32,6 +34,23 @@ type txBuffer struct {
 	commitLSN  pglogrepl.LSN
 	commitTime time.Time
 	events     []*model.WALEvent
+}
+
+type replicationStartFunc func(context.Context, pglogrepl.LSN) error
+type replicationLoopFunc func(context.Context, pglogrepl.LSN, chan<- *model.WALEvent) (pglogrepl.LSN, error)
+
+type fatalReplicationError struct {
+	err error
+}
+
+var jitterRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func (e fatalReplicationError) Error() string {
+	return e.err.Error()
+}
+
+func (e fatalReplicationError) Unwrap() error {
+	return e.err
 }
 
 // Reader streams logical replication changes from PostgreSQL.
@@ -103,6 +122,11 @@ func (r *PGReader) ReadWAL(ctx context.Context, position model.WALPosition) (<-c
 		return nil, fmt.Errorf("replication connection not started")
 	}
 
+	startFn, loopFn, pluginName, err := r.replicationHandlers()
+	if err != nil {
+		return nil, err
+	}
+
 	startLSN := pglogrepl.LSN(0)
 	if position.LSN != "" {
 		if lsn, err := pglogrepl.ParseLSN(position.LSN); err == nil {
@@ -110,16 +134,11 @@ func (r *PGReader) ReadWAL(ctx context.Context, position model.WALPosition) (<-c
 		}
 	}
 
-	switch r.slot.Plugin {
-	case "", "wal2json":
-		r.logger.Info("starting wal2json replication", zap.String("lsn", startLSN.String()))
-		return r.readWal2JSON(ctx, startLSN)
-	case "pgoutput":
-		r.logger.Info("starting pgoutput replication", zap.String("lsn", startLSN.String()), zap.Strings("publications", r.slot.Publications))
-		return r.readPGOutput(ctx, startLSN)
-	default:
-		return nil, fmt.Errorf("unsupported plugin: %s", r.slot.Plugin)
-	}
+	r.logger.Info("starting replication", zap.String("plugin", pluginName), zap.String("lsn", startLSN.String()))
+
+	out := make(chan *model.WALEvent)
+	go r.runReplicationLoop(ctx, startLSN, pluginName, startFn, loopFn, out)
+	return out, nil
 }
 
 func (r *PGReader) GetCurrentPosition(ctx context.Context) (model.WALPosition, error) {
@@ -136,9 +155,77 @@ func (r *PGReader) GetCurrentPosition(ctx context.Context) (model.WALPosition, e
 func (r *PGReader) Stop(ctx context.Context) error {
 	if r.conn != nil {
 		r.logger.Info("stopping replication connection")
-		return r.conn.Close(ctx)
 	}
-	return nil
+	return r.resetConnection(ctx)
+}
+
+func (r *PGReader) replicationHandlers() (replicationStartFunc, replicationLoopFunc, string, error) {
+	switch r.slot.Plugin {
+	case "", "wal2json":
+		return r.startWal2JSON, r.loopWal2JSON, "wal2json", nil
+	case "pgoutput":
+		return r.startPGOutput, r.loopPGOutput, "pgoutput", nil
+	}
+	return nil, nil, "", fmt.Errorf("unsupported plugin: %s", r.slot.Plugin)
+}
+
+func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LSN, plugin string, startFn replicationStartFunc, loopFn replicationLoopFunc, out chan<- *model.WALEvent) {
+	defer close(out)
+
+	resumeLSN := startLSN
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if r.conn == nil {
+			if err := r.Start(ctx); err != nil {
+				if isFatalReplicationError(err) {
+					r.logger.Error("replication connection failed", zap.String("plugin", plugin), zap.Error(err))
+					return
+				}
+				r.logger.Warn("replication connection failed, will retry", zap.String("plugin", plugin), zap.Error(err))
+				backoff = r.sleepWithBackoff(ctx, backoff, maxBackoff)
+				continue
+			}
+		}
+
+		if err := startFn(ctx, resumeLSN); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if isFatalReplicationError(err) {
+				r.logger.Error("replication start failed", zap.String("plugin", plugin), zap.Error(err))
+				return
+			}
+			r.logger.Warn("replication start failed, will retry", zap.String("plugin", plugin), zap.Error(err), zap.String("lsn", resumeLSN.String()))
+			_ = r.resetConnection(ctx)
+			backoff = r.sleepWithBackoff(ctx, backoff, maxBackoff)
+			continue
+		}
+		backoff = time.Second
+
+		lastLSN, err := loopFn(ctx, resumeLSN, out)
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			return
+		}
+		if isFatalReplicationError(err) {
+			r.logger.Error("replication loop stopped due to fatal error", zap.String("plugin", plugin), zap.Error(err))
+			return
+		}
+		if lastLSN != 0 {
+			resumeLSN = lastLSN
+		}
+		r.logger.Warn("replication loop error, reconnecting", zap.String("plugin", plugin), zap.Error(err), zap.String("resume_lsn", resumeLSN.String()))
+		_ = r.resetConnection(ctx)
+		backoff = r.sleepWithBackoff(ctx, backoff, maxBackoff)
+	}
 }
 
 func (r *PGReader) startWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) error {
@@ -156,22 +243,15 @@ func (r *PGReader) startWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) er
 	return nil
 }
 
-func (r *PGReader) readWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) (<-chan *model.WALEvent, error) {
-	if err := r.startWal2JSON(ctx, startLSN); err != nil {
-		return nil, err
-	}
-	out := make(chan *model.WALEvent)
-	go r.loopWal2JSON(ctx, out)
-	return out, nil
-}
-
-func (r *PGReader) loopWal2JSON(ctx context.Context, out chan<- *model.WALEvent) {
-	defer close(out)
-	var lastLSN pglogrepl.LSN
+func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out chan<- *model.WALEvent) (pglogrepl.LSN, error) {
+	lastLSN := startLSN
 	standbyTimeout := 45 * time.Second
 	standbyDeadline := time.Now().Add(standbyTimeout)
 
 	for {
+		if ctx.Err() != nil {
+			return lastLSN, ctx.Err()
+		}
 		msgCtx, cancel := context.WithDeadline(ctx, standbyDeadline)
 		msg, err := r.conn.ReceiveMessage(msgCtx)
 		cancel()
@@ -181,16 +261,14 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, out chan<- *model.WALEvent)
 				continue
 			}
 			if ctx.Err() != nil {
-				return
+				return lastLSN, ctx.Err()
 			}
-			r.logger.Error("replication receive error:", zap.Error(err))
-			return
+			return lastLSN, fmt.Errorf("receive replication message: %w", err)
 		}
 
 		switch m := msg.(type) {
 		case *pgproto3.ErrorResponse:
-			r.logger.Info("replication error response:", zap.Any("error response", m))
-			return
+			return lastLSN, fatalReplicationError{fmt.Errorf("replication error response: %s", m.Message)}
 		case *pgproto3.CopyData:
 			if len(m.Data) == 0 {
 				r.logger.Info("replication copydata empty payload")
@@ -221,7 +299,7 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, out chan<- *model.WALEvent)
 					}
 					select {
 					case <-ctx.Done():
-						return
+						return lastLSN, ctx.Err()
 					case out <- evt:
 					}
 				}
@@ -264,22 +342,15 @@ func (r *PGReader) startPGOutput(ctx context.Context, startLSN pglogrepl.LSN) er
 	return nil
 }
 
-func (r *PGReader) readPGOutput(ctx context.Context, startLSN pglogrepl.LSN) (<-chan *model.WALEvent, error) {
-	if err := r.startPGOutput(ctx, startLSN); err != nil {
-		return nil, err
-	}
-	out := make(chan *model.WALEvent)
-	go r.loopPGOutput(ctx, out)
-	return out, nil
-}
-
-func (r *PGReader) loopPGOutput(ctx context.Context, out chan<- *model.WALEvent) {
-	defer close(out)
-	var lastLSN pglogrepl.LSN
+func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out chan<- *model.WALEvent) (pglogrepl.LSN, error) {
+	lastLSN := startLSN
 	standbyTimeout := 45 * time.Second
 	standbyDeadline := time.Now().Add(standbyTimeout)
 
 	for {
+		if ctx.Err() != nil {
+			return lastLSN, ctx.Err()
+		}
 		msgCtx, cancel := context.WithDeadline(ctx, standbyDeadline)
 		msg, err := r.conn.ReceiveMessage(msgCtx)
 		cancel()
@@ -289,16 +360,14 @@ func (r *PGReader) loopPGOutput(ctx context.Context, out chan<- *model.WALEvent)
 				continue
 			}
 			if ctx.Err() != nil {
-				return
+				return lastLSN, ctx.Err()
 			}
-			r.logger.Warn("replication receive error", zap.Error(err))
-			return
+			return lastLSN, fmt.Errorf("receive replication message: %w", err)
 		}
 
 		switch m := msg.(type) {
 		case *pgproto3.ErrorResponse:
-			r.logger.Warn("replication error response", zap.Any("error", m))
-			return
+			return lastLSN, fatalReplicationError{fmt.Errorf("replication error response: %s", m.Message)}
 		case *pgproto3.CopyData:
 			if len(m.Data) == 0 {
 				continue
@@ -339,6 +408,83 @@ func (r *PGReader) loopPGOutput(ctx context.Context, out chan<- *model.WALEvent)
 			r.logger.Warn("unexpected replication message", zap.String("type", fmt.Sprintf("%T", m)))
 		}
 	}
+}
+
+func (r *PGReader) resetConnection(ctx context.Context) error {
+	if r.conn == nil {
+		r.tx = nil
+		return nil
+	}
+	err := r.conn.Close(ctx)
+	if err != nil {
+		r.logger.Warn("close replication connection failed", zap.Error(err))
+	}
+	r.conn = nil
+	r.tx = nil
+	r.relations = make(map[uint32]relationInfo)
+	r.typeMap = nil
+	return err
+}
+
+func (r *PGReader) sleepWithBackoff(ctx context.Context, backoff, max time.Duration) time.Duration {
+	delay := withJitter(backoff)
+	select {
+	case <-ctx.Done():
+		return backoff
+	case <-time.After(delay):
+	}
+	return nextBackoff(backoff, max)
+}
+
+func isFatalReplicationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var fatal fatalReplicationError
+	if errors.As(err, &fatal) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return isFatalPgError(pgErr)
+	}
+	return false
+}
+
+func isFatalPgError(err *pgconn.PgError) bool {
+	if err == nil {
+		return false
+	}
+	if strings.HasPrefix(err.Code, "28") { // invalid auth
+		return true
+	}
+	switch err.Code {
+	case "42501", // insufficient privilege
+		"42704": // undefined object (e.g., slot missing)
+		return true
+	default:
+		return false
+	}
+}
+
+func nextBackoff(current, max time.Duration) time.Duration {
+	if current <= 0 {
+		return time.Second
+	}
+	next := current * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
+func withJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = time.Second
+	}
+	spread := base / 2
+	extra := time.Duration(jitterRand.Int63n(int64(spread) + 1))
+	return base + extra
 }
 
 // decodeWal2JSON converts wal2json payload into WALEvents (format-version 2).
