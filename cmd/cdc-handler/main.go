@@ -35,14 +35,22 @@ func main() {
 	metricsReporter := metrics.NewReporter(30*time.Second, nil, nil, logger)
 	metricsReporter.Start(ctx)
 
+	tableFilter := buildTableFilter(cfg.TableFilters)
+
 	reader := wal.NewPGReader(wal.SlotConfig{
 		SlotName:     cfg.SlotName,
 		Plugin:       cfg.Plugin,
 		DatabaseURL:  cfg.DatabaseURL,
 		Publications: cfg.Publications,
-		TableFilter:  buildTableFilter(cfg.TableFilters),
+		TableFilter:  tableFilter,
 	}, logger)
-	parse := parser.NewNoopParser()
+	var parse parser.Parser
+	switch cfg.Plugin {
+	case "pgoutput":
+		parse = parser.NewPGOutputParser(parser.PGOutputConfig{TableFilter: tableFilter, Logger: logger})
+	default:
+		parse = parser.NewWal2JSONParser(logger)
+	}
 	trans := transformer.NewSimpleTransformer(cfg.Database)
 	pub := buildPublisher(cfg, logger)
 	store, cleanup := newCheckpointStore(cfg, logger)

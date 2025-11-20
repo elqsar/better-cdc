@@ -3,22 +3,28 @@ package parser
 import (
 	"context"
 
+	"github.com/jackc/pglogrepl"
+
 	"better-cdc/internal/model"
 )
 
-// Parser converts WAL decoding output into structured WALEvents.
+// Plugin enumerates supported logical decoding plugins.
+type Plugin string
+
+const (
+	PluginWal2JSON Plugin = "wal2json"
+	PluginPGOutput Plugin = "pgoutput"
+)
+
+// RawMessage is a single logical decoding message emitted by the WAL reader.
+// It carries the plugin identifier, WAL start LSN, and the raw payload bytes.
+type RawMessage struct {
+	Plugin   Plugin
+	WALStart pglogrepl.LSN
+	Data     []byte
+}
+
+// Parser converts raw logical decoding messages into structured WALEvents.
 type Parser interface {
-	Parse(ctx context.Context, stream <-chan *model.WALEvent) (<-chan *model.WALEvent, error)
-}
-
-// NoopParser passes events through; placeholder while real decoding is added.
-type NoopParser struct{}
-
-func NewNoopParser() *NoopParser {
-	return &NoopParser{}
-}
-
-func (p *NoopParser) Parse(ctx context.Context, stream <-chan *model.WALEvent) (<-chan *model.WALEvent, error) {
-	_ = ctx
-	return stream, nil
+	Parse(ctx context.Context, stream <-chan *RawMessage) (<-chan *model.WALEvent, error)
 }
