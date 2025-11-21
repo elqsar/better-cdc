@@ -43,6 +43,14 @@ func (p *JetStreamPublisher) Connect() error {
 	natsOpts := []nats.Option{
 		nats.Timeout(p.opts.ConnectTimeout),
 		nats.Name("better-cdc-publisher"),
+		nats.MaxReconnects(-1), // Retry forever
+		nats.ReconnectWait(2 * time.Second),
+		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			p.logger.Warn("NATS disconnected", zap.Error(err))
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			p.logger.Info("NATS reconnected", zap.String("url", nc.ConnectedUrl()))
+		}),
 	}
 	if p.opts.Username != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(p.opts.Username, p.opts.Password))
