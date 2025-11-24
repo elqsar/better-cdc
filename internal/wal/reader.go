@@ -26,8 +26,6 @@ type fatalReplicationError struct {
 	err error
 }
 
-var jitterRand = rand.New(rand.NewSource(time.Now().UnixNano()))
-
 func (e fatalReplicationError) Error() string {
 	return e.err.Error()
 }
@@ -67,7 +65,7 @@ func NewPGReader(slot SlotConfig, logger *zap.Logger) *PGReader {
 	}
 	return &PGReader{
 		slot:   slot,
-		errs:   metrics.NewCounter("decode_errors"),
+		errs:   metrics.NewCounter("replication_errors"),
 		logger: logger,
 	}
 }
@@ -271,11 +269,13 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 				}
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, false); err != nil {
+					r.errs.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
 				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(m.Data[1:])
 				if err != nil {
+					r.errs.Inc()
 					r.logger.Warn("parse keepalive failed", zap.Error(err))
 					continue
 				}
@@ -284,6 +284,7 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 				}
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, pkm.ReplyRequested); err != nil {
+					r.errs.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			default:
@@ -359,11 +360,13 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 				}
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, false); err != nil {
+					r.errs.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
 				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(m.Data[1:])
 				if err != nil {
+					r.errs.Inc()
 					r.logger.Warn("parse keepalive failed", zap.Error(err))
 					continue
 				}
@@ -372,6 +375,7 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 				}
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, pkm.ReplyRequested); err != nil {
+					r.errs.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			default:
@@ -452,7 +456,7 @@ func withJitter(base time.Duration) time.Duration {
 		base = time.Second
 	}
 	spread := base / 2
-	extra := time.Duration(jitterRand.Int63n(int64(spread) + 1))
+	extra := time.Duration(rand.Int63n(int64(spread) + 1))
 	return base + extra
 }
 
