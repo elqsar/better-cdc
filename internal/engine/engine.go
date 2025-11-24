@@ -77,47 +77,27 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 	timer := time.NewTimer(e.batchTimeout)
 	defer timer.Stop()
 
+	// Check if publisher supports batch operations for high throughput
+	batchPub, hasBatch := e.publisher.(publisher.BatchPublisher)
+	if hasBatch {
+		e.logger.Info("batch publisher detected, using async batch publishing")
+	}
+
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
 		e.logger.Debug("flushing batch", zap.Int("count", len(batch)))
 
-		// Capture last event before processing to safely check for commit boundary.
 		last := batch[len(batch)-1]
 
-		// Flush preserves ordering within a batch; commit markers should align with WAL boundaries.
-		for _, evt := range batch {
-			if evt.Begin || evt.Commit {
-				continue
-			}
-			cdcEvt, err := e.transformer.Transform(ctx, evt)
-			if err != nil {
-				return fmt.Errorf("transform event: %w", err)
-			}
-			subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
-			if err != nil {
-				return fmt.Errorf("build subject: %w", err)
-			}
-			payload, err := json.Marshal(cdcEvt)
-			if err != nil {
-				return fmt.Errorf("marshal event: %w", err)
-			}
-			if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3); err != nil {
-				return fmt.Errorf("publish: %w", err)
-			}
-			e.logger.Debug("published event", zap.String("subject", subject), zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
+		var err error
+		if hasBatch {
+			err = e.flushWithBatchPublish(ctx, batch, last, batchPub)
+		} else {
+			err = e.flushSequential(ctx, batch, last)
 		}
 
-		// Checkpoint only on commit boundaries to ensure transactional consistency.
-		// Events published before a commit may be re-delivered on restart, which is
-		// acceptable for at-least-once semantics; consumers must handle idempotency.
-		if last.Commit {
-			if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
-				return fmt.Errorf("checkpoint: %w", err)
-			}
-			e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
-		}
 		batch = batch[:0]
 		if !timer.Stop() {
 			select {
@@ -126,7 +106,7 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			}
 		}
 		timer.Reset(e.batchTimeout)
-		return nil
+		return err
 	}
 
 	for {
@@ -155,4 +135,124 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			}
 		}
 	}
+}
+
+// flushWithBatchPublish uses async batch publishing with collected acks for high throughput.
+func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent, batchPub publisher.BatchPublisher) error {
+	// Phase 1: Transform and prepare all items
+	items := make([]publisher.PublishItem, 0, len(batch))
+
+	for _, evt := range batch {
+		if evt.Begin || evt.Commit {
+			continue
+		}
+
+		cdcEvt, err := e.transformer.Transform(ctx, evt)
+		if err != nil {
+			return fmt.Errorf("transform event: %w", err)
+		}
+
+		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
+		if err != nil {
+			return fmt.Errorf("build subject: %w", err)
+		}
+
+		payload, err := json.Marshal(cdcEvt)
+		if err != nil {
+			return fmt.Errorf("marshal event: %w", err)
+		}
+
+		items = append(items, publisher.PublishItem{
+			Subject:  subject,
+			Data:     payload,
+			EventID:  cdcEvt.EventID,
+			TxID:     evt.TxID,
+			Position: evt.Position,
+		})
+	}
+
+	if len(items) == 0 {
+		// Only BEGIN/COMMIT markers, still checkpoint if needed
+		if last.Commit {
+			if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
+				return fmt.Errorf("checkpoint: %w", err)
+			}
+			e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
+		}
+		return nil
+	}
+
+	// Phase 2: Publish all items asynchronously
+	pending, err := batchPub.PublishBatchAsync(ctx, items)
+	if err != nil {
+		return fmt.Errorf("batch publish: %w", err)
+	}
+
+	// Phase 3: Wait for all acks before checkpointing
+	timeout := e.publishTimeout()
+	acked, err := batchPub.WaitForAcks(ctx, pending, timeout)
+	if err != nil {
+		e.logger.Error("batch ack failures",
+			zap.Error(err),
+			zap.Int("acked", acked),
+			zap.Int("total", len(pending)))
+		return fmt.Errorf("batch ack: %w", err)
+	}
+
+	e.logger.Debug("batch published",
+		zap.Int("count", len(items)),
+		zap.Int("acked", acked))
+
+	// Phase 4: Checkpoint only on commit boundaries
+	if last.Commit {
+		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
+			return fmt.Errorf("checkpoint: %w", err)
+		}
+		e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
+	}
+
+	return nil
+}
+
+// flushSequential is the original sequential publish logic (fallback).
+func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent) error {
+	for _, evt := range batch {
+		if evt.Begin || evt.Commit {
+			continue
+		}
+		cdcEvt, err := e.transformer.Transform(ctx, evt)
+		if err != nil {
+			return fmt.Errorf("transform event: %w", err)
+		}
+		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
+		if err != nil {
+			return fmt.Errorf("build subject: %w", err)
+		}
+		payload, err := json.Marshal(cdcEvt)
+		if err != nil {
+			return fmt.Errorf("marshal event: %w", err)
+		}
+		if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3); err != nil {
+			return fmt.Errorf("publish: %w", err)
+		}
+		e.logger.Debug("published event", zap.String("subject", subject), zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
+	}
+
+	// Checkpoint only on commit boundaries to ensure transactional consistency.
+	if last.Commit {
+		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
+			return fmt.Errorf("checkpoint: %w", err)
+		}
+		e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
+	}
+	return nil
+}
+
+// publishTimeout returns the timeout for waiting on batch acks.
+func (e *Engine) publishTimeout() time.Duration {
+	timeout := e.batchTimeout * 3
+	if timeout < 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	return timeout
 }

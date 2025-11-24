@@ -43,13 +43,22 @@ func main() {
 		DatabaseURL:  cfg.DatabaseURL,
 		Publications: cfg.Publications,
 		TableFilter:  tableFilter,
-	}, logger)
+	}, cfg.RawMessageBufferSize, logger)
+
 	var parse parser.Parser
 	switch cfg.Plugin {
 	case "pgoutput":
-		parse = parser.NewPGOutputParser(parser.PGOutputConfig{TableFilter: tableFilter, Logger: logger})
+		parse = parser.NewPGOutputParser(parser.PGOutputConfig{
+			TableFilter: tableFilter,
+			Logger:      logger,
+			BufferSize:  cfg.ParsedEventBufferSize,
+		})
 	default:
-		parse = parser.NewWal2JSONParser(parser.Wal2JSONConfig{TableFilter: tableFilter, Logger: logger})
+		parse = parser.NewWal2JSONParser(parser.Wal2JSONConfig{
+			TableFilter: tableFilter,
+			Logger:      logger,
+			BufferSize:  cfg.ParsedEventBufferSize,
+		})
 	}
 	trans := transformer.NewSimpleTransformer(cfg.Database)
 	pub := buildPublisher(cfg, logger)
@@ -57,7 +66,14 @@ func main() {
 	defer cleanup()
 	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
 
-	logger.Info("starting better-cdc", zap.Bool("debug", cfg.Debug), zap.String("slot", cfg.SlotName), zap.Strings("publications", cfg.Publications), zap.String("db", cfg.Database), zap.String("plugin", cfg.Plugin))
+	logger.Info("starting better-cdc",
+		zap.Bool("debug", cfg.Debug),
+		zap.String("slot", cfg.SlotName),
+		zap.Strings("publications", cfg.Publications),
+		zap.String("db", cfg.Database),
+		zap.String("plugin", cfg.Plugin),
+		zap.Int("raw_buffer", cfg.RawMessageBufferSize),
+		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize))
 
 	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, logger)
 

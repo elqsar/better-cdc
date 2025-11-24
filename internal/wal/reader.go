@@ -53,20 +53,22 @@ type SlotConfig struct {
 
 // PGReader streams logical replication; supports wal2json (today) and leaves a hook for pgoutput.
 type PGReader struct {
-	slot   SlotConfig
-	conn   *pgconn.PgConn
-	errs   *metrics.Counter
-	logger *zap.Logger
+	slot       SlotConfig
+	conn       *pgconn.PgConn
+	errs       *metrics.Counter
+	logger     *zap.Logger
+	bufferSize int // Output channel buffer size for throughput optimization
 }
 
-func NewPGReader(slot SlotConfig, logger *zap.Logger) *PGReader {
+func NewPGReader(slot SlotConfig, bufferSize int, logger *zap.Logger) *PGReader {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	return &PGReader{
-		slot:   slot,
-		errs:   metrics.NewCounter("replication_errors"),
-		logger: logger,
+		slot:       slot,
+		errs:       metrics.NewCounter("replication_errors"),
+		logger:     logger,
+		bufferSize: bufferSize,
 	}
 }
 
@@ -108,9 +110,12 @@ func (r *PGReader) ReadWAL(ctx context.Context, position model.WALPosition) (<-c
 		}
 	}
 
-	r.logger.Info("starting replication", zap.String("plugin", pluginName), zap.String("lsn", startLSN.String()))
+	r.logger.Info("starting replication",
+		zap.String("plugin", pluginName),
+		zap.String("lsn", startLSN.String()),
+		zap.Int("buffer_size", r.bufferSize))
 
-	out := make(chan *parser.RawMessage)
+	out := make(chan *parser.RawMessage, r.bufferSize)
 	go r.runReplicationLoop(ctx, startLSN, pluginName, startFn, loopFn, out)
 	return out, nil
 }

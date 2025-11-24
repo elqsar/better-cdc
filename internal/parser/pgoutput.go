@@ -33,6 +33,7 @@ type txBuffer struct {
 type PGOutputConfig struct {
 	TableFilter map[string]struct{} // schema.table allowlist; empty means all
 	Logger      *zap.Logger
+	BufferSize  int // Output channel buffer size for throughput optimization
 }
 
 // PGOutputParser decodes pgoutput plugin messages into WALEvents.
@@ -44,6 +45,7 @@ type PGOutputParser struct {
 	logger      *zap.Logger
 	lagGauge    *metrics.Gauge
 	errs        *metrics.Counter
+	bufferSize  int
 }
 
 func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
@@ -58,11 +60,12 @@ func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
 		logger:      logger,
 		lagGauge:    metrics.NewGauge("replication_lag_ms"),
 		errs:        metrics.NewCounter("decode_errors"),
+		bufferSize:  cfg.BufferSize,
 	}
 }
 
 func (p *PGOutputParser) Parse(ctx context.Context, stream <-chan *RawMessage) (<-chan *model.WALEvent, error) {
-	out := make(chan *model.WALEvent)
+	out := make(chan *model.WALEvent, p.bufferSize)
 	go func() {
 		defer close(out)
 		for {

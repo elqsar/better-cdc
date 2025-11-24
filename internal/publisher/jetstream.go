@@ -7,16 +7,21 @@ import (
 	"strings"
 	"time"
 
+	"better-cdc/internal/metrics"
+
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
 // JetStreamPublisher publishes messages to NATS JetStream with ack handling.
+// Implements both Publisher and BatchPublisher interfaces.
 type JetStreamPublisher struct {
-	opts   JetStreamOptions
-	nc     *nats.Conn
-	js     nats.JetStreamContext
-	logger *zap.Logger
+	opts         JetStreamOptions
+	nc           *nats.Conn
+	js           nats.JetStreamContext
+	logger       *zap.Logger
+	publishedCnt *metrics.Counter
+	ackFailCnt   *metrics.Counter
 }
 
 type JetStreamOptions struct {
@@ -33,7 +38,12 @@ func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStream
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &JetStreamPublisher{opts: opts, logger: logger}
+	return &JetStreamPublisher{
+		opts:         opts,
+		logger:       logger,
+		publishedCnt: metrics.NewCounter("jetstream_published"),
+		ackFailCnt:   metrics.NewCounter("jetstream_ack_failures"),
+	}
 }
 
 func (p *JetStreamPublisher) Connect() error {
@@ -175,4 +185,106 @@ func (p *JetStreamPublisher) streamName() string {
 		return p.opts.StreamName
 	}
 	return "CDC"
+}
+
+// PublishBatchAsync sends multiple messages asynchronously without waiting for acks.
+// Returns immediately with pending acks to monitor.
+func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []PublishItem) ([]*PendingAck, error) {
+	if p.js == nil {
+		return nil, fmt.Errorf("jetstream not connected")
+	}
+
+	pending := make([]*PendingAck, 0, len(items))
+
+	for _, item := range items {
+		select {
+		case <-ctx.Done():
+			return pending, ctx.Err()
+		default:
+		}
+
+		pend := &PendingAck{
+			Subject: item.Subject,
+			EventID: item.EventID,
+			TxID:    item.TxID,
+			done:    make(chan struct{}),
+		}
+
+		pa, err := p.js.PublishAsync(item.Subject, item.Data)
+		if err != nil {
+			pend.Err = err
+			close(pend.done)
+			pending = append(pending, pend)
+			p.ackFailCnt.Inc()
+			continue
+		}
+
+		pending = append(pending, pend)
+
+		// Launch goroutine to await this specific ack
+		go func(pend *PendingAck, pa nats.PubAckFuture, subject string) {
+			defer close(pend.done)
+			select {
+			case <-ctx.Done():
+				pend.Err = ctx.Err()
+				p.ackFailCnt.Inc()
+			case ack := <-pa.Ok():
+				if ack != nil {
+					pend.Acked = true
+					p.publishedCnt.Inc()
+					p.logger.Debug("async ack received",
+						zap.String("subject", subject),
+						zap.Uint64("seq", ack.Sequence))
+				} else {
+					pend.Err = fmt.Errorf("nil ack")
+					p.ackFailCnt.Inc()
+				}
+			case err := <-pa.Err():
+				pend.Err = err
+				p.ackFailCnt.Inc()
+			case <-time.After(p.publishTimeout()):
+				pend.Err = fmt.Errorf("ack timeout")
+				p.ackFailCnt.Inc()
+			}
+		}(pend, pa, item.Subject)
+	}
+
+	return pending, nil
+}
+
+// WaitForAcks blocks until all pending acks are resolved or timeout.
+// Returns the count of successful acks and first error encountered.
+func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*PendingAck, timeout time.Duration) (int, error) {
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	successCount := 0
+	var firstErr error
+
+	for _, pend := range pending {
+		select {
+		case <-ctx.Done():
+			return successCount, ctx.Err()
+		case <-deadline.C:
+			// Count what we have so far
+			for _, pa := range pending {
+				if pa.Acked {
+					successCount++
+				}
+			}
+			return successCount, fmt.Errorf("timeout waiting for acks: %d/%d resolved", successCount, len(pending))
+		case <-pend.done:
+			if pend.Acked {
+				successCount++
+			} else if pend.Err != nil && firstErr == nil {
+				firstErr = pend.Err
+			}
+		}
+	}
+
+	return successCount, firstErr
 }

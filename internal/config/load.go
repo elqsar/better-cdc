@@ -91,6 +91,16 @@ func Load() Config {
 	if v := strings.ToLower(os.Getenv("DEBUG")); v == "1" || v == "true" || v == "yes" {
 		cfg.Debug = true
 	}
+	if v := os.Getenv("RAW_MESSAGE_BUFFER_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
+			cfg.RawMessageBufferSize = i
+		}
+	}
+	if v := os.Getenv("PARSED_EVENT_BUFFER_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
+			cfg.ParsedEventBufferSize = i
+		}
+	}
 
 	return cfg
 }

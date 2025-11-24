@@ -17,6 +17,7 @@ import (
 type Wal2JSONConfig struct {
 	TableFilter map[string]struct{} // schema.table allowlist; empty means all
 	Logger      *zap.Logger
+	BufferSize  int // Output channel buffer size for throughput optimization
 }
 
 // Wal2JSONParser decodes wal2json plugin output into WALEvents.
@@ -25,6 +26,7 @@ type Wal2JSONParser struct {
 	logger      *zap.Logger
 	lagGauge    *metrics.Gauge
 	errs        *metrics.Counter
+	bufferSize  int
 }
 
 func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
@@ -37,11 +39,12 @@ func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
 		logger:      logger,
 		lagGauge:    metrics.NewGauge("replication_lag_ms"),
 		errs:        metrics.NewCounter("decode_errors"),
+		bufferSize:  cfg.BufferSize,
 	}
 }
 
 func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (<-chan *model.WALEvent, error) {
-	out := make(chan *model.WALEvent)
+	out := make(chan *model.WALEvent, p.bufferSize)
 	go func() {
 		defer close(out)
 		for {
