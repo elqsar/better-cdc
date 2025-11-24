@@ -49,7 +49,7 @@ func main() {
 	case "pgoutput":
 		parse = parser.NewPGOutputParser(parser.PGOutputConfig{TableFilter: tableFilter, Logger: logger})
 	default:
-		parse = parser.NewWal2JSONParser(logger)
+		parse = parser.NewWal2JSONParser(parser.Wal2JSONConfig{TableFilter: tableFilter, Logger: logger})
 	}
 	trans := transformer.NewSimpleTransformer(cfg.Database)
 	pub := buildPublisher(cfg, logger)

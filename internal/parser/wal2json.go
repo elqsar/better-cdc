@@ -13,21 +13,30 @@ import (
 	"better-cdc/internal/model"
 )
 
-// Wal2JSONParser decodes wal2json plugin output into WALEvents.
-type Wal2JSONParser struct {
-	logger   *zap.Logger
-	lagGauge *metrics.Gauge
-	errs     *metrics.Counter
+// Wal2JSONConfig configures wal2json parsing.
+type Wal2JSONConfig struct {
+	TableFilter map[string]struct{} // schema.table allowlist; empty means all
+	Logger      *zap.Logger
 }
 
-func NewWal2JSONParser(logger *zap.Logger) *Wal2JSONParser {
+// Wal2JSONParser decodes wal2json plugin output into WALEvents.
+type Wal2JSONParser struct {
+	tableFilter map[string]struct{}
+	logger      *zap.Logger
+	lagGauge    *metrics.Gauge
+	errs        *metrics.Counter
+}
+
+func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
+	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	return &Wal2JSONParser{
-		logger:   logger,
-		lagGauge: metrics.NewGauge("replication_lag_ms"),
-		errs:     metrics.NewCounter("decode_errors"),
+		tableFilter: cfg.TableFilter,
+		logger:      logger,
+		lagGauge:    metrics.NewGauge("replication_lag_ms"),
+		errs:        metrics.NewCounter("decode_errors"),
 	}
 }
 
@@ -49,7 +58,7 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				if msg.Plugin != PluginWal2JSON && msg.Plugin != "" {
 					continue
 				}
-				events, err := decodeWal2JSON(uint64(msg.WALStart), msg.Data)
+				events, err := decodeWal2JSON(uint64(msg.WALStart), msg.Data, p.tableFilter)
 				if err != nil {
 					p.errs.Inc()
 					p.logger.Warn("decode wal2json failed", zap.Error(err))
@@ -75,29 +84,38 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 }
 
 // decodeWal2JSON converts wal2json payload into WALEvents (format-version 2).
-func decodeWal2JSON(walStart uint64, data []byte) ([]*model.WALEvent, error) {
+func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{}) ([]*model.WALEvent, error) {
 	var envelope wal2JSONEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, fmt.Errorf("unmarshal wal2json: %w", err)
 	}
 	var events []*model.WALEvent
+	position := model.WALPosition{LSN: pglogrepl.LSN(walStart).String()}
+	txID := fmt.Sprintf("%d", envelope.XID)
+
 	beginEvt := &model.WALEvent{
 		Begin:         true,
-		Position:      model.WALPosition{LSN: pglogrepl.LSN(walStart).String()},
-		LSN:           pglogrepl.LSN(walStart).String(),
-		TransactionID: fmt.Sprintf("%d", envelope.XID),
+		Position:      position,
+		LSN:           position.LSN,
+		TransactionID: txID,
 		TxID:          uint64(envelope.XID),
 	}
 	events = append(events, beginEvt)
 
 	var lastEvent *model.WALEvent
 	for _, ch := range envelope.Change {
+		if len(tableFilter) > 0 {
+			tableKey := ch.Schema + "." + ch.Table
+			if _, ok := tableFilter[tableKey]; !ok {
+				continue
+			}
+		}
 		ev := &model.WALEvent{
-			Position:      model.WALPosition{LSN: pglogrepl.LSN(walStart).String()},
+			Position:      position,
 			Timestamp:     envelope.Timestamp,
 			CommitTime:    envelope.Timestamp,
-			TransactionID: fmt.Sprintf("%d", envelope.XID),
-			LSN:           pglogrepl.LSN(walStart).String(),
+			TransactionID: txID,
+			LSN:           position.LSN,
 			TxID:          uint64(envelope.XID),
 			Schema:        ch.Schema,
 			Table:         ch.Table,
@@ -119,17 +137,20 @@ func decodeWal2JSON(walStart uint64, data []byte) ([]*model.WALEvent, error) {
 		events = append(events, ev)
 		lastEvent = ev
 	}
+
+	commitLSN := position.LSN
 	if lastEvent != nil {
-		commitEvt := &model.WALEvent{
-			Commit:        true,
-			Position:      model.WALPosition{LSN: lastEvent.Position.LSN},
-			LSN:           lastEvent.Position.LSN,
-			CommitTime:    envelope.Timestamp,
-			TransactionID: fmt.Sprintf("%d", envelope.XID),
-			TxID:          uint64(envelope.XID),
-		}
-		events = append(events, commitEvt)
+		commitLSN = lastEvent.Position.LSN
 	}
+	commitEvt := &model.WALEvent{
+		Commit:        true,
+		Position:      model.WALPosition{LSN: commitLSN},
+		LSN:           commitLSN,
+		CommitTime:    envelope.Timestamp,
+		TransactionID: txID,
+		TxID:          uint64(envelope.XID),
+	}
+	events = append(events, commitEvt)
 	return events, nil
 }
 
