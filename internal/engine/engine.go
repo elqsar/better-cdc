@@ -12,6 +12,7 @@ import (
 	"better-cdc/internal/publisher"
 	"better-cdc/internal/transformer"
 	"better-cdc/internal/wal"
+
 	"go.uber.org/zap"
 )
 
@@ -81,6 +82,10 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			return nil
 		}
 		e.logger.Debug("flushing batch", zap.Int("count", len(batch)))
+
+		// Capture last event before processing to safely check for commit boundary.
+		last := batch[len(batch)-1]
+
 		// Flush preserves ordering within a batch; commit markers should align with WAL boundaries.
 		for _, evt := range batch {
 			if evt.Begin || evt.Commit {
@@ -103,9 +108,11 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			}
 			e.logger.Debug("published event", zap.String("subject", subject), zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
 		}
-		last := batch[len(batch)-1]
+
+		// Checkpoint only on commit boundaries to ensure transactional consistency.
+		// Events published before a commit may be re-delivered on restart, which is
+		// acceptable for at-least-once semantics; consumers must handle idempotency.
 		if last.Commit {
-			// Only checkpoint on commit boundary.
 			if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
 				return fmt.Errorf("checkpoint: %w", err)
 			}
@@ -125,10 +132,10 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 	for {
 		select {
 		case <-ctx.Done():
-			return flushOrErr(flush)
+			return flush()
 		case evt, ok := <-stream:
 			if !ok {
-				return flushOrErr(flush)
+				return flush()
 			}
 			batch = append(batch, evt)
 			if evt.Commit {
@@ -148,11 +155,4 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			}
 		}
 	}
-}
-
-func flushOrErr(flush func() error) error {
-	if err := flush(); err != nil {
-		return err
-	}
-	return nil
 }
