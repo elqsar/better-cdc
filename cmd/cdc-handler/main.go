@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -22,6 +23,10 @@ import (
 )
 
 func main() {
+	// Enable block and mutex profiling for contention analysis
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+
 	cfg := config.Load()
 	logger, err := logging.New(cfg.Debug)
 	if err != nil {

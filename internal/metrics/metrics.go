@@ -85,3 +85,110 @@ func (r *Reporter) Start(ctx context.Context) {
 		}
 	}()
 }
+
+// RateCounter tracks events/second with a sliding window.
+type RateCounter struct {
+	count     uint64
+	lastCount uint64
+	lastTime  time.Time
+	rate      float64
+	desc      string
+}
+
+func NewRateCounter(desc string) *RateCounter {
+	return &RateCounter{desc: desc, lastTime: time.Now()}
+}
+
+func (r *RateCounter) Inc() {
+	atomic.AddUint64(&r.count, 1)
+}
+
+func (r *RateCounter) Add(n uint64) {
+	atomic.AddUint64(&r.count, n)
+}
+
+func (r *RateCounter) Total() uint64 {
+	return atomic.LoadUint64(&r.count)
+}
+
+// Rate calculates and returns the current rate (events/second).
+// Call this periodically; it updates the rate based on time since last call.
+func (r *RateCounter) Rate() float64 {
+	now := time.Now()
+	current := atomic.LoadUint64(&r.count)
+	elapsed := now.Sub(r.lastTime).Seconds()
+
+	if elapsed >= 1.0 {
+		r.rate = float64(current-r.lastCount) / elapsed
+		r.lastCount = current
+		r.lastTime = now
+	}
+	return r.rate
+}
+
+func (r *RateCounter) Desc() string {
+	return r.desc
+}
+
+// Histogram tracks value distributions with predefined buckets.
+type Histogram struct {
+	buckets []uint64 // bucket boundaries
+	counts  []uint64 // count per bucket (len = len(buckets) + 1 for overflow)
+	sum     uint64
+	count   uint64
+	desc    string
+}
+
+// NewHistogram creates a histogram with the given bucket boundaries.
+// Values <= buckets[i] go into counts[i].
+// Values > buckets[len-1] go into the overflow bucket.
+func NewHistogram(desc string, buckets []uint64) *Histogram {
+	return &Histogram{
+		desc:    desc,
+		buckets: buckets,
+		counts:  make([]uint64, len(buckets)+1),
+	}
+}
+
+func (h *Histogram) Observe(value uint64) {
+	atomic.AddUint64(&h.sum, value)
+	atomic.AddUint64(&h.count, 1)
+
+	for i, boundary := range h.buckets {
+		if value <= boundary {
+			atomic.AddUint64(&h.counts[i], 1)
+			return
+		}
+	}
+	// Overflow bucket
+	atomic.AddUint64(&h.counts[len(h.buckets)], 1)
+}
+
+func (h *Histogram) Mean() float64 {
+	count := atomic.LoadUint64(&h.count)
+	if count == 0 {
+		return 0
+	}
+	return float64(atomic.LoadUint64(&h.sum)) / float64(count)
+}
+
+func (h *Histogram) Count() uint64 {
+	return atomic.LoadUint64(&h.count)
+}
+
+func (h *Histogram) Sum() uint64 {
+	return atomic.LoadUint64(&h.sum)
+}
+
+func (h *Histogram) Desc() string {
+	return h.desc
+}
+
+// Buckets returns bucket boundaries and counts for inspection.
+func (h *Histogram) Buckets() (boundaries []uint64, counts []uint64) {
+	counts = make([]uint64, len(h.counts))
+	for i := range h.counts {
+		counts[i] = atomic.LoadUint64(&h.counts[i])
+	}
+	return h.buckets, counts
+}

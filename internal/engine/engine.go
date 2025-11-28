@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"better-cdc/internal/checkpoint"
+	"better-cdc/internal/metrics"
 	"better-cdc/internal/model"
 	"better-cdc/internal/parser"
 	"better-cdc/internal/publisher"
@@ -27,6 +28,12 @@ type Engine struct {
 	batchSize    int
 	batchTimeout time.Duration
 	logger       *zap.Logger
+
+	// Throughput metrics
+	eventsProcessed  *metrics.RateCounter
+	batchesPublished *metrics.Counter
+	batchLatency     *metrics.Histogram
+	transformLatency *metrics.Histogram
 }
 
 func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, logger *zap.Logger) *Engine {
@@ -43,6 +50,11 @@ func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.
 		batchSize:    batchSize,
 		batchTimeout: batchTimeout,
 		logger:       logger,
+		// Initialize throughput metrics
+		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
+		batchesPublished: metrics.NewCounter("batches_published"),
+		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000, 5000, 10000, 50000}),
+		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000, 5000, 10000}),
 	}
 }
 
@@ -139,6 +151,8 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 
 // flushWithBatchPublish uses async batch publishing with collected acks for high throughput.
 func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent, batchPub publisher.BatchPublisher) error {
+	batchStart := time.Now()
+
 	// Phase 1: Transform and prepare all items
 	items := make([]publisher.PublishItem, 0, len(batch))
 
@@ -147,7 +161,9 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 			continue
 		}
 
+		transformStart := time.Now()
 		cdcEvt, err := e.transformer.Transform(ctx, evt)
+		e.transformLatency.Observe(uint64(time.Since(transformStart).Nanoseconds()))
 		if err != nil {
 			return fmt.Errorf("transform event: %w", err)
 		}
@@ -203,6 +219,11 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		zap.Int("count", len(items)),
 		zap.Int("acked", acked))
 
+	// Record metrics
+	e.eventsProcessed.Add(uint64(len(items)))
+	e.batchesPublished.Inc()
+	e.batchLatency.Observe(uint64(time.Since(batchStart).Microseconds()))
+
 	// Phase 4: Checkpoint only on commit boundaries
 	if last.Commit {
 		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
@@ -255,4 +276,24 @@ func (e *Engine) publishTimeout() time.Duration {
 		timeout = 5 * time.Second
 	}
 	return timeout
+}
+
+// EngineMetrics contains throughput metrics for external access.
+type EngineMetrics struct {
+	EventsPerSecond       float64
+	EventsTotal           uint64
+	BatchesPublished      uint64
+	BatchLatencyMeanUs    float64
+	TransformLatencyMeanNs float64
+}
+
+// Metrics returns current throughput metrics.
+func (e *Engine) Metrics() EngineMetrics {
+	return EngineMetrics{
+		EventsPerSecond:       e.eventsProcessed.Rate(),
+		EventsTotal:           e.eventsProcessed.Total(),
+		BatchesPublished:      e.batchesPublished.Value(),
+		BatchLatencyMeanUs:    e.batchLatency.Mean(),
+		TransformLatencyMeanNs: e.transformLatency.Mean(),
+	}
 }
