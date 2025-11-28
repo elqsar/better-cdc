@@ -59,11 +59,14 @@ type Engine struct {
 	batchTimeout time.Duration
 	logger       *zap.Logger
 
-	// Throughput metrics
+	// Throughput metrics (legacy, kept for backward compatibility)
 	eventsProcessed  *metrics.RateCounter
 	batchesPublished *metrics.Counter
 	batchLatency     *metrics.Histogram
 	transformLatency *metrics.Histogram
+
+	// Prometheus metrics
+	promMetrics *metrics.Metrics
 }
 
 func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, logger *zap.Logger) *Engine {
@@ -80,11 +83,13 @@ func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.
 		batchSize:    batchSize,
 		batchTimeout: batchTimeout,
 		logger:       logger,
-		// Initialize throughput metrics
+		// Initialize throughput metrics (legacy)
 		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
 		batchesPublished: metrics.NewCounter("batches_published"),
 		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000, 5000, 10000, 50000}),
 		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000, 5000, 10000}),
+		// Use global Prometheus metrics
+		promMetrics: metrics.GlobalMetrics,
 	}
 }
 
@@ -194,7 +199,9 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 		transformStart := time.Now()
 		cdcEvt, err := e.transformer.Transform(ctx, evt)
-		e.transformLatency.Observe(uint64(time.Since(transformStart).Nanoseconds()))
+		transformLatencyNs := uint64(time.Since(transformStart).Nanoseconds())
+		e.transformLatency.Observe(transformLatencyNs)
+		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
 		if err != nil {
 			// Release any already-transformed events on error
 			for _, e := range cdcEvents {
@@ -266,10 +273,17 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		zap.Int("count", len(items)),
 		zap.Int("acked", acked))
 
-	// Record metrics
+	// Record metrics (legacy)
 	e.eventsProcessed.Add(uint64(len(items)))
 	e.batchesPublished.Inc()
-	e.batchLatency.Observe(uint64(time.Since(batchStart).Microseconds()))
+	batchLatencyUs := uint64(time.Since(batchStart).Microseconds())
+	e.batchLatency.Observe(batchLatencyUs)
+
+	// Record Prometheus metrics
+	e.promMetrics.EventsTotal.Add(uint64(len(items)))
+	e.promMetrics.BatchesPublished.Inc()
+	e.promMetrics.BatchLatency.Observe(batchLatencyUs)
+	e.promMetrics.EventsPerSecond.Set(int64(e.eventsProcessed.Rate()))
 
 	// Phase 4: Checkpoint only on commit boundaries
 	if last.Commit {

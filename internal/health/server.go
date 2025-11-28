@@ -2,23 +2,12 @@ package health
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/pprof"
-	"sync/atomic"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
-
-// MetricsProvider is a function that returns current metrics as key-value pairs.
-type MetricsProvider func() map[string]interface{}
-
-var globalMetricsProvider atomic.Value
-
-// SetMetricsProvider sets the global metrics provider for the /metrics endpoint.
-func SetMetricsProvider(provider MetricsProvider) {
-	globalMetricsProvider.Store(provider)
-}
 
 // Start launches a simple health endpoint at the given address.
 func Start(ctx context.Context, addr string, logger *zap.Logger) {
@@ -47,37 +36,8 @@ func Start(ctx context.Context, addr string, logger *zap.Logger) {
 	mux.Handle("/debug/pprof/block", pprof.Handler("block"))
 	mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
 
-	// Metrics endpoint
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-
-		provider := globalMetricsProvider.Load()
-		if provider == nil {
-			fmt.Fprintln(w, "# No metrics provider configured")
-			return
-		}
-
-		metricsFunc, ok := provider.(MetricsProvider)
-		if !ok {
-			fmt.Fprintln(w, "# Invalid metrics provider")
-			return
-		}
-
-		metrics := metricsFunc()
-		fmt.Fprintln(w, "# CDC Handler Metrics")
-		for key, value := range metrics {
-			switch v := value.(type) {
-			case float64:
-				fmt.Fprintf(w, "%s %.6f\n", key, v)
-			case uint64:
-				fmt.Fprintf(w, "%s %d\n", key, v)
-			case int64:
-				fmt.Fprintf(w, "%s %d\n", key, v)
-			default:
-				fmt.Fprintf(w, "%s %v\n", key, v)
-			}
-		}
-	})
+	// Prometheus metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:    addr,

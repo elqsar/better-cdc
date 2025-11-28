@@ -6,14 +6,12 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
-	"time"
 
 	"better-cdc/internal/checkpoint"
 	"better-cdc/internal/config"
 	"better-cdc/internal/engine"
 	"better-cdc/internal/health"
 	"better-cdc/internal/logging"
-	"better-cdc/internal/metrics"
 	"better-cdc/internal/parser"
 	"better-cdc/internal/publisher"
 	"better-cdc/internal/transformer"
@@ -37,8 +35,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	health.Start(ctx, cfg.HealthAddr, logger)
-	metricsReporter := metrics.NewReporter(30*time.Second, nil, nil, logger)
-	metricsReporter.Start(ctx)
+	logger.Info("prometheus metrics available", zap.String("endpoint", cfg.HealthAddr+"/metrics"))
 
 	tableFilter := buildTableFilter(cfg.TableFilters)
 

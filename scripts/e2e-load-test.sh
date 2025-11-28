@@ -319,12 +319,20 @@ select_operation() {
     fi
 }
 
-# Generate batch SQL
+# Generate batch SQL - writes SQL to temp file and returns count info
+# Args: max_ops sql_file
+# Returns: "ops_count:inserts:updates:deletes" via stdout
 generate_batch_sql() {
-    local batch_sql="BEGIN;"
+    local max_ops=$1
+    local sql_file=$2
     local ops_in_batch=0
+    local batch_inserts=0
+    local batch_updates=0
+    local batch_deletes=0
 
-    while [[ $ops_in_batch -lt $BATCH_SIZE ]] && [[ $TOTAL_DONE -lt $TOTAL_OPS ]]; do
+    echo "BEGIN;" > "$sql_file"
+
+    while [[ $ops_in_batch -lt $max_ops ]]; do
         local roll=$((RANDOM % 100))
         local table_roll=$((RANDOM % 100))
 
@@ -337,15 +345,15 @@ generate_batch_sql() {
                 cents=$(random_cents)
                 local status
                 status=$(random_order_status)
-                batch_sql+=$'\n'"INSERT INTO orders (account_id, total_cents, status) VALUES ($account_id, $cents, '$status');"
+                echo "INSERT INTO orders (account_id, total_cents, status) VALUES ($account_id, $cents, '$status');" >> "$sql_file"
             else
                 local email
                 email=$(random_email)
                 local status
                 status=$(random_account_status)
-                batch_sql+=$'\n'"INSERT INTO accounts (email, status) VALUES ('$email', '$status');"
+                echo "INSERT INTO accounts (email, status) VALUES ('$email', '$status');" >> "$sql_file"
             fi
-            ((INSERTS++))
+            ((batch_inserts++))
         elif [[ $roll -lt $((INSERT_RATIO + UPDATE_RATIO)) ]]; then
             # UPDATE
             if [[ $table_roll -lt $ORDER_RATIO ]] && [[ ${#ORDER_IDS[@]} -gt 0 ]]; then
@@ -355,59 +363,52 @@ generate_batch_sql() {
                 cents=$(random_cents)
                 local status
                 status=$(random_order_status)
-                batch_sql+=$'\n'"UPDATE orders SET total_cents = $cents, status = '$status', updated_at = now() WHERE id = $order_id;"
+                echo "UPDATE orders SET total_cents = $cents, status = '$status', updated_at = now() WHERE id = $order_id;" >> "$sql_file"
+                ((batch_updates++))
             elif [[ ${#ACCOUNT_IDS[@]} -gt 0 ]]; then
                 local account_id
                 account_id=$(random_account_id)
                 local status
                 status=$(random_account_status)
-                batch_sql+=$'\n'"UPDATE accounts SET status = '$status', updated_at = now() WHERE id = $account_id;"
+                echo "UPDATE accounts SET status = '$status', updated_at = now() WHERE id = $account_id;" >> "$sql_file"
+                ((batch_updates++))
             else
                 local email
                 email=$(random_email)
                 local status
                 status=$(random_account_status)
-                batch_sql+=$'\n'"INSERT INTO accounts (email, status) VALUES ('$email', '$status');"
-                ((INSERTS++))
-                ((ops_in_batch++))
-                ((TOTAL_DONE++))
-                continue
+                echo "INSERT INTO accounts (email, status) VALUES ('$email', '$status');" >> "$sql_file"
+                ((batch_inserts++))
             fi
-            ((UPDATES++))
         else
             # DELETE
             if [[ $table_roll -lt $ORDER_RATIO ]] && [[ ${#ORDER_IDS[@]} -gt 0 ]]; then
                 local order_id
                 order_id=$(random_order_id)
-                batch_sql+=$'\n'"DELETE FROM orders WHERE id = $order_id;"
-                remove_order_id "$order_id"
+                echo "DELETE FROM orders WHERE id = $order_id;" >> "$sql_file"
+                ((batch_deletes++))
             elif [[ ${#ACCOUNT_IDS[@]} -gt 1 ]]; then
                 # Keep at least one account for order inserts
                 local account_id
                 account_id=$(random_account_id)
-                batch_sql+=$'\n'"DELETE FROM orders WHERE account_id = $account_id;"
-                batch_sql+=$'\n'"DELETE FROM accounts WHERE id = $account_id;"
-                remove_account_id "$account_id"
+                echo "DELETE FROM orders WHERE account_id = $account_id;" >> "$sql_file"
+                echo "DELETE FROM accounts WHERE id = $account_id;" >> "$sql_file"
+                ((batch_deletes++))
             else
                 local email
                 email=$(random_email)
                 local status
                 status=$(random_account_status)
-                batch_sql+=$'\n'"INSERT INTO accounts (email, status) VALUES ('$email', '$status');"
-                ((INSERTS++))
-                ((ops_in_batch++))
-                ((TOTAL_DONE++))
-                continue
+                echo "INSERT INTO accounts (email, status) VALUES ('$email', '$status');" >> "$sql_file"
+                ((batch_inserts++))
             fi
-            ((DELETES++))
         fi
 
         ((ops_in_batch++))
-        ((TOTAL_DONE++))
     done
 
-    batch_sql+=$'\n'"COMMIT;"
-    echo "$batch_sql"
+    echo "COMMIT;" >> "$sql_file"
+    echo "$ops_in_batch:$batch_inserts:$batch_updates:$batch_deletes"
 }
 
 # Pre-seed accounts for FK constraints
@@ -491,10 +492,32 @@ main() {
 
     if [[ "$BATCH_MODE" == "true" ]]; then
         log_info "Running in BATCH mode..."
+        local sql_file
+        sql_file=$(mktemp)
+        trap "rm -f $sql_file" EXIT
+
         while [[ $TOTAL_DONE -lt $TOTAL_OPS ]]; do
-            local batch_sql
-            batch_sql=$(generate_batch_sql)
-            exec_sql_batch "$batch_sql" > /dev/null 2>&1 || true
+            # Calculate how many ops for this batch
+            local remaining=$((TOTAL_OPS - TOTAL_DONE))
+            local batch_count=$BATCH_SIZE
+            [[ $remaining -lt $batch_count ]] && batch_count=$remaining
+
+            # Generate batch - returns counts, writes SQL to temp file
+            local counts
+            counts=$(generate_batch_sql "$batch_count" "$sql_file")
+
+            # Parse counts (ops:inserts:updates:deletes)
+            local ops_count ins_count upd_count del_count
+            IFS=':' read -r ops_count ins_count upd_count del_count <<< "$counts"
+
+            # Execute the batch from file
+            $PSQL_CMD < "$sql_file" > /dev/null 2>&1 || true
+
+            # Update counters in parent shell
+            ((TOTAL_DONE += ops_count))
+            ((INSERTS += ins_count))
+            ((UPDATES += upd_count))
+            ((DELETES += del_count))
 
             # Refresh IDs periodically (every 10 batches)
             if [[ $((TOTAL_DONE % (BATCH_SIZE * 10))) -eq 0 ]]; then
@@ -510,13 +533,20 @@ main() {
         done
     else
         log_info "Running in SINGLE operation mode..."
+        # Calculate progress interval (at least every 1% or every 50 ops, whichever is smaller)
+        local progress_interval=$((TOTAL_OPS / 100))
+        [[ $progress_interval -lt 1 ]] && progress_interval=1
+        [[ $progress_interval -gt 50 ]] && progress_interval=50
+
         while [[ $TOTAL_DONE -lt $TOTAL_OPS ]]; do
             select_operation
             ((TOTAL_DONE++))
 
-            # Print progress every 100 ops
-            [[ $((TOTAL_DONE % 100)) -eq 0 ]] && print_progress
+            # Print progress at calculated interval
+            [[ $((TOTAL_DONE % progress_interval)) -eq 0 ]] && print_progress
         done
+        # Final progress update
+        print_progress
     fi
 
     echo

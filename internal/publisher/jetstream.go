@@ -22,6 +22,7 @@ type JetStreamPublisher struct {
 	logger       *zap.Logger
 	publishedCnt *metrics.Counter
 	ackFailCnt   *metrics.Counter
+	promMetrics  *metrics.Metrics
 }
 
 type JetStreamOptions struct {
@@ -43,6 +44,7 @@ func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStream
 		logger:       logger,
 		publishedCnt: metrics.NewCounter("jetstream_published"),
 		ackFailCnt:   metrics.NewCounter("jetstream_ack_failures"),
+		promMetrics:  metrics.GlobalMetrics,
 	}
 }
 
@@ -216,6 +218,7 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 			close(pend.done)
 			pending = append(pending, pend)
 			p.ackFailCnt.Inc()
+			p.promMetrics.JetstreamAckFailure.Inc()
 			continue
 		}
 
@@ -228,23 +231,28 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 			case <-ctx.Done():
 				pend.Err = ctx.Err()
 				p.ackFailCnt.Inc()
+				p.promMetrics.JetstreamAckFailure.Inc()
 			case ack := <-pa.Ok():
 				if ack != nil {
 					pend.Acked = true
 					p.publishedCnt.Inc()
+					p.promMetrics.JetstreamPublished.Inc()
 					p.logger.Debug("async ack received",
 						zap.String("subject", subject),
 						zap.Uint64("seq", ack.Sequence))
 				} else {
 					pend.Err = fmt.Errorf("nil ack")
 					p.ackFailCnt.Inc()
+					p.promMetrics.JetstreamAckFailure.Inc()
 				}
 			case err := <-pa.Err():
 				pend.Err = err
 				p.ackFailCnt.Inc()
+				p.promMetrics.JetstreamAckFailure.Inc()
 			case <-time.After(p.publishTimeout()):
 				pend.Err = fmt.Errorf("ack timeout")
 				p.ackFailCnt.Inc()
+				p.promMetrics.JetstreamAckFailure.Inc()
 			}
 		}(pend, pa, item.Subject)
 	}

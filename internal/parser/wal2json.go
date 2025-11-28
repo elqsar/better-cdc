@@ -27,6 +27,7 @@ type Wal2JSONParser struct {
 	lagGauge    *metrics.Gauge
 	errs        *metrics.Counter
 	bufferSize  int
+	promMetrics *metrics.Metrics
 }
 
 func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
@@ -40,6 +41,7 @@ func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
 		lagGauge:    metrics.NewGauge("replication_lag_ms"),
 		errs:        metrics.NewCounter("decode_errors"),
 		bufferSize:  cfg.BufferSize,
+		promMetrics: metrics.GlobalMetrics,
 	}
 }
 
@@ -64,12 +66,15 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				events, err := decodeWal2JSON(uint64(msg.WALStart), msg.Data, p.tableFilter)
 				if err != nil {
 					p.errs.Inc()
+					p.promMetrics.DecodeErrors.Inc()
 					p.logger.Warn("decode wal2json failed", zap.Error(err))
 					continue
 				}
 				for _, evt := range events {
 					if !evt.CommitTime.IsZero() {
-						p.lagGauge.Set(time.Since(evt.CommitTime).Milliseconds())
+						lag := time.Since(evt.CommitTime).Milliseconds()
+						p.lagGauge.Set(lag)
+						p.promMetrics.ReplicationLag.Set(lag)
 					}
 					if p.logger != nil {
 						p.logger.Debug("wal2json event", zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
@@ -191,7 +196,7 @@ func (t *pgTime) UnmarshalJSON(data []byte) error {
 // wal2JSONMessageV2 matches wal2json format-version 2 output.
 // Each message is a separate JSON object with an action field.
 type wal2JSONMessageV2 struct {
-	Action    string           `json:"action"`   // B=Begin, C=Commit, I=Insert, U=Update, D=Delete, T=Truncate
+	Action    string           `json:"action"` // B=Begin, C=Commit, I=Insert, U=Update, D=Delete, T=Truncate
 	XID       int64            `json:"xid"`
 	Timestamp pgTime           `json:"timestamp"`
 	Schema    string           `json:"schema,omitempty"`

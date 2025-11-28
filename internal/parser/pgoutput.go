@@ -46,6 +46,7 @@ type PGOutputParser struct {
 	lagGauge    *metrics.Gauge
 	errs        *metrics.Counter
 	bufferSize  int
+	promMetrics *metrics.Metrics
 }
 
 func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
@@ -61,6 +62,7 @@ func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
 		lagGauge:    metrics.NewGauge("replication_lag_ms"),
 		errs:        metrics.NewCounter("decode_errors"),
 		bufferSize:  cfg.BufferSize,
+		promMetrics: metrics.GlobalMetrics,
 	}
 }
 
@@ -85,6 +87,7 @@ func (p *PGOutputParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				logical, err := pglogrepl.Parse(msg.Data)
 				if err != nil {
 					p.errs.Inc()
+					p.promMetrics.DecodeErrors.Inc()
 					p.logger.Warn("parse pgoutput message failed", zap.Error(err))
 					continue
 				}
@@ -139,6 +142,7 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		if !m.CommitTime.IsZero() {
 			lag := time.Since(m.CommitTime).Milliseconds()
 			p.lagGauge.Set(lag)
+			p.promMetrics.ReplicationLag.Set(lag)
 		}
 		for _, evt := range p.tx.events {
 			evt.CommitTime = p.tx.commitTime
@@ -285,6 +289,7 @@ func (p *PGOutputParser) decodeColumn(oid uint32, data []byte) interface{} {
 		val, err := dt.Codec.DecodeValue(p.typeMap, oid, pgtype.TextFormatCode, data)
 		if err != nil {
 			p.errs.Inc()
+			p.promMetrics.DecodeErrors.Inc()
 			p.logger.Error("decode column error", zap.Error(err), zap.Uint32("oid", oid))
 			return string(data)
 		}

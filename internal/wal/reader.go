@@ -53,11 +53,12 @@ type SlotConfig struct {
 
 // PGReader streams logical replication; supports wal2json (today) and leaves a hook for pgoutput.
 type PGReader struct {
-	slot       SlotConfig
-	conn       *pgconn.PgConn
-	errs       *metrics.Counter
-	logger     *zap.Logger
-	bufferSize int // Output channel buffer size for throughput optimization
+	slot        SlotConfig
+	conn        *pgconn.PgConn
+	errs        *metrics.Counter
+	logger      *zap.Logger
+	bufferSize  int // Output channel buffer size for throughput optimization
+	promMetrics *metrics.Metrics
 }
 
 func NewPGReader(slot SlotConfig, bufferSize int, logger *zap.Logger) *PGReader {
@@ -65,10 +66,11 @@ func NewPGReader(slot SlotConfig, bufferSize int, logger *zap.Logger) *PGReader 
 		logger = zap.NewNop()
 	}
 	return &PGReader{
-		slot:       slot,
-		errs:       metrics.NewCounter("replication_errors"),
-		logger:     logger,
-		bufferSize: bufferSize,
+		slot:        slot,
+		errs:        metrics.NewCounter("replication_errors"),
+		logger:      logger,
+		bufferSize:  bufferSize,
+		promMetrics: metrics.GlobalMetrics,
 	}
 }
 
@@ -259,6 +261,7 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 				xld, err := pglogrepl.ParseXLogData(m.Data[1:])
 				if err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("parse xlog data failed", zap.Error(err))
 					continue
 				}
@@ -279,12 +282,14 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, false); err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
 				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(m.Data[1:])
 				if err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("parse keepalive failed", zap.Error(err))
 					continue
 				}
@@ -294,6 +299,7 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, pkm.ReplyRequested); err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			default:
@@ -353,6 +359,7 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 				xld, err := pglogrepl.ParseXLogData(m.Data[1:])
 				if err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("parse xlog data failed", zap.Error(err))
 					continue
 				}
@@ -373,12 +380,14 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, false); err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
 				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(m.Data[1:])
 				if err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("parse keepalive failed", zap.Error(err))
 					continue
 				}
@@ -388,6 +397,7 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 				standbyDeadline = time.Now().Add(standbyTimeout)
 				if err := r.sendStandbyStatus(ctx, lastLSN, pkm.ReplyRequested); err != nil {
 					r.errs.Inc()
+					r.promMetrics.ReplicationErrors.Inc()
 					r.logger.Warn("send standby status failed", zap.Error(err))
 				}
 			default:
