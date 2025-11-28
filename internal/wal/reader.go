@@ -209,8 +209,9 @@ func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LS
 
 func (r *PGReader) startWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) error {
 	pluginArgs := []string{
-		"\"pretty-print\" '0'",
-		"\"write-in-chunks\" '1'",
+		"\"pretty-print\" 'false'",
+		"\"include-xids\" 'true'",
+		"\"include-timestamp\" 'true'",
 		"\"format-version\" '2'",
 	}
 
@@ -262,10 +263,13 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 					continue
 				}
 				lastLSN = xld.WALStart
+				// Copy data to avoid race condition - pglogrepl reuses the buffer
+				dataCopy := make([]byte, len(xld.WALData))
+				copy(dataCopy, xld.WALData)
 				raw := &parser.RawMessage{
 					Plugin:   parser.PluginWal2JSON,
 					WALStart: xld.WALStart,
-					Data:     xld.WALData,
+					Data:     dataCopy,
 				}
 				select {
 				case <-ctx.Done():
@@ -353,10 +357,13 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 					continue
 				}
 				lastLSN = xld.WALStart
+				// Copy data to avoid race condition - pglogrepl reuses the buffer
+				dataCopy := make([]byte, len(xld.WALData))
+				copy(dataCopy, xld.WALData)
 				raw := &parser.RawMessage{
 					Plugin:   parser.PluginPGOutput,
 					WALStart: xld.WALStart,
-					Data:     xld.WALData,
+					Data:     dataCopy,
 				}
 				select {
 				case <-ctx.Done():

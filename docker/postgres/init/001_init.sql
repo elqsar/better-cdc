@@ -1,5 +1,7 @@
 -- Base schema and replication setup for local CDC testing.
 -- Requires Postgres to be started with wal_level=logical (set in docker-compose).
+DROP TABLE IF EXISTS public.orders;
+DROP TABLE IF EXISTS public.accounts;
 
 -- Create dedicated roles for replication and app access.
 DO $$
@@ -45,14 +47,15 @@ ON CONFLICT DO NOTHING;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO cdc_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO cdc_app;
 
--- Publication for pgoutput; matches default config.Publications.
+-- Publication for logical replication; matches default config.Publications.
 DROP PUBLICATION IF EXISTS better_cdc_pub;
 CREATE PUBLICATION better_cdc_pub FOR TABLE public.accounts, public.orders;
 
 -- Logical replication slot used by the Go CDC reader.
+-- Using wal2json plugin by default (avoids pglogrepl TupleData.Decode bug).
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'better_cdc_slot') THEN
-        PERFORM pg_create_logical_replication_slot('better_cdc_slot', 'pgoutput');
+        PERFORM pg_create_logical_replication_slot('better_cdc_slot', 'wal2json');
     END IF;
 END$$;

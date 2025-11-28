@@ -35,7 +35,7 @@ func DefaultConfig() Config {
 	return Config{
 		Database:              "postgres",
 		SlotName:              "better_cdc_slot",
-		Plugin:                "pgoutput",
+		Plugin:                "wal2json",
 		DatabaseURL:           "postgres://postgres:postgres@localhost:5432/postgres",
 		BatchSize:             500,
 		BatchTimeout:          100 * time.Millisecond,

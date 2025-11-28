@@ -2,65 +2,111 @@ package parser
 
 import (
 	"testing"
-	"time"
 )
 
-// Sample wal2json payload for benchmarking
-var sampleWal2JSONInsert = []byte(`{
+// Sample wal2json format-version 2 payloads for benchmarking
+
+var sampleWal2JSONV2Begin = []byte(`{
+	"action": "B",
 	"xid": 12345,
-	"timestamp": "2024-01-15T10:30:00.123456Z",
-	"change": [{
-		"kind": "insert",
-		"schema": "public",
-		"table": "users",
-		"columnnames": ["id", "name", "email", "created_at", "is_active"],
-		"columnvalues": [1, "Test User", "test@example.com", "2024-01-15T10:30:00Z", true]
-	}]
+	"timestamp": "2024-01-15 10:30:00.123456+00"
 }`)
 
-var sampleWal2JSONUpdate = []byte(`{
-	"xid": 12346,
-	"timestamp": "2024-01-15T10:31:00.123456Z",
-	"change": [{
-		"kind": "update",
-		"schema": "public",
-		"table": "users",
-		"columnnames": ["id", "name", "email", "updated_at"],
-		"columnvalues": [1, "Updated User", "updated@example.com", "2024-01-15T10:31:00Z"],
-		"oldkeys": {
-			"keynames": ["id"],
-			"keyvalues": [1]
-		}
-	}]
-}`)
-
-var sampleWal2JSONMultiChange = []byte(`{
-	"xid": 12347,
-	"timestamp": "2024-01-15T10:32:00.123456Z",
-	"change": [
-		{"kind": "insert", "schema": "public", "table": "users", "columnnames": ["id", "name"], "columnvalues": [1, "User 1"]},
-		{"kind": "insert", "schema": "public", "table": "users", "columnnames": ["id", "name"], "columnvalues": [2, "User 2"]},
-		{"kind": "insert", "schema": "public", "table": "users", "columnnames": ["id", "name"], "columnvalues": [3, "User 3"]},
-		{"kind": "insert", "schema": "public", "table": "users", "columnnames": ["id", "name"], "columnvalues": [4, "User 4"]},
-		{"kind": "insert", "schema": "public", "table": "users", "columnnames": ["id", "name"], "columnvalues": [5, "User 5"]}
+var sampleWal2JSONV2Insert = []byte(`{
+	"action": "I",
+	"xid": 12345,
+	"timestamp": "2024-01-15 10:30:00.123456+00",
+	"schema": "public",
+	"table": "users",
+	"columns": [
+		{"name": "id", "type": "bigint", "value": 1},
+		{"name": "name", "type": "text", "value": "Test User"},
+		{"name": "email", "type": "text", "value": "test@example.com"},
+		{"name": "created_at", "type": "timestamp with time zone", "value": "2024-01-15 10:30:00+00"},
+		{"name": "is_active", "type": "boolean", "value": true}
 	]
 }`)
 
-var sampleWal2JSONLarge = generateLargeWal2JSON()
+var sampleWal2JSONV2Update = []byte(`{
+	"action": "U",
+	"xid": 12346,
+	"timestamp": "2024-01-15 10:31:00.123456+00",
+	"schema": "public",
+	"table": "users",
+	"columns": [
+		{"name": "id", "type": "bigint", "value": 1},
+		{"name": "name", "type": "text", "value": "Updated User"},
+		{"name": "email", "type": "text", "value": "updated@example.com"},
+		{"name": "updated_at", "type": "timestamp with time zone", "value": "2024-01-15 10:31:00+00"}
+	],
+	"identity": [
+		{"name": "id", "type": "bigint", "value": 1}
+	]
+}`)
 
-func generateLargeWal2JSON() []byte {
-	// Generate a wal2json payload with 20 columns
+var sampleWal2JSONV2Delete = []byte(`{
+	"action": "D",
+	"xid": 12347,
+	"timestamp": "2024-01-15 10:32:00.123456+00",
+	"schema": "public",
+	"table": "users",
+	"identity": [
+		{"name": "id", "type": "bigint", "value": 1}
+	]
+}`)
+
+var sampleWal2JSONV2Commit = []byte(`{
+	"action": "C",
+	"xid": 12345,
+	"timestamp": "2024-01-15 10:30:00.123456+00"
+}`)
+
+var sampleWal2JSONV2Large = generateLargeWal2JSONV2()
+
+func generateLargeWal2JSONV2() []byte {
+	// Generate a wal2json format-version 2 payload with 20 columns
 	return []byte(`{
+		"action": "I",
 		"xid": 12348,
-		"timestamp": "2024-01-15T10:33:00.123456Z",
-		"change": [{
-			"kind": "insert",
-			"schema": "public",
-			"table": "large_table",
-			"columnnames": ["col1", "col2", "col3", "col4", "col5", "col6", "col7", "col8", "col9", "col10", "col11", "col12", "col13", "col14", "col15", "col16", "col17", "col18", "col19", "col20"],
-			"columnvalues": ["value1", "value2", "value3", "value4", "value5", "value6", "value7", "value8", "value9", "value10", "value11", "value12", "value13", "value14", "value15", "value16", "value17", "value18", "value19", "value20"]
-		}]
+		"timestamp": "2024-01-15 10:33:00.123456+00",
+		"schema": "public",
+		"table": "large_table",
+		"columns": [
+			{"name": "col1", "type": "text", "value": "value1"},
+			{"name": "col2", "type": "text", "value": "value2"},
+			{"name": "col3", "type": "text", "value": "value3"},
+			{"name": "col4", "type": "text", "value": "value4"},
+			{"name": "col5", "type": "text", "value": "value5"},
+			{"name": "col6", "type": "text", "value": "value6"},
+			{"name": "col7", "type": "text", "value": "value7"},
+			{"name": "col8", "type": "text", "value": "value8"},
+			{"name": "col9", "type": "text", "value": "value9"},
+			{"name": "col10", "type": "text", "value": "value10"},
+			{"name": "col11", "type": "text", "value": "value11"},
+			{"name": "col12", "type": "text", "value": "value12"},
+			{"name": "col13", "type": "text", "value": "value13"},
+			{"name": "col14", "type": "text", "value": "value14"},
+			{"name": "col15", "type": "text", "value": "value15"},
+			{"name": "col16", "type": "text", "value": "value16"},
+			{"name": "col17", "type": "text", "value": "value17"},
+			{"name": "col18", "type": "text", "value": "value18"},
+			{"name": "col19", "type": "text", "value": "value19"},
+			{"name": "col20", "type": "text", "value": "value20"}
+		]
 	}`)
+}
+
+// BenchmarkDecodeWal2JSONBegin benchmarks decoding a begin message
+func BenchmarkDecodeWal2JSONBegin(b *testing.B) {
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Begin, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 // BenchmarkDecodeWal2JSONInsert benchmarks decoding a single insert
@@ -69,33 +115,46 @@ func BenchmarkDecodeWal2JSONInsert(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONInsert, nil)
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Insert, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkDecodeWal2JSONUpdate benchmarks decoding an update with old keys
+// BenchmarkDecodeWal2JSONUpdate benchmarks decoding an update with identity
 func BenchmarkDecodeWal2JSONUpdate(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONUpdate, nil)
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Update, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkDecodeWal2JSONMultiChange benchmarks decoding multiple changes in one transaction
-func BenchmarkDecodeWal2JSONMultiChange(b *testing.B) {
+// BenchmarkDecodeWal2JSONDelete benchmarks decoding a delete
+func BenchmarkDecodeWal2JSONDelete(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONMultiChange, nil)
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Delete, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDecodeWal2JSONCommit benchmarks decoding a commit message
+func BenchmarkDecodeWal2JSONCommit(b *testing.B) {
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Commit, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -108,7 +167,7 @@ func BenchmarkDecodeWal2JSONLarge(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONLarge, nil)
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Large, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -125,7 +184,7 @@ func BenchmarkDecodeWal2JSONWithFilter(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONInsert, filter)
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Insert, filter)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -142,35 +201,43 @@ func BenchmarkDecodeWal2JSONFilteredOut(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONInsert, filter)
+		_, err := decodeWal2JSON(0x16B3748, sampleWal2JSONV2Insert, filter)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkToMap benchmarks the toMap helper function
-func BenchmarkToMap(b *testing.B) {
-	keys := []string{"id", "name", "email", "created_at", "updated_at", "is_active", "balance"}
-	vals := []interface{}{1, "Test User", "test@example.com", time.Now(), time.Now(), true, 123.45}
+// BenchmarkColumnsToMap benchmarks the columnsToMap helper function
+func BenchmarkColumnsToMap(b *testing.B) {
+	cols := []wal2JSONColumn{
+		{Name: "id", Type: "bigint", Value: 1},
+		{Name: "name", Type: "text", Value: "Test User"},
+		{Name: "email", Type: "text", Value: "test@example.com"},
+		{Name: "created_at", Type: "timestamp with time zone", Value: "2024-01-15 10:30:00+00"},
+		{Name: "updated_at", Type: "timestamp with time zone", Value: "2024-01-15 10:30:00+00"},
+		{Name: "is_active", Type: "boolean", Value: true},
+		{Name: "balance", Type: "numeric", Value: 123.45},
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_ = toMap(keys, vals)
+		_ = columnsToMap(cols)
 	}
 }
 
-// BenchmarkToMapSmall benchmarks toMap with small inputs
-func BenchmarkToMapSmall(b *testing.B) {
-	keys := []string{"id"}
-	vals := []interface{}{1}
+// BenchmarkColumnsToMapSmall benchmarks columnsToMap with small inputs
+func BenchmarkColumnsToMapSmall(b *testing.B) {
+	cols := []wal2JSONColumn{
+		{Name: "id", Type: "bigint", Value: 1},
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_ = toMap(keys, vals)
+		_ = columnsToMap(cols)
 	}
 }

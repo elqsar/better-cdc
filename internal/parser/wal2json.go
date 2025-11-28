@@ -86,105 +86,135 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 	return out, nil
 }
 
-// decodeWal2JSON converts wal2json payload into WALEvents (format-version 2).
+// decodeWal2JSON converts wal2json format-version 2 message into a WALEvent.
+// Format v2 sends separate messages per action (B=Begin, C=Commit, I=Insert, U=Update, D=Delete).
 func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{}) ([]*model.WALEvent, error) {
-	var envelope wal2JSONEnvelope
-	if err := json.Unmarshal(data, &envelope); err != nil {
+	var msg wal2JSONMessageV2
+	if err := json.Unmarshal(data, &msg); err != nil {
 		return nil, fmt.Errorf("unmarshal wal2json: %w", err)
 	}
-	var events []*model.WALEvent
-	position := model.WALPosition{LSN: pglogrepl.LSN(walStart).String()}
-	txID := fmt.Sprintf("%d", envelope.XID)
 
-	beginEvt := &model.WALEvent{
-		Begin:         true,
+	position := model.WALPosition{LSN: pglogrepl.LSN(walStart).String()}
+	txID := fmt.Sprintf("%d", msg.XID)
+
+	evt := &model.WALEvent{
 		Position:      position,
 		LSN:           position.LSN,
+		Timestamp:     msg.Timestamp.Time,
+		CommitTime:    msg.Timestamp.Time,
 		TransactionID: txID,
-		TxID:          uint64(envelope.XID),
+		TxID:          uint64(msg.XID),
+		Schema:        msg.Schema,
+		Table:         msg.Table,
 	}
-	events = append(events, beginEvt)
 
-	var lastEvent *model.WALEvent
-	for _, ch := range envelope.Change {
+	switch msg.Action {
+	case "B": // Begin
+		evt.Begin = true
+	case "C": // Commit
+		evt.Commit = true
+	case "I": // Insert
 		if len(tableFilter) > 0 {
-			tableKey := ch.Schema + "." + ch.Table
-			if _, ok := tableFilter[tableKey]; !ok {
-				continue
+			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
+				return nil, nil // Filtered out
 			}
 		}
-		ev := &model.WALEvent{
-			Position:      position,
-			Timestamp:     envelope.Timestamp,
-			CommitTime:    envelope.Timestamp,
-			TransactionID: txID,
-			LSN:           position.LSN,
-			TxID:          uint64(envelope.XID),
-			Schema:        ch.Schema,
-			Table:         ch.Table,
+		evt.Operation = model.OperationInsert
+		evt.NewValues = columnsToMap(msg.Columns)
+	case "U": // Update
+		if len(tableFilter) > 0 {
+			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
+				return nil, nil
+			}
 		}
-		switch ch.Kind {
-		case "insert":
-			ev.Operation = model.OperationInsert
-			ev.NewValues = toMap(ch.ColumnNames, ch.ColumnValues)
-		case "update":
-			ev.Operation = model.OperationUpdate
-			ev.OldValues = toMap(ch.OldKeys.KeyNames, ch.OldKeys.KeyValues)
-			ev.NewValues = toMap(ch.ColumnNames, ch.ColumnValues)
-		case "delete":
-			ev.Operation = model.OperationDelete
-			ev.OldValues = toMap(ch.OldKeys.KeyNames, ch.OldKeys.KeyValues)
-		default:
-			ev.Operation = model.OperationType(ch.Kind)
+		evt.Operation = model.OperationUpdate
+		evt.NewValues = columnsToMap(msg.Columns)
+		evt.OldValues = columnsToMap(msg.Identity)
+	case "D": // Delete
+		if len(tableFilter) > 0 {
+			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
+				return nil, nil
+			}
 		}
-		events = append(events, ev)
-		lastEvent = ev
+		evt.Operation = model.OperationDelete
+		evt.OldValues = columnsToMap(msg.Identity)
+	case "T": // Truncate
+		if len(tableFilter) > 0 {
+			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
+				return nil, nil
+			}
+		}
+		evt.Operation = model.OperationDDL
+	default:
+		return nil, nil // Unknown action, skip
 	}
 
-	commitLSN := position.LSN
-	if lastEvent != nil {
-		commitLSN = lastEvent.Position.LSN
-	}
-	commitEvt := &model.WALEvent{
-		Commit:        true,
-		Position:      model.WALPosition{LSN: commitLSN},
-		LSN:           commitLSN,
-		CommitTime:    envelope.Timestamp,
-		TransactionID: txID,
-		TxID:          uint64(envelope.XID),
-	}
-	events = append(events, commitEvt)
-	return events, nil
+	return []*model.WALEvent{evt}, nil
 }
 
-// wal2JSONEnvelope matches wal2json format version 2 output.
-type wal2JSONEnvelope struct {
-	XID       int64            `json:"xid"`
-	Timestamp time.Time        `json:"timestamp"`
-	Change    []wal2JSONChange `json:"change"`
+// pgTime handles PostgreSQL timestamp format (space separator instead of T).
+type pgTime struct {
+	time.Time
 }
 
-type wal2JSONChange struct {
-	Kind         string        `json:"kind"`
-	Schema       string        `json:"schema"`
-	Table        string        `json:"table"`
-	ColumnNames  []string      `json:"columnnames"`
-	ColumnValues []interface{} `json:"columnvalues"`
-	OldKeys      wal2JSONKeys  `json:"oldkeys"`
-}
-
-type wal2JSONKeys struct {
-	KeyNames  []string      `json:"keynames"`
-	KeyValues []interface{} `json:"keyvalues"`
-}
-
-func toMap(keys []string, vals []interface{}) map[string]interface{} {
-	if len(keys) == 0 || len(vals) == 0 || len(keys) != len(vals) {
+func (t *pgTime) UnmarshalJSON(data []byte) error {
+	// Remove quotes
+	s := string(data)
+	if len(s) < 2 {
 		return nil
 	}
-	m := make(map[string]interface{}, len(keys))
-	for i, k := range keys {
-		m[k] = vals[i]
+	s = s[1 : len(s)-1]
+	if s == "" || s == "null" {
+		return nil
+	}
+
+	// Try RFC3339 first, then PostgreSQL format
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999-07",
+		"2006-01-02 15:04:05.999999+00",
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05+00",
+	}
+
+	var err error
+	for _, format := range formats {
+		t.Time, err = time.Parse(format, s)
+		if err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("cannot parse timestamp %q", s)
+}
+
+// wal2JSONMessageV2 matches wal2json format-version 2 output.
+// Each message is a separate JSON object with an action field.
+type wal2JSONMessageV2 struct {
+	Action    string           `json:"action"`   // B=Begin, C=Commit, I=Insert, U=Update, D=Delete, T=Truncate
+	XID       int64            `json:"xid"`
+	Timestamp pgTime           `json:"timestamp"`
+	Schema    string           `json:"schema,omitempty"`
+	Table     string           `json:"table,omitempty"`
+	Columns   []wal2JSONColumn `json:"columns,omitempty"`  // New values for I/U
+	Identity  []wal2JSONColumn `json:"identity,omitempty"` // Old key values for U/D
+}
+
+// wal2JSONColumn represents a column in format-version 2.
+type wal2JSONColumn struct {
+	Name  string      `json:"name"`
+	Type  string      `json:"type"`
+	Value interface{} `json:"value"`
+}
+
+// columnsToMap converts format-version 2 columns array to a map.
+func columnsToMap(cols []wal2JSONColumn) map[string]interface{} {
+	if len(cols) == 0 {
+		return nil
+	}
+	m := make(map[string]interface{}, len(cols))
+	for _, col := range cols {
+		m[col.Name] = col.Value
 	}
 	return m
 }
