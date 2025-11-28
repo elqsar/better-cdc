@@ -3,6 +3,7 @@ package publisher
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"better-cdc/internal/model"
@@ -92,5 +93,14 @@ func SubjectForEvent(database string, evt *model.CDCEvent) (string, error) {
 	if evt == nil {
 		return "", fmt.Errorf("nil event")
 	}
-	return fmt.Sprintf("cdc.%s.%s.%s", database, evt.Schema, evt.Table), nil
+	// Use strings.Builder to avoid fmt.Sprintf allocation
+	var sb strings.Builder
+	sb.Grow(len("cdc.") + len(database) + 1 + len(evt.Schema) + 1 + len(evt.Table))
+	sb.WriteString("cdc.")
+	sb.WriteString(database)
+	sb.WriteByte('.')
+	sb.WriteString(evt.Schema)
+	sb.WriteByte('.')
+	sb.WriteString(evt.Table)
+	return sb.String(), nil
 }

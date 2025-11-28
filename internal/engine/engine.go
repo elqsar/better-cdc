@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"better-cdc/internal/checkpoint"
@@ -16,6 +18,34 @@ import (
 
 	"go.uber.org/zap"
 )
+
+// jsonBufPool provides reusable buffers for JSON marshaling.
+var jsonBufPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
+// marshalCDCEvent marshals a CDCEvent using a pooled buffer.
+func marshalCDCEvent(evt *model.CDCEvent) ([]byte, error) {
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer jsonBufPool.Put(buf)
+
+	enc := json.NewEncoder(buf)
+	if err := enc.Encode(evt); err != nil {
+		return nil, err
+	}
+
+	// Copy result since buffer is pooled; remove trailing newline from Encode
+	data := buf.Bytes()
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+	}
+	result := make([]byte, len(data))
+	copy(result, data)
+	return result, nil
+}
 
 // Engine coordinates the end-to-end CDC flow.
 type Engine struct {
@@ -155,6 +185,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 	// Phase 1: Transform and prepare all items
 	items := make([]publisher.PublishItem, 0, len(batch))
+	cdcEvents := make([]*model.CDCEvent, 0, len(batch)) // Track for pool release
 
 	for _, evt := range batch {
 		if evt.Begin || evt.Commit {
@@ -165,16 +196,27 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		cdcEvt, err := e.transformer.Transform(ctx, evt)
 		e.transformLatency.Observe(uint64(time.Since(transformStart).Nanoseconds()))
 		if err != nil {
+			// Release any already-transformed events on error
+			for _, e := range cdcEvents {
+				model.ReleaseCDCEvent(e)
+			}
 			return fmt.Errorf("transform event: %w", err)
 		}
+		cdcEvents = append(cdcEvents, cdcEvt)
 
 		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
 		if err != nil {
+			for _, e := range cdcEvents {
+				model.ReleaseCDCEvent(e)
+			}
 			return fmt.Errorf("build subject: %w", err)
 		}
 
-		payload, err := json.Marshal(cdcEvt)
+		payload, err := marshalCDCEvent(cdcEvt)
 		if err != nil {
+			for _, e := range cdcEvents {
+				model.ReleaseCDCEvent(e)
+			}
 			return fmt.Errorf("marshal event: %w", err)
 		}
 
@@ -185,6 +227,11 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 			TxID:     evt.TxID,
 			Position: evt.Position,
 		})
+	}
+
+	// Release CDCEvents back to pool after marshaling (data is copied)
+	for _, evt := range cdcEvents {
+		model.ReleaseCDCEvent(evt)
 	}
 
 	if len(items) == 0 {
@@ -247,12 +294,17 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 		}
 		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
 		if err != nil {
+			model.ReleaseCDCEvent(cdcEvt)
 			return fmt.Errorf("build subject: %w", err)
 		}
-		payload, err := json.Marshal(cdcEvt)
+		payload, err := marshalCDCEvent(cdcEvt)
 		if err != nil {
+			model.ReleaseCDCEvent(cdcEvt)
 			return fmt.Errorf("marshal event: %w", err)
 		}
+		// Release event after marshaling
+		model.ReleaseCDCEvent(cdcEvt)
+
 		if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3); err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}

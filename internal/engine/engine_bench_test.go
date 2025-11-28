@@ -80,6 +80,57 @@ func BenchmarkCDCEventMarshalLarge(b *testing.B) {
 	}
 }
 
+// BenchmarkCDCEventMarshalPooled benchmarks optimized pooled JSON marshaling
+func BenchmarkCDCEventMarshalPooled(b *testing.B) {
+	evt := &model.CDCEvent{
+		EventID:    "0/16B3748:12345:public.users:id=1,email=test@example.com",
+		EventType:  "cdc.insert",
+		Source:     "test-db",
+		Timestamp:  time.Now(),
+		CommitTime: time.Now(),
+		LSN:        "0/16B3748",
+		TxID:       12345,
+		Schema:     "public",
+		Table:      "users",
+		Operation:  "INSERT",
+		Before:     nil,
+		After: map[string]interface{}{
+			"id":         1,
+			"email":      "test@example.com",
+			"name":       "Test User",
+			"created_at": time.Now().Format(time.RFC3339),
+			"updated_at": time.Now().Format(time.RFC3339),
+			"is_active":  true,
+			"balance":    123.45,
+		},
+		Metadata: map[string]interface{}{"txid": "12345"},
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := marshalCDCEvent(evt)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCDCEventPool benchmarks acquire/release cycle
+func BenchmarkCDCEventPool(b *testing.B) {
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		evt := model.AcquireCDCEvent()
+		evt.EventID = "test"
+		evt.Schema = "public"
+		evt.Table = "users"
+		model.ReleaseCDCEvent(evt)
+	}
+}
+
 // generateTestEvents creates realistic WALEvents for benchmarking
 func generateTestEvents(n int) []*model.WALEvent {
 	events := make([]*model.WALEvent, n)
