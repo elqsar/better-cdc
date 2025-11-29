@@ -204,8 +204,8 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
 		if err != nil {
 			// Release any already-transformed events on error
-			for _, e := range cdcEvents {
-				model.ReleaseCDCEvent(e)
+			for _, event := range cdcEvents {
+				model.ReleaseCDCEvent(event)
 			}
 			return fmt.Errorf("transform event: %w", err)
 		}
@@ -213,16 +213,16 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
 		if err != nil {
-			for _, e := range cdcEvents {
-				model.ReleaseCDCEvent(e)
+			for _, event := range cdcEvents {
+				model.ReleaseCDCEvent(event)
 			}
 			return fmt.Errorf("build subject: %w", err)
 		}
 
 		payload, err := marshalCDCEvent(cdcEvt)
 		if err != nil {
-			for _, e := range cdcEvents {
-				model.ReleaseCDCEvent(e)
+			for _, event := range cdcEvents {
+				model.ReleaseCDCEvent(event)
 			}
 			return fmt.Errorf("marshal event: %w", err)
 		}
@@ -298,11 +298,19 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 // flushSequential is the original sequential publish logic (fallback).
 func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent) error {
+	batchStart := time.Now()
+	var eventCount int
+
 	for _, evt := range batch {
 		if evt.Begin || evt.Commit {
 			continue
 		}
+
+		transformStart := time.Now()
 		cdcEvt, err := e.transformer.Transform(ctx, evt)
+		transformLatencyNs := uint64(time.Since(transformStart).Nanoseconds())
+		e.transformLatency.Observe(transformLatencyNs)
+		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
 		if err != nil {
 			return fmt.Errorf("transform event: %w", err)
 		}
@@ -322,7 +330,21 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 		if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3); err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}
+		eventCount++
 		e.logger.Debug("published event", zap.String("subject", subject), zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
+	}
+
+	// Record metrics
+	if eventCount > 0 {
+		e.eventsProcessed.Add(uint64(eventCount))
+		e.batchesPublished.Inc()
+		batchLatencyUs := uint64(time.Since(batchStart).Microseconds())
+		e.batchLatency.Observe(batchLatencyUs)
+
+		e.promMetrics.EventsTotal.Add(uint64(eventCount))
+		e.promMetrics.BatchesPublished.Inc()
+		e.promMetrics.BatchLatency.Observe(batchLatencyUs)
+		e.promMetrics.EventsPerSecond.Set(int64(e.eventsProcessed.Rate()))
 	}
 
 	// Checkpoint only on commit boundaries to ensure transactional consistency.
@@ -346,20 +368,20 @@ func (e *Engine) publishTimeout() time.Duration {
 
 // EngineMetrics contains throughput metrics for external access.
 type EngineMetrics struct {
-	EventsPerSecond       float64
-	EventsTotal           uint64
-	BatchesPublished      uint64
-	BatchLatencyMeanUs    float64
+	EventsPerSecond        float64
+	EventsTotal            uint64
+	BatchesPublished       uint64
+	BatchLatencyMeanUs     float64
 	TransformLatencyMeanNs float64
 }
 
 // Metrics returns current throughput metrics.
 func (e *Engine) Metrics() EngineMetrics {
 	return EngineMetrics{
-		EventsPerSecond:       e.eventsProcessed.Rate(),
-		EventsTotal:           e.eventsProcessed.Total(),
-		BatchesPublished:      e.batchesPublished.Value(),
-		BatchLatencyMeanUs:    e.batchLatency.Mean(),
+		EventsPerSecond:        e.eventsProcessed.Rate(),
+		EventsTotal:            e.eventsProcessed.Total(),
+		BatchesPublished:       e.batchesPublished.Value(),
+		BatchLatencyMeanUs:     e.batchLatency.Mean(),
 		TransformLatencyMeanNs: e.transformLatency.Mean(),
 	}
 }
