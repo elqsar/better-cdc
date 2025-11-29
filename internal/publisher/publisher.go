@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"better-cdc/internal/model"
+
 	"go.uber.org/zap"
 )
 
@@ -28,13 +29,18 @@ type PublishItem struct {
 }
 
 // PendingAck represents an in-flight publish awaiting acknowledgment.
+//
+// Thread safety: The Acked and Err fields are written by a background goroutine
+// and must only be read after waiting on the done channel (via Wait method or
+// direct channel read). Reading these fields before done is closed results in
+// a data race.
 type PendingAck struct {
 	Subject string
 	EventID string
 	TxID    uint64
-	Acked   bool
-	Err     error
-	done    chan struct{} // signals completion
+	Acked   bool  // safe to read only after done is closed
+	Err     error // safe to read only after done is closed
+	done    chan struct{}
 }
 
 // Wait blocks until the ack is resolved or context is cancelled.

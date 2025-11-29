@@ -141,6 +141,10 @@ func backoff(attempt int) time.Duration {
 	if attempt < 0 {
 		return time.Second
 	}
+	const maxAttempt = 3 // cap at 8 seconds (2^3)
+	if attempt > maxAttempt {
+		attempt = maxAttempt
+	}
 	return time.Duration(1<<attempt) * time.Second
 }
 
@@ -278,7 +282,8 @@ func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*Pending
 		case <-ctx.Done():
 			return successCount, ctx.Err()
 		case <-deadline.C:
-			// Count what we have so far
+			// Recount from scratch to get accurate total
+			successCount = 0
 			for _, pa := range pending {
 				if pa.Acked {
 					successCount++
