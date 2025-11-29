@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -24,8 +25,6 @@ type Wal2JSONConfig struct {
 type Wal2JSONParser struct {
 	tableFilter map[string]struct{}
 	logger      *zap.Logger
-	lagGauge    *metrics.Gauge
-	errs        *metrics.Counter
 	bufferSize  int
 	promMetrics *metrics.Metrics
 }
@@ -38,8 +37,6 @@ func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
 	return &Wal2JSONParser{
 		tableFilter: cfg.TableFilter,
 		logger:      logger,
-		lagGauge:    metrics.NewGauge("replication_lag_ms"),
-		errs:        metrics.NewCounter("decode_errors"),
 		bufferSize:  cfg.BufferSize,
 		promMetrics: metrics.GlobalMetrics,
 	}
@@ -65,7 +62,6 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				}
 				events, err := decodeWal2JSON(uint64(msg.WALStart), msg.Data, p.tableFilter)
 				if err != nil {
-					p.errs.Inc()
 					p.promMetrics.DecodeErrors.Inc()
 					p.logger.Warn("decode wal2json failed", zap.Error(err))
 					continue
@@ -73,7 +69,6 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				for _, evt := range events {
 					if !evt.CommitTime.IsZero() {
 						lag := time.Since(evt.CommitTime).Milliseconds()
-						p.lagGauge.Set(lag)
 						p.promMetrics.ReplicationLag.Set(lag)
 					}
 					if p.logger != nil {
@@ -100,7 +95,7 @@ func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{
 	}
 
 	position := model.WALPosition{LSN: pglogrepl.LSN(walStart).String()}
-	txID := fmt.Sprintf("%d", msg.XID)
+	txID := strconv.FormatInt(msg.XID, 10)
 
 	evt := &model.WALEvent{
 		Position:      position,
@@ -119,35 +114,27 @@ func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{
 	case "C": // Commit
 		evt.Commit = true
 	case "I": // Insert
-		if len(tableFilter) > 0 {
-			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
-				return nil, nil // Filtered out
-			}
+		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			return nil, nil
 		}
 		evt.Operation = model.OperationInsert
 		evt.NewValues = columnsToMap(msg.Columns)
 	case "U": // Update
-		if len(tableFilter) > 0 {
-			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
-				return nil, nil
-			}
+		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			return nil, nil
 		}
 		evt.Operation = model.OperationUpdate
 		evt.NewValues = columnsToMap(msg.Columns)
 		evt.OldValues = columnsToMap(msg.Identity)
 	case "D": // Delete
-		if len(tableFilter) > 0 {
-			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
-				return nil, nil
-			}
+		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			return nil, nil
 		}
 		evt.Operation = model.OperationDelete
 		evt.OldValues = columnsToMap(msg.Identity)
 	case "T": // Truncate
-		if len(tableFilter) > 0 {
-			if _, ok := tableFilter[msg.Schema+"."+msg.Table]; !ok {
-				return nil, nil
-			}
+		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			return nil, nil
 		}
 		evt.Operation = model.OperationDDL
 	default:
@@ -155,6 +142,15 @@ func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{
 	}
 
 	return []*model.WALEvent{evt}, nil
+}
+
+// isTableFiltered returns true if the table should be filtered out.
+func isTableFiltered(schema, table string, filter map[string]struct{}) bool {
+	if len(filter) == 0 {
+		return false
+	}
+	_, ok := filter[schema+"."+table]
+	return !ok
 }
 
 // pgTime handles PostgreSQL timestamp format (space separator instead of T).
@@ -177,10 +173,10 @@ func (t *pgTime) UnmarshalJSON(data []byte) error {
 	formats := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
-		"2006-01-02 15:04:05.999999-07",
-		"2006-01-02 15:04:05.999999+00",
-		"2006-01-02 15:04:05-07",
-		"2006-01-02 15:04:05+00",
+		"2006-01-02 15:04:05.999999-07:00",
+		"2006-01-02 15:04:05.999999Z07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05Z07:00",
 	}
 
 	var err error
