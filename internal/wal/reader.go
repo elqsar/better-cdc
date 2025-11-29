@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -19,8 +19,10 @@ import (
 	"go.uber.org/zap"
 )
 
-type replicationStartFunc func(context.Context, pglogrepl.LSN) error
-type replicationLoopFunc func(context.Context, pglogrepl.LSN, chan<- *parser.RawMessage) (pglogrepl.LSN, error)
+type (
+	replicationStartFunc func(context.Context, pglogrepl.LSN) error
+	replicationLoopFunc  func(context.Context, pglogrepl.LSN, chan<- *parser.RawMessage) (pglogrepl.LSN, error)
+)
 
 type fatalReplicationError struct {
 	err error
@@ -478,7 +480,7 @@ func withJitter(base time.Duration) time.Duration {
 		base = time.Second
 	}
 	spread := base / 2
-	extra := time.Duration(rand.Int63n(int64(spread) + 1))
+	extra := time.Duration(rand.Int64N(int64(spread) + 1))
 	return base + extra
 }
 
