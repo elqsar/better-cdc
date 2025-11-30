@@ -131,36 +131,6 @@ func BenchmarkCDCEventPool(b *testing.B) {
 	}
 }
 
-// generateTestEvents creates realistic WALEvents for benchmarking
-func generateTestEvents(n int) []*model.WALEvent {
-	events := make([]*model.WALEvent, n)
-	baseTime := time.Now()
-
-	for i := 0; i < n; i++ {
-		events[i] = &model.WALEvent{
-			Position:  model.WALPosition{LSN: "0/16B3748"},
-			Timestamp: baseTime,
-			Operation: model.OperationInsert,
-			Begin:     false,
-			Commit:    false,
-			Schema:    "public",
-			Table:     "users",
-			OldValues: nil,
-			NewValues: map[string]interface{}{
-				"id":         i,
-				"email":      "user@example.com",
-				"name":       "Test User",
-				"created_at": baseTime.Format(time.RFC3339),
-			},
-			TransactionID: "12345",
-			CommitTime:    baseTime,
-			LSN:           "0/16B3748",
-			TxID:          12345,
-		}
-	}
-	return events
-}
-
 // MockBatchPublisher implements BatchPublisher for isolated benchmarking
 type MockBatchPublisher struct {
 	publishedCount int

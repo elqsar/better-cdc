@@ -111,6 +111,6 @@ Set buffer sizes to `0` to revert to unbuffered (sequential) behavior for debugg
 - wal2json path now emits begin/commit markers so checkpoints persist; `pgoutput` remains the recommended plugin for RDS-like environments.
 
 ## Development
-- Requires Go 1.21+
+- Requires Go 1.23+
 - Run `go test ./...` (unit-level only; no integration harness yet).
 - Code lives under `internal/`; entrypoint `cmd/cdc-handler/main.go`.
