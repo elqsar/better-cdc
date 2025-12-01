@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"better-cdc/internal/metrics"
+	"better-cdc/internal/model"
 
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
@@ -265,39 +266,90 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 }
 
 // WaitForAcks blocks until all pending acks are resolved or timeout.
-// Returns the count of successful acks and first error encountered.
-func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*PendingAck, timeout time.Duration) (int, error) {
+// Returns a BatchResult with detailed per-item status.
+func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*PendingAck, items []PublishItem, timeout time.Duration) (*BatchResult, error) {
+	result := &BatchResult{
+		Total:       len(pending),
+		FailedItems: make([]int, 0),
+	}
+
 	if len(pending) == 0 {
-		return 0, nil
+		return result, nil
 	}
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
-	successCount := 0
-	var firstErr error
+	// Track which items completed (vs timed out)
+	completed := make([]bool, len(pending))
 
-	for _, pend := range pending {
+	for i, pend := range pending {
 		select {
 		case <-ctx.Done():
-			return successCount, ctx.Err()
+			// Context cancelled - count what we have so far
+			result.FirstError = ctx.Err()
+			p.countResults(pending, items, completed, result)
+			return result, ctx.Err()
 		case <-deadline.C:
-			// Recount from scratch to get accurate total
-			successCount = 0
-			for _, pa := range pending {
-				if pa.IsAcked() {
-					successCount++
-				}
-			}
-			return successCount, fmt.Errorf("timeout waiting for acks: %d/%d resolved", successCount, len(pending))
+			// Timeout - count what completed before deadline
+			result.FirstError = fmt.Errorf("timeout waiting for acks: %d/%d resolved", result.Succeeded, len(pending))
+			p.countResults(pending, items, completed, result)
+			return result, result.FirstError
 		case <-pend.done:
+			completed[i] = true
 			if pend.IsAcked() {
-				successCount++
-			} else if pend.Err != nil && firstErr == nil {
-				firstErr = pend.Err
+				result.Succeeded++
+			} else {
+				result.Failed++
+				result.FailedItems = append(result.FailedItems, i)
+				if pend.Err != nil && result.FirstError == nil {
+					result.FirstError = pend.Err
+				}
 			}
 		}
 	}
 
-	return successCount, firstErr
+	// All completed - find the last successful position
+	result.LastSuccessPosition = p.findLastSuccessPosition(pending, items)
+
+	return result, result.FirstError
+}
+
+// countResults tallies the final results after timeout/cancellation.
+func (p *JetStreamPublisher) countResults(pending []*PendingAck, items []PublishItem, completed []bool, result *BatchResult) {
+	result.Succeeded = 0
+	result.Failed = 0
+	result.FailedItems = result.FailedItems[:0]
+
+	for i, pend := range pending {
+		if pend.IsAcked() {
+			result.Succeeded++
+		} else {
+			result.Failed++
+			result.FailedItems = append(result.FailedItems, i)
+		}
+		// Mark incomplete items as failed
+		if !completed[i] && !pend.IsAcked() {
+			if result.FirstError == nil {
+				result.FirstError = fmt.Errorf("item %d did not complete", i)
+			}
+		}
+	}
+
+	result.LastSuccessPosition = p.findLastSuccessPosition(pending, items)
+}
+
+// findLastSuccessPosition finds the WAL position of the last successfully acked item
+// in the original order. This is important for correct checkpointing.
+func (p *JetStreamPublisher) findLastSuccessPosition(pending []*PendingAck, items []PublishItem) *model.WALPosition {
+	var lastPos *model.WALPosition
+
+	for i, pend := range pending {
+		if pend.IsAcked() && i < len(items) {
+			pos := items[i].Position
+			lastPos = &pos
+		}
+	}
+
+	return lastPos
 }

@@ -98,20 +98,21 @@ func (h *PrometheusHistogram) Sum() uint64 {
 // Metrics is a centralized registry of all CDC metrics.
 type Metrics struct {
 	// Engine metrics
-	EventsTotal      *PrometheusCounter
-	BatchesPublished *PrometheusCounter
-	BatchLatency     *PrometheusHistogram
-	TransformLatency *PrometheusHistogram
+	EventsTotal          *PrometheusCounter
+	BatchesPublished     *PrometheusCounter
+	BatchLatency         *PrometheusHistogram
+	TransformLatency     *PrometheusHistogram
+	PartialBatchFailures *PrometheusCounter // Batches with partial success (some items failed)
 
 	// Publisher metrics
 	JetstreamPublished  *PrometheusCounter
 	JetstreamAckFailure *PrometheusCounter
 
 	// Parser metrics
-	ReplicationLag        *PrometheusGauge
-	DecodeErrors          *PrometheusCounter
-	TxBufferSize          *PrometheusGauge   // Current transaction buffer size (pgoutput)
-	TxBufferOverflows     *PrometheusCounter // Transactions that exceeded buffer limit
+	ReplicationLag    *PrometheusGauge
+	DecodeErrors      *PrometheusCounter
+	TxBufferSize      *PrometheusGauge   // Current transaction buffer size (pgoutput)
+	TxBufferOverflows *PrometheusCounter // Transactions that exceeded buffer limit
 
 	// WAL Reader metrics
 	ReplicationErrors *PrometheusCounter
@@ -134,6 +135,8 @@ func NewMetrics() *Metrics {
 		TransformLatency: NewPrometheusHistogram("engine", "transform_latency_nanoseconds",
 			"Event transformation latency in nanoseconds",
 			[]float64{100, 500, 1000, 5000, 10000, 50000}),
+		PartialBatchFailures: NewPrometheusCounter("engine", "partial_batch_failures_total",
+			"Total number of batches with partial success (some items failed, checkpoint saved for successful items)"),
 
 		// Publisher metrics
 		JetstreamPublished: NewPrometheusCounter("publisher", "jetstream_published_total",

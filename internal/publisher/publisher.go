@@ -72,8 +72,35 @@ type BatchPublisher interface {
 	PublishBatchAsync(ctx context.Context, items []PublishItem) ([]*PendingAck, error)
 
 	// WaitForAcks blocks until all pending acks are resolved or timeout.
-	// Returns the count of successful acks and first error encountered.
-	WaitForAcks(ctx context.Context, pending []*PendingAck, timeout time.Duration) (int, error)
+	// Returns a BatchResult with detailed per-item status.
+	WaitForAcks(ctx context.Context, pending []*PendingAck, items []PublishItem, timeout time.Duration) (*BatchResult, error)
+}
+
+// BatchResult contains the detailed result of a batch publish operation.
+type BatchResult struct {
+	// Total number of items in the batch
+	Total int
+	// Number of successfully acknowledged items
+	Succeeded int
+	// Number of failed items
+	Failed int
+	// LastSuccessPosition is the WAL position of the last successfully acked item (in order).
+	// This can be used to checkpoint progress even on partial failures.
+	LastSuccessPosition *model.WALPosition
+	// FirstError is the first error encountered, if any
+	FirstError error
+	// FailedItems contains indices of failed items for potential retry
+	FailedItems []int
+}
+
+// IsComplete returns true if all items succeeded
+func (r *BatchResult) IsComplete() bool {
+	return r.Failed == 0 && r.Succeeded == r.Total
+}
+
+// IsPartialSuccess returns true if some but not all items succeeded
+func (r *BatchResult) IsPartialSuccess() bool {
+	return r.Succeeded > 0 && r.Failed > 0
 }
 
 // NoopPublisher is a stub that records the last subject published.

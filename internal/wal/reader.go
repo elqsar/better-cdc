@@ -19,6 +19,8 @@ import (
 	"go.uber.org/zap"
 )
 
+const maxBackoff = 30 * time.Second
+
 type (
 	replicationStartFunc func(context.Context, pglogrepl.LSN) error
 	replicationLoopFunc  func(context.Context, pglogrepl.LSN, chan<- *parser.RawMessage) (pglogrepl.LSN, error)
@@ -157,7 +159,6 @@ func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LS
 
 	resumeLSN := startLSN
 	backoff := time.Second
-	const maxBackoff = 30 * time.Second
 
 	for {
 		if ctx.Err() != nil {

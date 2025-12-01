@@ -260,32 +260,59 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 	// Phase 3: Wait for all acks before checkpointing
 	timeout := e.publishTimeout()
-	acked, err := batchPub.WaitForAcks(ctx, pending, timeout)
+	result, err := batchPub.WaitForAcks(ctx, pending, items, timeout)
+
+	// Record metrics for what succeeded (even on partial failure)
+	if result.Succeeded > 0 {
+		e.eventsProcessed.Add(uint64(result.Succeeded))
+		e.promMetrics.EventsTotal.Add(uint64(result.Succeeded))
+	}
+	e.batchesPublished.Inc()
+	batchLatencyUs := uint64(time.Since(batchStart).Microseconds())
+	e.batchLatency.Observe(batchLatencyUs)
+	e.promMetrics.BatchesPublished.Inc()
+	e.promMetrics.BatchLatency.Observe(batchLatencyUs)
+	e.promMetrics.EventsPerSecond.Set(int64(e.eventsProcessed.Rate()))
+
+	// Handle partial success: checkpoint what we can
+	if result.IsPartialSuccess() {
+		e.promMetrics.PartialBatchFailures.Inc()
+		e.logger.Warn("partial batch success - checkpointing last successful position",
+			zap.Int("succeeded", result.Succeeded),
+			zap.Int("failed", result.Failed),
+			zap.Int("total", result.Total),
+			zap.Error(result.FirstError))
+
+		// Checkpoint the last successfully acked position to avoid replaying those events
+		if result.LastSuccessPosition != nil && result.LastSuccessPosition.LSN != "" {
+			if cpErr := e.checkpointer.MaybeFlush(ctx, *result.LastSuccessPosition, false, time.Now()); cpErr != nil {
+				e.logger.Error("failed to checkpoint partial success",
+					zap.Error(cpErr),
+					zap.String("lsn", result.LastSuccessPosition.LSN))
+			} else {
+				e.logger.Info("checkpointed partial batch success",
+					zap.String("lsn", result.LastSuccessPosition.LSN),
+					zap.Int("succeeded", result.Succeeded))
+			}
+		}
+
+		return fmt.Errorf("partial batch failure: %d/%d succeeded: %w", result.Succeeded, result.Total, result.FirstError)
+	}
+
+	// Complete failure (no successes)
 	if err != nil {
 		e.logger.Error("batch ack failures",
 			zap.Error(err),
-			zap.Int("acked", acked),
-			zap.Int("total", len(pending)))
+			zap.Int("succeeded", result.Succeeded),
+			zap.Int("total", result.Total))
 		return fmt.Errorf("batch ack: %w", err)
 	}
 
 	e.logger.Debug("batch published",
 		zap.Int("count", len(items)),
-		zap.Int("acked", acked))
+		zap.Int("acked", result.Succeeded))
 
-	// Record metrics (legacy)
-	e.eventsProcessed.Add(uint64(len(items)))
-	e.batchesPublished.Inc()
-	batchLatencyUs := uint64(time.Since(batchStart).Microseconds())
-	e.batchLatency.Observe(batchLatencyUs)
-
-	// Record Prometheus metrics
-	e.promMetrics.EventsTotal.Add(uint64(len(items)))
-	e.promMetrics.BatchesPublished.Inc()
-	e.promMetrics.BatchLatency.Observe(batchLatencyUs)
-	e.promMetrics.EventsPerSecond.Set(int64(e.eventsProcessed.Rate()))
-
-	// Phase 4: Checkpoint only on commit boundaries
+	// Phase 4: Checkpoint only on commit boundaries (full success)
 	if last.Commit {
 		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
 			return fmt.Errorf("checkpoint: %w", err)
