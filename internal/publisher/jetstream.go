@@ -238,7 +238,7 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 				p.promMetrics.JetstreamAckFailure.Inc()
 			case ack := <-pa.Ok():
 				if ack != nil {
-					pend.Acked = true
+					pend.setAcked(true)
 					p.publishedCnt.Inc()
 					p.promMetrics.JetstreamPublished.Inc()
 					p.logger.Debug("async ack received",
@@ -285,13 +285,13 @@ func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*Pending
 			// Recount from scratch to get accurate total
 			successCount = 0
 			for _, pa := range pending {
-				if pa.Acked {
+				if pa.IsAcked() {
 					successCount++
 				}
 			}
 			return successCount, fmt.Errorf("timeout waiting for acks: %d/%d resolved", successCount, len(pending))
 		case <-pend.done:
-			if pend.Acked {
+			if pend.IsAcked() {
 				successCount++
 			} else if pend.Err != nil && firstErr == nil {
 				firstErr = pend.Err

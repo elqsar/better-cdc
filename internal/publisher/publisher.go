@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"better-cdc/internal/model"
@@ -30,17 +31,26 @@ type PublishItem struct {
 
 // PendingAck represents an in-flight publish awaiting acknowledgment.
 //
-// Thread safety: The Acked and Err fields are written by a background goroutine
-// and must only be read after waiting on the done channel (via Wait method or
-// direct channel read). Reading these fields before done is closed results in
-// a data race.
+// Thread safety: The acked field uses atomic.Bool and is safe to read at any time.
+// The Err field is written by a background goroutine and must only be read after
+// waiting on the done channel (via Wait method or direct channel read).
 type PendingAck struct {
 	Subject string
 	EventID string
 	TxID    uint64
-	Acked   bool  // safe to read only after done is closed
-	Err     error // safe to read only after done is closed
+	acked   atomic.Bool // thread-safe, can be read at any time
+	Err     error       // safe to read only after done is closed
 	done    chan struct{}
+}
+
+// IsAcked returns whether the publish was acknowledged. Thread-safe.
+func (p *PendingAck) IsAcked() bool {
+	return p.acked.Load()
+}
+
+// setAcked marks the publish as acknowledged. Thread-safe.
+func (p *PendingAck) setAcked(v bool) {
+	p.acked.Store(v)
 }
 
 // Wait blocks until the ack is resolved or context is cancelled.

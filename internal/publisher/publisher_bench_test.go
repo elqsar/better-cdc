@@ -133,9 +133,9 @@ func BenchmarkPendingAckWaitResolved(b *testing.B) {
 	pending := make([]*PendingAck, 100)
 	for i := range pending {
 		pa := &PendingAck{
-			Acked: true,
-			done:  make(chan struct{}),
+			done: make(chan struct{}),
 		}
+		pa.setAcked(true)
 		close(pa.done)
 		pending[i] = pa
 	}
@@ -149,7 +149,7 @@ func BenchmarkPendingAckWaitResolved(b *testing.B) {
 		for _, pa := range pending {
 			select {
 			case <-pa.done:
-				if pa.Acked {
+				if pa.IsAcked() {
 					count++
 				}
 			default:
