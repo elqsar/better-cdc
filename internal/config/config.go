@@ -28,6 +28,11 @@ type Config struct {
 	// Pipeline buffer sizes for throughput optimization
 	RawMessageBufferSize  int // Buffer between WAL reader and parser (default: 5000)
 	ParsedEventBufferSize int // Buffer between parser and engine (default: 5000)
+
+	// Transaction buffer limit for pgoutput parser
+	// When exceeded, events are streamed immediately instead of buffered until COMMIT
+	// This prevents OOM during large transactions (bulk inserts, migrations)
+	MaxTxBufferSize int // Maximum events to buffer per transaction (default: 100000, 0 = unlimited)
 }
 
 // DefaultConfig provides safe defaults for local prototyping.
@@ -49,5 +54,6 @@ func DefaultConfig() Config {
 		Publications:          []string{"better_cdc_pub"},
 		RawMessageBufferSize:  5000,
 		ParsedEventBufferSize: 5000,
+		MaxTxBufferSize:       100000, // 100k events max per transaction before streaming
 	}
 }

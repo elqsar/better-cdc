@@ -27,26 +27,29 @@ type txBuffer struct {
 	commitLSN  pglogrepl.LSN
 	commitTime time.Time
 	events     []*model.WALEvent
+	streaming  bool // true when buffer limit exceeded, events emitted immediately
 }
 
 // PGOutputConfig configures parsing for pgoutput.
 type PGOutputConfig struct {
-	TableFilter map[string]struct{} // schema.table allowlist; empty means all
-	Logger      *zap.Logger
-	BufferSize  int // Output channel buffer size for throughput optimization
+	TableFilter     map[string]struct{} // schema.table allowlist; empty means all
+	Logger          *zap.Logger
+	BufferSize      int // Output channel buffer size for throughput optimization
+	MaxTxBufferSize int // Max events to buffer per transaction (0 = unlimited)
 }
 
 // PGOutputParser decodes pgoutput plugin messages into WALEvents.
 type PGOutputParser struct {
-	tableFilter map[string]struct{}
-	typeMap     *pgtype.Map
-	relations   map[uint32]relationInfo
-	tx          *txBuffer
-	logger      *zap.Logger
-	lagGauge    *metrics.Gauge
-	errs        *metrics.Counter
-	bufferSize  int
-	promMetrics *metrics.Metrics
+	tableFilter     map[string]struct{}
+	typeMap         *pgtype.Map
+	relations       map[uint32]relationInfo
+	tx              *txBuffer
+	logger          *zap.Logger
+	lagGauge        *metrics.Gauge
+	errs            *metrics.Counter
+	bufferSize      int
+	maxTxBufferSize int
+	promMetrics     *metrics.Metrics
 }
 
 func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
@@ -55,14 +58,15 @@ func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
 		logger = zap.NewNop()
 	}
 	return &PGOutputParser{
-		tableFilter: cfg.TableFilter,
-		typeMap:     pgtype.NewMap(),
-		relations:   make(map[uint32]relationInfo),
-		logger:      logger,
-		lagGauge:    metrics.NewGauge("replication_lag_ms"),
-		errs:        metrics.NewCounter("decode_errors"),
-		bufferSize:  cfg.BufferSize,
-		promMetrics: metrics.GlobalMetrics,
+		tableFilter:     cfg.TableFilter,
+		typeMap:         pgtype.NewMap(),
+		relations:       make(map[uint32]relationInfo),
+		logger:          logger,
+		lagGauge:        metrics.NewGauge("replication_lag_ms"),
+		errs:            metrics.NewCounter("decode_errors"),
+		bufferSize:      cfg.BufferSize,
+		maxTxBufferSize: cfg.MaxTxBufferSize,
+		promMetrics:     metrics.GlobalMetrics,
 	}
 }
 
@@ -144,19 +148,30 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 			p.lagGauge.Set(lag)
 			p.promMetrics.ReplicationLag.Set(lag)
 		}
-		for _, evt := range p.tx.events {
-			evt.CommitTime = p.tx.commitTime
-			evt.Position = model.WALPosition{LSN: p.tx.commitLSN.String()}
-			evt.LSN = p.tx.commitLSN.String()
-			evt.TxID = uint64(p.tx.xid)
-			evt.Timestamp = p.tx.commitTime
-			evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case out <- evt:
+		// If in streaming mode, events were already sent without commit metadata.
+		// In normal mode, emit buffered events with full commit info.
+		if !p.tx.streaming {
+			for _, evt := range p.tx.events {
+				evt.CommitTime = p.tx.commitTime
+				evt.Position = model.WALPosition{LSN: p.tx.commitLSN.String()}
+				evt.LSN = p.tx.commitLSN.String()
+				evt.TxID = uint64(p.tx.xid)
+				evt.Timestamp = p.tx.commitTime
+				evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case out <- evt:
+				}
 			}
+		} else {
+			p.logger.Debug("pgoutput commit (streamed transaction)",
+				zap.String("lsn", p.tx.commitLSN.String()),
+				zap.Uint64("txid", uint64(p.tx.xid)))
 		}
+		// Reset buffer size gauge
+		p.promMetrics.TxBufferSize.Set(0)
+
 		commitEvt := &model.WALEvent{
 			Commit:     true,
 			LSN:        p.tx.commitLSN.String(),
@@ -176,7 +191,9 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		}
 		evt := p.buildEventFromTuple(m.RelationID, m.Tuple.Columns, model.OperationInsert)
 		if evt != nil {
-			p.bufferEvent(evt)
+			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+				return err
+			}
 		}
 	case *pglogrepl.UpdateMessage:
 		if m.NewTuple == nil {
@@ -189,7 +206,9 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 				oldCols = m.OldTuple.Columns
 			}
 			evt.OldValues = p.tupleColumnMap(p.lookupRelation(m.RelationID), oldCols)
-			p.bufferEvent(evt)
+			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+				return err
+			}
 		}
 	case *pglogrepl.DeleteMessage:
 		if m.OldTuple == nil {
@@ -197,17 +216,67 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		}
 		evt := p.buildEventFromTuple(m.RelationID, m.OldTuple.Columns, model.OperationDelete)
 		if evt != nil {
-			p.bufferEvent(evt)
+			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func (p *PGOutputParser) bufferEvent(evt *model.WALEvent) {
+// bufferOrStreamEvent either buffers the event or streams it immediately if limit exceeded.
+// Returns error only if streaming and context is cancelled.
+func (p *PGOutputParser) bufferOrStreamEvent(ctx context.Context, evt *model.WALEvent, out chan<- *model.WALEvent) error {
 	if p.tx == nil {
 		p.tx = &txBuffer{}
 	}
+
+	// Check if we're already in streaming mode
+	if p.tx.streaming {
+		// Stream event immediately
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- evt:
+		}
+		return nil
+	}
+
+	// Check if we should switch to streaming mode
+	if p.maxTxBufferSize > 0 && len(p.tx.events) >= p.maxTxBufferSize {
+		// Switch to streaming mode
+		p.tx.streaming = true
+		p.promMetrics.TxBufferOverflows.Inc()
+		p.logger.Warn("transaction buffer limit exceeded, switching to streaming mode",
+			zap.Uint32("xid", p.tx.xid),
+			zap.Int("buffered_events", len(p.tx.events)),
+			zap.Int("limit", p.maxTxBufferSize))
+
+		// Flush all buffered events first
+		for _, bufferedEvt := range p.tx.events {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case out <- bufferedEvt:
+			}
+		}
+		// Clear the buffer (events are now sent)
+		p.tx.events = nil
+		p.promMetrics.TxBufferSize.Set(0)
+
+		// Now stream the current event
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- evt:
+		}
+		return nil
+	}
+
+	// Normal buffering
 	p.tx.events = append(p.tx.events, evt)
+	p.promMetrics.TxBufferSize.Set(int64(len(p.tx.events)))
+	return nil
 }
 
 func (p *PGOutputParser) lookupRelation(relID uint32) relationInfo {

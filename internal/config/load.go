@@ -101,6 +101,11 @@ func Load() Config {
 			cfg.ParsedEventBufferSize = i
 		}
 	}
+	if v := os.Getenv("MAX_TX_BUFFER_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
+			cfg.MaxTxBufferSize = i
+		}
+	}
 
 	return cfg
 }

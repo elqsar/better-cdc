@@ -51,9 +51,10 @@ func main() {
 	switch cfg.Plugin {
 	case "pgoutput":
 		parse = parser.NewPGOutputParser(parser.PGOutputConfig{
-			TableFilter: tableFilter,
-			Logger:      logger,
-			BufferSize:  cfg.ParsedEventBufferSize,
+			TableFilter:     tableFilter,
+			Logger:          logger,
+			BufferSize:      cfg.ParsedEventBufferSize,
+			MaxTxBufferSize: cfg.MaxTxBufferSize,
 		})
 	default:
 		parse = parser.NewWal2JSONParser(parser.Wal2JSONConfig{
@@ -75,7 +76,8 @@ func main() {
 		zap.String("db", cfg.Database),
 		zap.String("plugin", cfg.Plugin),
 		zap.Int("raw_buffer", cfg.RawMessageBufferSize),
-		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize))
+		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize),
+		zap.Int("max_tx_buffer", cfg.MaxTxBufferSize))
 
 	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, logger)
 

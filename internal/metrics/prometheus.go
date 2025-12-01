@@ -108,8 +108,10 @@ type Metrics struct {
 	JetstreamAckFailure *PrometheusCounter
 
 	// Parser metrics
-	ReplicationLag *PrometheusGauge
-	DecodeErrors   *PrometheusCounter
+	ReplicationLag        *PrometheusGauge
+	DecodeErrors          *PrometheusCounter
+	TxBufferSize          *PrometheusGauge   // Current transaction buffer size (pgoutput)
+	TxBufferOverflows     *PrometheusCounter // Transactions that exceeded buffer limit
 
 	// WAL Reader metrics
 	ReplicationErrors *PrometheusCounter
@@ -144,6 +146,10 @@ func NewMetrics() *Metrics {
 			"Current replication lag in milliseconds"),
 		DecodeErrors: NewPrometheusCounter("parser", "decode_errors_total",
 			"Total number of message decode errors"),
+		TxBufferSize: NewPrometheusGauge("parser", "tx_buffer_size",
+			"Current number of events buffered in transaction (pgoutput)"),
+		TxBufferOverflows: NewPrometheusCounter("parser", "tx_buffer_overflows_total",
+			"Total number of transactions that exceeded buffer limit and switched to streaming"),
 
 		// WAL Reader metrics
 		ReplicationErrors: NewPrometheusCounter("wal", "replication_errors_total",
