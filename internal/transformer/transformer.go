@@ -73,21 +73,6 @@ func eventType(op model.OperationType) string {
 	return "cdc.unknown"
 }
 
-func lowerOp(op model.OperationType) string {
-	switch op {
-	case model.OperationInsert:
-		return "insert"
-	case model.OperationUpdate:
-		return "update"
-	case model.OperationDelete:
-		return "delete"
-	case model.OperationDDL:
-		return "ddl"
-	default:
-		return "unknown"
-	}
-}
-
 // buildEventID constructs EventID using pooled strings.Builder for efficiency.
 // Format: lsn:txid:schema.table:pk_fragment
 func buildEventID(evt *model.WALEvent) string {
@@ -161,30 +146,4 @@ func writeValue(sb *strings.Builder, v interface{}) {
 		// Fallback for complex types
 		sb.WriteString(fmt.Sprintf("%v", val))
 	}
-}
-
-// primaryKeyFragment builds a deterministic, sorted key=value list from the best-known keyset.
-// Prefers OldValues (oldkeys from wal2json / delete tuples) and falls back to NewValues.
-func primaryKeyFragment(evt *model.WALEvent) string {
-	var keyset map[string]interface{}
-	if len(evt.OldValues) > 0 {
-		keyset = evt.OldValues
-	} else {
-		keyset = evt.NewValues
-	}
-	if len(keyset) == 0 {
-		return "nopk"
-	}
-
-	keys := make([]string, 0, len(keyset))
-	for k := range keyset {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%v", k, keyset[k]))
-	}
-	return strings.Join(parts, ",")
 }

@@ -122,42 +122,8 @@ func BenchmarkTransformLargePayload(b *testing.B) {
 	}
 }
 
-// BenchmarkPrimaryKeyFragment benchmarks primary key fragment generation in isolation
-func BenchmarkPrimaryKeyFragment(b *testing.B) {
-	evt := &model.WALEvent{
-		OldValues: map[string]interface{}{
-			"id":        1,
-			"tenant_id": "abc-123",
-			"version":   5,
-		},
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		_ = primaryKeyFragment(evt)
-	}
-}
-
-// BenchmarkPrimaryKeyFragmentSingleKey benchmarks with a single primary key
-func BenchmarkPrimaryKeyFragmentSingleKey(b *testing.B) {
-	evt := &model.WALEvent{
-		OldValues: map[string]interface{}{
-			"id": 1,
-		},
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		_ = primaryKeyFragment(evt)
-	}
-}
-
-// BenchmarkLowerOp benchmarks operation type conversion
-func BenchmarkLowerOp(b *testing.B) {
+// BenchmarkEventType benchmarks operation type conversion
+func BenchmarkEventType(b *testing.B) {
 	ops := []model.OperationType{
 		model.OperationInsert,
 		model.OperationUpdate,
@@ -169,6 +135,6 @@ func BenchmarkLowerOp(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_ = lowerOp(ops[i%4])
+		_ = eventType(ops[i%4])
 	}
 }
