@@ -37,6 +37,52 @@ type WALEvent struct {
 	TxID          uint64
 }
 
+// Default map capacity for pooled WALEvents (typical table has ~10-20 columns).
+const defaultMapCapacity = 16
+
+var walEventPool = sync.Pool{
+	New: func() interface{} {
+		return &WALEvent{
+			OldValues: make(map[string]interface{}, defaultMapCapacity),
+			NewValues: make(map[string]interface{}, defaultMapCapacity),
+		}
+	},
+}
+
+// AcquireWALEvent returns a WALEvent from the pool with pre-allocated maps.
+func AcquireWALEvent() *WALEvent {
+	return walEventPool.Get().(*WALEvent)
+}
+
+// ReleaseWALEvent returns a WALEvent to the pool after resetting it.
+func ReleaseWALEvent(evt *WALEvent) {
+	if evt == nil {
+		return
+	}
+	// Reset scalar fields
+	evt.Position = WALPosition{}
+	evt.Timestamp = time.Time{}
+	evt.Operation = ""
+	evt.Begin = false
+	evt.Commit = false
+	evt.Schema = ""
+	evt.Table = ""
+	evt.TransactionID = ""
+	evt.CommitTime = time.Time{}
+	evt.LSN = ""
+	evt.TxID = 0
+
+	// Clear maps but keep the underlying storage
+	for k := range evt.OldValues {
+		delete(evt.OldValues, k)
+	}
+	for k := range evt.NewValues {
+		delete(evt.NewValues, k)
+	}
+
+	walEventPool.Put(evt)
+}
+
 // CDCEvent is the normalized event ready for publication.
 type CDCEvent struct {
 	EventID    string                 `json:"event_id"`

@@ -97,16 +97,15 @@ func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{
 	position := model.WALPosition{LSN: pglogrepl.LSN(walStart).String()}
 	txID := strconv.FormatInt(msg.XID, 10)
 
-	evt := &model.WALEvent{
-		Position:      position,
-		LSN:           position.LSN,
-		Timestamp:     msg.Timestamp.Time,
-		CommitTime:    msg.Timestamp.Time,
-		TransactionID: txID,
-		TxID:          uint64(msg.XID),
-		Schema:        msg.Schema,
-		Table:         msg.Table,
-	}
+	evt := model.AcquireWALEvent()
+	evt.Position = position
+	evt.LSN = position.LSN
+	evt.Timestamp = msg.Timestamp.Time
+	evt.CommitTime = msg.Timestamp.Time
+	evt.TransactionID = txID
+	evt.TxID = uint64(msg.XID)
+	evt.Schema = msg.Schema
+	evt.Table = msg.Table
 
 	switch msg.Action {
 	case "B": // Begin
@@ -115,29 +114,34 @@ func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{
 		evt.Commit = true
 	case "I": // Insert
 		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			model.ReleaseWALEvent(evt)
 			return nil, nil
 		}
 		evt.Operation = model.OperationInsert
-		evt.NewValues = columnsToMap(msg.Columns)
+		populateMapFromColumns(evt.NewValues, msg.Columns)
 	case "U": // Update
 		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			model.ReleaseWALEvent(evt)
 			return nil, nil
 		}
 		evt.Operation = model.OperationUpdate
-		evt.NewValues = columnsToMap(msg.Columns)
-		evt.OldValues = columnsToMap(msg.Identity)
+		populateMapFromColumns(evt.NewValues, msg.Columns)
+		populateMapFromColumns(evt.OldValues, msg.Identity)
 	case "D": // Delete
 		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			model.ReleaseWALEvent(evt)
 			return nil, nil
 		}
 		evt.Operation = model.OperationDelete
-		evt.OldValues = columnsToMap(msg.Identity)
+		populateMapFromColumns(evt.OldValues, msg.Identity)
 	case "T": // Truncate
 		if isTableFiltered(msg.Schema, msg.Table, tableFilter) {
+			model.ReleaseWALEvent(evt)
 			return nil, nil
 		}
 		evt.Operation = model.OperationDDL
 	default:
+		model.ReleaseWALEvent(evt)
 		return nil, nil // Unknown action, skip
 	}
 
@@ -210,12 +214,12 @@ type wal2JSONColumn struct {
 	Value interface{} `json:"value"`
 }
 
-// columnsToMap converts format-version 2 columns array to a map.
-func columnsToMap(cols []wal2JSONColumn) map[string]interface{} {
+// populateMapFromColumns populates an existing map with column data.
+// Returns the populated map, or nil if cols is empty.
+func populateMapFromColumns(m map[string]interface{}, cols []wal2JSONColumn) map[string]interface{} {
 	if len(cols) == 0 {
 		return nil
 	}
-	m := make(map[string]interface{}, len(cols))
 	for _, col := range cols {
 		m[col.Name] = col.Value
 	}

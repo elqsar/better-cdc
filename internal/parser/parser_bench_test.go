@@ -208,8 +208,8 @@ func BenchmarkDecodeWal2JSONFilteredOut(b *testing.B) {
 	}
 }
 
-// BenchmarkColumnsToMap benchmarks the columnsToMap helper function
-func BenchmarkColumnsToMap(b *testing.B) {
+// BenchmarkPopulateMapFromColumns benchmarks the populateMapFromColumns helper function
+func BenchmarkPopulateMapFromColumns(b *testing.B) {
 	cols := []wal2JSONColumn{
 		{Name: "id", Type: "bigint", Value: 1},
 		{Name: "name", Type: "text", Value: "Test User"},
@@ -219,25 +219,33 @@ func BenchmarkColumnsToMap(b *testing.B) {
 		{Name: "is_active", Type: "boolean", Value: true},
 		{Name: "balance", Type: "numeric", Value: 123.45},
 	}
+	m := make(map[string]interface{}, 16)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_ = columnsToMap(cols)
+		for k := range m {
+			delete(m, k)
+		}
+		populateMapFromColumns(m, cols)
 	}
 }
 
-// BenchmarkColumnsToMapSmall benchmarks columnsToMap with small inputs
-func BenchmarkColumnsToMapSmall(b *testing.B) {
+// BenchmarkPopulateMapFromColumnsSmall benchmarks populateMapFromColumns with small inputs
+func BenchmarkPopulateMapFromColumnsSmall(b *testing.B) {
 	cols := []wal2JSONColumn{
 		{Name: "id", Type: "bigint", Value: 1},
 	}
+	m := make(map[string]interface{}, 16)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		_ = columnsToMap(cols)
+		for k := range m {
+			delete(m, k)
+		}
+		populateMapFromColumns(m, cols)
 	}
 }

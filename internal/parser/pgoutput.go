@@ -201,11 +201,9 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		}
 		evt := p.buildEventFromTuple(m.RelationID, m.NewTuple.Columns, model.OperationUpdate)
 		if evt != nil {
-			var oldCols []*pglogrepl.TupleDataColumn
 			if m.OldTuple != nil {
-				oldCols = m.OldTuple.Columns
+				p.populateTupleColumnMap(evt.OldValues, p.lookupRelation(m.RelationID), m.OldTuple.Columns)
 			}
-			evt.OldValues = p.tupleColumnMap(p.lookupRelation(m.RelationID), oldCols)
 			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
 				return err
 			}
@@ -301,24 +299,26 @@ func (p *PGOutputParser) buildEventFromTuple(relID uint32, cols []*pglogrepl.Tup
 		}
 	}
 
-	evt := &model.WALEvent{
-		Schema:        rel.Schema,
-		Table:         rel.Table,
-		Operation:     op,
-		TxID:          uint64(p.tx.xid),
-		LSN:           p.tx.beginLSN.String(),
-		TransactionID: fmt.Sprintf("%d", p.tx.xid),
-	}
+	evt := model.AcquireWALEvent()
+	evt.Schema = rel.Schema
+	evt.Table = rel.Table
+	evt.Operation = op
+	evt.TxID = uint64(p.tx.xid)
+	evt.LSN = p.tx.beginLSN.String()
+	evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
+
 	switch op {
 	case model.OperationInsert, model.OperationUpdate:
-		evt.NewValues = p.tupleColumnMap(rel, cols)
+		p.populateTupleColumnMap(evt.NewValues, rel, cols)
 	case model.OperationDelete:
-		evt.OldValues = p.tupleColumnMap(rel, cols)
+		p.populateTupleColumnMap(evt.OldValues, rel, cols)
 	}
 	return evt
 }
 
-func (p *PGOutputParser) tupleColumnMap(rel relationInfo, cols []*pglogrepl.TupleDataColumn) map[string]interface{} {
+// populateTupleColumnMap populates the given map with tuple column data.
+// Returns the map for convenience, or nil if relation has no columns.
+func (p *PGOutputParser) populateTupleColumnMap(out map[string]interface{}, rel relationInfo, cols []*pglogrepl.TupleDataColumn) map[string]interface{} {
 	if len(rel.Columns) == 0 {
 		return nil
 	}
@@ -326,7 +326,6 @@ func (p *PGOutputParser) tupleColumnMap(rel relationInfo, cols []*pglogrepl.Tupl
 	if len(cols) < length {
 		length = len(cols)
 	}
-	out := make(map[string]interface{}, length)
 	for i := 0; i < length; i++ {
 		col := cols[i]
 		var oid uint32
