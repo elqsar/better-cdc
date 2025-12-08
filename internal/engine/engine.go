@@ -285,7 +285,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 		// Checkpoint the last successfully acked position to avoid replaying those events
 		if result.LastSuccessPosition != nil && result.LastSuccessPosition.LSN != "" {
-			if cpErr := e.checkpointer.MaybeFlush(ctx, *result.LastSuccessPosition, false, time.Now()); cpErr != nil {
+			if cpErr := e.checkpointer.MaybeFlush(ctx, *result.LastSuccessPosition, true, time.Now()); cpErr != nil {
 				e.logger.Error("failed to checkpoint partial success",
 					zap.Error(cpErr),
 					zap.String("lsn", result.LastSuccessPosition.LSN))
