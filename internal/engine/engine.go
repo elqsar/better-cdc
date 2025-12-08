@@ -184,7 +184,15 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 	}
 }
 
+// Retry configuration for transient publish failures.
+const (
+	maxPublishRetries = 3
+	baseRetryBackoff  = time.Second
+	maxRetryBackoff   = 8 * time.Second
+)
+
 // flushWithBatchPublish uses async batch publishing with collected acks for high throughput.
+// Includes retry logic with exponential backoff for transient failures.
 func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent, batchPub publisher.BatchPublisher) error {
 	batchStart := time.Now()
 
@@ -252,15 +260,8 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		return nil
 	}
 
-	// Phase 2: Publish all items asynchronously
-	pending, err := batchPub.PublishBatchAsync(ctx, items)
-	if err != nil {
-		return fmt.Errorf("batch publish: %w", err)
-	}
-
-	// Phase 3: Wait for all acks before checkpointing
-	timeout := e.publishTimeout()
-	result, err := batchPub.WaitForAcks(ctx, pending, items, timeout)
+	// Phase 2 & 3: Publish with retry logic for transient failures
+	result, err := e.publishWithRetry(ctx, batchPub, items)
 
 	// Record metrics for what succeeded (even on partial failure)
 	if result.Succeeded > 0 {
@@ -277,7 +278,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 	// Handle partial success: checkpoint what we can
 	if result.IsPartialSuccess() {
 		e.promMetrics.PartialBatchFailures.Inc()
-		e.logger.Warn("partial batch success - checkpointing last successful position",
+		e.logger.Warn("partial batch success after retries - checkpointing last successful position",
 			zap.Int("succeeded", result.Succeeded),
 			zap.Int("failed", result.Failed),
 			zap.Int("total", result.Total),
@@ -301,7 +302,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 	// Complete failure (no successes)
 	if err != nil {
-		e.logger.Error("batch ack failures",
+		e.logger.Error("batch ack failures after retries",
 			zap.Error(err),
 			zap.Int("succeeded", result.Succeeded),
 			zap.Int("total", result.Total))
@@ -321,6 +322,152 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 	}
 
 	return nil
+}
+
+// publishWithRetry attempts to publish items with retry logic for transient failures.
+// It retries only the failed items with exponential backoff.
+func (e *Engine) publishWithRetry(ctx context.Context, batchPub publisher.BatchPublisher, items []publisher.PublishItem) (*publisher.BatchResult, error) {
+	timeout := e.publishTimeout()
+
+	// Track original indices for proper position tracking across retries
+	type indexedItem struct {
+		originalIdx int
+		item        publisher.PublishItem
+	}
+
+	// Initialize with all items to publish
+	itemsToPublish := make([]indexedItem, len(items))
+	for i, item := range items {
+		itemsToPublish[i] = indexedItem{originalIdx: i, item: item}
+	}
+
+	// Track success status for each original item
+	succeeded := make([]bool, len(items))
+	var lastError error
+
+	for attempt := 0; attempt <= maxPublishRetries; attempt++ {
+		if len(itemsToPublish) == 0 {
+			break
+		}
+
+		// Apply backoff before retry (not on first attempt)
+		if attempt > 0 {
+			backoff := e.calculateBackoff(attempt)
+			e.promMetrics.PublishRetries.Inc()
+			e.logger.Warn("retrying failed publishes",
+				zap.Int("attempt", attempt),
+				zap.Int("items", len(itemsToPublish)),
+				zap.Duration("backoff", backoff))
+
+			select {
+			case <-ctx.Done():
+				return e.buildFinalResult(items, succeeded, lastError), ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		// Extract just the items for publishing
+		pubItems := make([]publisher.PublishItem, len(itemsToPublish))
+		for i, indexed := range itemsToPublish {
+			pubItems[i] = indexed.item
+		}
+
+		// Publish batch asynchronously
+		pending, err := batchPub.PublishBatchAsync(ctx, pubItems)
+		if err != nil {
+			// Context cancelled - don't retry
+			if ctx.Err() != nil {
+				return e.buildFinalResult(items, succeeded, err), ctx.Err()
+			}
+			lastError = err
+			continue
+		}
+
+		// Wait for acks
+		result, err := batchPub.WaitForAcks(ctx, pending, pubItems, timeout)
+
+		// Context cancelled - return what we have
+		if ctx.Err() != nil {
+			// Mark successes from this round
+			for i, indexed := range itemsToPublish {
+				if i < len(pending) && pending[i].IsAcked() {
+					succeeded[indexed.originalIdx] = true
+				}
+			}
+			return e.buildFinalResult(items, succeeded, ctx.Err()), ctx.Err()
+		}
+
+		// Track successes and collect failures for next retry
+		var failedItems []indexedItem
+		for i, indexed := range itemsToPublish {
+			if i < len(pending) && pending[i].IsAcked() {
+				succeeded[indexed.originalIdx] = true
+			} else {
+				failedItems = append(failedItems, indexed)
+				if i < len(pending) && pending[i].Err != nil && lastError == nil {
+					lastError = pending[i].Err
+				}
+			}
+		}
+
+		// All succeeded
+		if len(failedItems) == 0 {
+			return e.buildFinalResult(items, succeeded, nil), nil
+		}
+
+		// Update error from result if we don't have one yet
+		if lastError == nil && result.FirstError != nil {
+			lastError = result.FirstError
+		}
+
+		// Prepare for next retry with only failed items
+		itemsToPublish = failedItems
+
+		e.logger.Debug("publish attempt completed",
+			zap.Int("attempt", attempt),
+			zap.Int("succeeded_this_round", len(pubItems)-len(failedItems)),
+			zap.Int("failed_this_round", len(failedItems)))
+	}
+
+	// Exhausted retries - return final state
+	return e.buildFinalResult(items, succeeded, lastError), lastError
+}
+
+// buildFinalResult constructs a BatchResult from the success tracking array.
+func (e *Engine) buildFinalResult(items []publisher.PublishItem, succeeded []bool, lastError error) *publisher.BatchResult {
+	result := &publisher.BatchResult{
+		Total:       len(items),
+		FailedItems: make([]int, 0),
+		FirstError:  lastError,
+	}
+
+	var lastSuccessIdx = -1
+	for i, ok := range succeeded {
+		if ok {
+			result.Succeeded++
+			lastSuccessIdx = i
+		} else {
+			result.Failed++
+			result.FailedItems = append(result.FailedItems, i)
+		}
+	}
+
+	// Set last successful position for partial checkpointing
+	if lastSuccessIdx >= 0 && items[lastSuccessIdx].Position.LSN != "" {
+		pos := items[lastSuccessIdx].Position
+		result.LastSuccessPosition = &pos
+	}
+
+	return result
+}
+
+// calculateBackoff returns the backoff duration for a given retry attempt.
+func (e *Engine) calculateBackoff(attempt int) time.Duration {
+	backoff := baseRetryBackoff * time.Duration(1<<(attempt-1))
+	if backoff > maxRetryBackoff {
+		backoff = maxRetryBackoff
+	}
+	return backoff
 }
 
 // flushSequential is the original sequential publish logic (fallback).

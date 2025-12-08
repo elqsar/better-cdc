@@ -107,6 +107,7 @@ type Metrics struct {
 	// Publisher metrics
 	JetstreamPublished  *PrometheusCounter
 	JetstreamAckFailure *PrometheusCounter
+	PublishRetries      *PrometheusCounter // Retry attempts for failed publishes
 
 	// Parser metrics
 	ReplicationLag    *PrometheusGauge
@@ -143,6 +144,8 @@ func NewMetrics() *Metrics {
 			"Total number of messages published to JetStream"),
 		JetstreamAckFailure: NewPrometheusCounter("publisher", "jetstream_ack_failures_total",
 			"Total number of JetStream ack failures"),
+		PublishRetries: NewPrometheusCounter("publisher", "publish_retries_total",
+			"Total number of publish retry attempts due to transient failures"),
 
 		// Parser metrics
 		ReplicationLag: NewPrometheusGauge("parser", "replication_lag_milliseconds",

@@ -63,6 +63,36 @@ func (p *PendingAck) Wait(ctx context.Context) error {
 	}
 }
 
+// NewPendingAck creates a new PendingAck for testing purposes.
+func NewPendingAck(subject, eventID string, txID uint64) *PendingAck {
+	return &PendingAck{
+		Subject: subject,
+		EventID: eventID,
+		TxID:    txID,
+		done:    make(chan struct{}),
+	}
+}
+
+// SetAcked sets the acked status (for testing).
+func (p *PendingAck) SetAcked(v bool) {
+	p.acked.Store(v)
+}
+
+// SetError sets the error (for testing).
+func (p *PendingAck) SetError(err error) {
+	p.Err = err
+}
+
+// Close closes the done channel to signal completion (for testing).
+func (p *PendingAck) Close() {
+	select {
+	case <-p.done:
+		// Already closed
+	default:
+		close(p.done)
+	}
+}
+
 // BatchPublisher extends Publisher with batch async capabilities for high throughput.
 type BatchPublisher interface {
 	Publisher
