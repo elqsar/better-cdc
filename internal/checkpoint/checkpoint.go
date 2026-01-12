@@ -50,6 +50,19 @@ func NewManager(store Store, interval time.Duration, logger *zap.Logger) *Manage
 	return &Manager{store: store, interval: interval, logger: logger}
 }
 
+// Init seeds the manager with an already-durable checkpoint (e.g. loaded from Store on startup).
+func (m *Manager) Init(pos model.WALPosition, now time.Time) {
+	if pos.LSN == "" {
+		return
+	}
+	m.lastFlush = pos
+	m.lastTime = now
+}
+
+func (m *Manager) LastFlushed() model.WALPosition {
+	return m.lastFlush
+}
+
 func (m *Manager) MaybeFlush(ctx context.Context, pos model.WALPosition, acked bool, now time.Time) error {
 	if pos.LSN == "" {
 		return nil
@@ -58,10 +71,12 @@ func (m *Manager) MaybeFlush(ctx context.Context, pos model.WALPosition, acked b
 		return nil
 	}
 	if m.lastFlush.LSN == "" || now.Sub(m.lastTime) >= m.interval {
+		m.logger.Debug("saving checkpoint", zap.String("lsn", pos.LSN))
+		if err := m.store.Save(ctx, pos); err != nil {
+			return err
+		}
 		m.lastFlush = pos
 		m.lastTime = now
-		m.logger.Debug("saving checkpoint", zap.String("lsn", pos.LSN))
-		return m.store.Save(ctx, pos)
 	}
 	return nil
 }

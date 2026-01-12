@@ -255,6 +255,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 			if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
 				return fmt.Errorf("checkpoint: %w", err)
 			}
+			e.maybeAcknowledgeCheckpoint()
 			e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
 		}
 		return nil
@@ -291,6 +292,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 					zap.Error(cpErr),
 					zap.String("lsn", result.LastSuccessPosition.LSN))
 			} else {
+				e.maybeAcknowledgeCheckpoint()
 				e.logger.Info("checkpointed partial batch success",
 					zap.String("lsn", result.LastSuccessPosition.LSN),
 					zap.Int("succeeded", result.Succeeded))
@@ -318,6 +320,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
 			return fmt.Errorf("checkpoint: %w", err)
 		}
+		e.maybeAcknowledgeCheckpoint()
 		e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
 	}
 
@@ -526,17 +529,29 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
 			return fmt.Errorf("checkpoint: %w", err)
 		}
+		e.maybeAcknowledgeCheckpoint()
 		e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
 	}
 	return nil
 }
 
+func (e *Engine) maybeAcknowledgeCheckpoint() {
+	ack, ok := e.reader.(wal.Acknowledger)
+	if !ok {
+		return
+	}
+	pos := e.checkpointer.LastFlushed()
+	if pos.LSN == "" {
+		return
+	}
+	if err := ack.SetAckedPosition(pos); err != nil {
+		e.logger.Warn("failed to update replication acked position", zap.String("lsn", pos.LSN), zap.Error(err))
+	}
+}
+
 // publishTimeout returns the timeout for waiting on batch acks.
 func (e *Engine) publishTimeout() time.Duration {
-	timeout := e.batchTimeout * 3
-	if timeout < 5*time.Second {
-		timeout = 5 * time.Second
-	}
+	timeout := max(e.batchTimeout*3, 5*time.Second)
 	return timeout
 }
 

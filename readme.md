@@ -86,6 +86,10 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - **Checkpoint Manager** (`internal/checkpoint`): saves LSNs (Redis/in-memory) on commit boundaries only after all events are acknowledged.
 - **Health/Metrics**: `/health` endpoint; periodic counters/gauges logger.
 
+## Delivery semantics
+- Postgres replication feedback is only advanced to the last *durably persisted* checkpoint, so a crash/restart can replay already-published events (**at-least-once**).
+- Consumers that need exactly-once processing should de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
+
 ## Throughput Tuning
 
 The pipeline uses buffered channels and batch async publishing to achieve high throughput (target: 1-2k TPS).

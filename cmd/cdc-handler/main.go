@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"better-cdc/internal/checkpoint"
 	"better-cdc/internal/config"
@@ -85,6 +86,7 @@ func main() {
 	if err != nil {
 		logger.Warn("failed to load checkpoint, starting from earliest", zap.Error(err))
 	}
+	ckpt.Init(startPos, time.Now())
 
 	if err := eng.Run(ctx, startPos); err != nil {
 		logger.Error("cdc engine stopped", zap.Error(err))
