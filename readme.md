@@ -1,18 +1,18 @@
 # Better CDC
 
-A lightweight Go CDC handler that reads PostgreSQL logical replication changes and publishes normalized events to NATS JetStream. Comes with Docker-based local stack (Postgres + NATS JetStream + Redis) for quick end-to-end testing.
+A lightweight Go CDC handler that reads PostgreSQL logical replication changes and publishes normalized events to NATS JetStream. Comes with Docker-based local stack (Postgres + NATS JetStream) for quick end-to-end testing.
 
 ## Features
 - PostgreSQL logical replication via `pgoutput` (default) or `wal2json`.
 - Deterministic event IDs, before/after images, commit timestamps.
 - NATS JetStream publisher with automatic stream creation and publish retries.
 - **High throughput pipeline** with configurable buffered channels and batch async publishing.
-- Checkpoint persistence (Redis by default, in-memory fallback).
+- Checkpoint recovery from PostgreSQL replication slot (`confirmed_flush_lsn`).
 - Table allowlisting and publication support.
 - Simple health endpoint and lightweight metrics logger.
 
 ## Quickstart (Local E2E)
-1) Start infra (Postgres with logical replication, NATS, Redis):
+1) Start infra (Postgres with logical replication, NATS):
    ```bash
    docker compose up -d
    ```
@@ -55,10 +55,7 @@ Environment variables (defaults in `internal/config`):
 - `PARSED_EVENT_BUFFER_SIZE` (default `5000`) - buffer between parser and engine
 
 **Checkpoint:**
-- `CHECKPOINT_INTERVAL` (default `1s`)
-- `CHECKPOINT_KEY` (default `better-cdc:checkpoint`)
-- `CHECKPOINT_TTL` (default `24h`)
-- `REDIS_URL` (default `redis://localhost:6379`)
+- `CHECKPOINT_INTERVAL` (default `1s`) - how often to advance replication slot feedback
 
 **NATS:**
 - `NATS_URL` (comma-separated; default `nats://localhost:4222`)
@@ -73,9 +70,9 @@ Environment variables (defaults in `internal/config`):
 
 ```
 PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► Engine ──► JetStream
-                                                           │
-                                                           ▼
-                                                      Checkpoint
+                                                          │
+                                                          ▼
+                                                     Checkpoint
 ```
 
 - **WAL Reader** (`internal/wal`): replication connection, `pgoutput`/`wal2json`, emits begin/commit markers and row changes; configurable output buffer for backpressure handling.
@@ -83,7 +80,7 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - **Transformer** (`internal/transformer`): builds normalized CDC events with deterministic IDs.
 - **Publisher** (`internal/publisher`): connects to NATS JetStream, ensures stream exists (defaults: name `CDC`, subjects `cdc.>`). Supports batch async publishing for high throughput.
 - **Engine** (`internal/engine`): orchestrates the pipeline; batches events by size/timeout/commit boundaries; uses async batch publishing when available.
-- **Checkpoint Manager** (`internal/checkpoint`): saves LSNs (Redis/in-memory) on commit boundaries only after all events are acknowledged.
+- **Checkpoint Manager** (`internal/checkpoint`): on startup, reads `confirmed_flush_lsn` from the PostgreSQL replication slot. During operation, the `StandbyStatusUpdate` heartbeat advances the slot position in Postgres; the checkpoint `Save` is a no-op since Postgres already tracks the position durably.
 - **Health/Metrics**: `/health` endpoint; periodic counters/gauges logger.
 
 ## Delivery semantics

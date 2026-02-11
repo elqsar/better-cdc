@@ -17,7 +17,6 @@ import (
 	"better-cdc/internal/publisher"
 	"better-cdc/internal/transformer"
 	"better-cdc/internal/wal"
-	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
@@ -66,8 +65,7 @@ func main() {
 	}
 	trans := transformer.NewSimpleTransformer(cfg.Database)
 	pub := buildPublisher(cfg, logger)
-	store, cleanup := newCheckpointStore(cfg, logger)
-	defer cleanup()
+	store := checkpoint.NewSlotStore(cfg.DatabaseURL, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
 
 	logger.Info("starting better-cdc",
@@ -117,23 +115,4 @@ func buildTableFilter(filters []string) map[string]struct{} {
 		out[f] = struct{}{}
 	}
 	return out
-}
-
-// newCheckpointStore builds Redis-backed checkpoint store, falling back to in-memory if unavailable.
-func newCheckpointStore(cfg config.Config, logger *zap.Logger) (checkpoint.Store, func()) {
-	opt, err := redis.ParseURL(cfg.RedisURL)
-	if err != nil {
-		logger.Warn("invalid redis url, using memory store", zap.String("url", cfg.RedisURL), zap.Error(err))
-		return checkpoint.NewMemoryStore(), func() {}
-	}
-	client := redis.NewClient(opt)
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.CheckpointFreq)
-	defer cancel()
-	if err := client.Ping(ctx).Err(); err != nil {
-		logger.Warn("redis unavailable, using memory store", zap.Error(err))
-		_ = client.Close()
-		return checkpoint.NewMemoryStore(), func() {}
-	}
-	store := checkpoint.NewRedisStore(client, cfg.CheckpointKey, cfg.CheckpointTTL)
-	return store, func() { _ = client.Close() }
 }

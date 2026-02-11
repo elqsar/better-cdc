@@ -38,17 +38,6 @@ func Load() Config {
 			cfg.CheckpointFreq = d
 		}
 	}
-	if v := os.Getenv("CHECKPOINT_KEY"); v != "" {
-		cfg.CheckpointKey = v
-	}
-	if v := os.Getenv("CHECKPOINT_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.CheckpointTTL = d
-		}
-	}
-	if v := os.Getenv("REDIS_URL"); v != "" {
-		cfg.RedisURL = v
-	}
 	if v := os.Getenv("NATS_URL"); v != "" {
 		cfg.NATSURLs = strings.Split(v, ",")
 	}

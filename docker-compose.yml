@@ -37,21 +37,6 @@ services:
       - "4222:4222"
       - "8222:8222"
 
-  redis:
-    image: redis:7-alpine
-    container_name: better-cdc-redis
-    ports:
-      - "6379:6379"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-
-  redis-insight:
-    image: redis/redisinsight:latest
-    container_name: better-cdc-redis-insight
-    ports:
-      - "5540:5540"
-    depends_on:
-      - redis
-
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: better-cdc-prometheus
