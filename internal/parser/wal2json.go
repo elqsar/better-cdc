@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -27,6 +28,9 @@ type Wal2JSONParser struct {
 	logger      *zap.Logger
 	bufferSize  int
 	promMetrics *metrics.Metrics
+
+	mu       sync.Mutex
+	fatalErr error
 }
 
 func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
@@ -63,8 +67,10 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				events, err := decodeWal2JSON(uint64(msg.WALStart), msg.Data, p.tableFilter)
 				if err != nil {
 					p.promMetrics.DecodeErrors.Inc()
-					p.logger.Warn("decode wal2json failed", zap.Error(err))
-					continue
+					fatal := fmt.Errorf("decode wal2json failed: %w", err)
+					p.setFatalError(fatal)
+					p.logger.Error("decode wal2json failed", zap.Error(fatal))
+					return
 				}
 				for _, evt := range events {
 					if !evt.CommitTime.IsZero() {
@@ -84,6 +90,21 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 		}
 	}()
 	return out, nil
+}
+
+func (p *Wal2JSONParser) setFatalError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fatalErr == nil {
+		p.fatalErr = err
+	}
+}
+
+// Err returns the fatal parse error that caused the parser to stop, or nil.
+func (p *Wal2JSONParser) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fatalErr
 }
 
 // decodeWal2JSON converts wal2json format-version 2 message into a WALEvent.

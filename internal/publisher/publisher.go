@@ -63,6 +63,18 @@ func (p *PendingAck) Wait(ctx context.Context) error {
 	}
 }
 
+// GetErr returns the error if the ack goroutine has completed, or nil if it
+// is still in-flight. This is safe to call concurrently — it only reads Err
+// after the done channel is closed, which provides a happens-before guarantee.
+func (p *PendingAck) GetErr() error {
+	select {
+	case <-p.done:
+		return p.Err
+	default:
+		return nil
+	}
+}
+
 // NewPendingAck creates a new PendingAck for testing purposes.
 func NewPendingAck(subject, eventID string, txID uint64) *PendingAck {
 	return &PendingAck{

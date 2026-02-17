@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -50,6 +51,9 @@ type PGOutputParser struct {
 	bufferSize      int
 	maxTxBufferSize int
 	promMetrics     *metrics.Metrics
+
+	mu       sync.Mutex
+	fatalErr error
 }
 
 func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
@@ -92,16 +96,39 @@ func (p *PGOutputParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				if err != nil {
 					p.errs.Inc()
 					p.promMetrics.DecodeErrors.Inc()
-					p.logger.Warn("parse pgoutput message failed", zap.Error(err))
-					continue
+					fatal := fmt.Errorf("parse pgoutput message failed: %w", err)
+					p.setFatalError(fatal)
+					p.logger.Error("parse pgoutput message failed", zap.Error(fatal))
+					return
 				}
 				if err := p.handlePGOutputMessage(ctx, logical, out); err != nil {
-					p.logger.Warn("pgoutput handle error", zap.Error(err))
+					if ctx.Err() != nil {
+						return
+					}
+					fatal := fmt.Errorf("pgoutput handle failed: %w", err)
+					p.setFatalError(fatal)
+					p.logger.Error("pgoutput handle failed", zap.Error(fatal))
+					return
 				}
 			}
 		}
 	}()
 	return out, nil
+}
+
+func (p *PGOutputParser) setFatalError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fatalErr == nil {
+		p.fatalErr = err
+	}
+}
+
+// Err returns the fatal parse error that caused the parser to stop, or nil.
+func (p *PGOutputParser) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fatalErr
 }
 
 func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglogrepl.Message, out chan<- *model.WALEvent) error {
@@ -174,6 +201,7 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 
 		commitEvt := &model.WALEvent{
 			Commit:     true,
+			Position:   model.WALPosition{LSN: p.tx.commitLSN.String()},
 			LSN:        p.tx.commitLSN.String(),
 			CommitTime: p.tx.commitTime,
 			TxID:       uint64(p.tx.xid),

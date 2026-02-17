@@ -339,16 +339,18 @@ func (p *JetStreamPublisher) countResults(pending []*PendingAck, items []Publish
 	result.LastSuccessPosition = p.findLastSuccessPosition(pending, items)
 }
 
-// findLastSuccessPosition finds the WAL position of the last successfully acked item
-// in the original order. This is important for correct checkpointing.
+// findLastSuccessPosition finds the WAL position of the last contiguously
+// successful item from the start. Only checkpoint up to the last position
+// where all preceding items also succeeded, to avoid skipping failed events.
 func (p *JetStreamPublisher) findLastSuccessPosition(pending []*PendingAck, items []PublishItem) *model.WALPosition {
 	var lastPos *model.WALPosition
 
 	for i, pend := range pending {
-		if pend.IsAcked() && i < len(items) {
-			pos := items[i].Position
-			lastPos = &pos
+		if !pend.IsAcked() || i >= len(items) {
+			break
 		}
+		pos := items[i].Position
+		lastPos = &pos
 	}
 
 	return lastPos

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,7 +11,9 @@ import (
 
 	"better-cdc/internal/metrics"
 	"better-cdc/internal/model"
+	"better-cdc/internal/parser"
 	"better-cdc/internal/publisher"
+	"better-cdc/internal/wal"
 
 	"go.uber.org/zap"
 )
@@ -86,7 +89,8 @@ func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publish
 		}
 	}
 
-	var lastSuccessIdx = -1
+	var lastContiguousIdx = -1
+	var contiguousBroken bool
 	for i, pend := range pending {
 		if failSet[i] {
 			result.Failed++
@@ -95,16 +99,19 @@ func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publish
 			if result.FirstError == nil {
 				result.FirstError = errors.New("mock failure")
 			}
+			contiguousBroken = true
 		} else {
 			pend.SetAcked(true)
 			result.Succeeded++
-			lastSuccessIdx = i
+			if !contiguousBroken {
+				lastContiguousIdx = i
+			}
 		}
 		pend.Close()
 	}
 
-	if lastSuccessIdx >= 0 && len(items) > lastSuccessIdx {
-		pos := items[lastSuccessIdx].Position
+	if lastContiguousIdx >= 0 && len(items) > lastContiguousIdx {
+		pos := items[lastContiguousIdx].Position
 		result.LastSuccessPosition = &pos
 	}
 
@@ -344,8 +351,161 @@ func TestBuildFinalResult(t *testing.T) {
 	if result.FirstError != testErr {
 		t.Errorf("expected test error, got %v", result.FirstError)
 	}
-	// Last successful position should be item 2 (index 2)
-	if result.LastSuccessPosition == nil || result.LastSuccessPosition.LSN != "0/2" {
-		t.Errorf("expected last success position 0/2, got %v", result.LastSuccessPosition)
+	// Last successful position should be item 0 (last contiguous success from start)
+	// Item 1 failed, so we cannot checkpoint past it even though item 2 succeeded.
+	if result.LastSuccessPosition == nil || result.LastSuccessPosition.LSN != "0/0" {
+		t.Errorf("expected last success position 0/0 (contiguous prefix), got %v", result.LastSuccessPosition)
+	}
+}
+
+// mockErrorReader implements wal.Reader and wal.ErrorReporter for testing
+// fatal error propagation from the reader to the engine.
+type mockErrorReader struct {
+	fatalErr error
+}
+
+var _ wal.Reader = (*mockErrorReader)(nil)
+var _ wal.ErrorReporter = (*mockErrorReader)(nil)
+
+func (m *mockErrorReader) Start(context.Context) error { return nil }
+func (m *mockErrorReader) ReadWAL(context.Context, model.WALPosition) (<-chan *parser.RawMessage, error) {
+	return nil, nil
+}
+func (m *mockErrorReader) GetCurrentPosition(context.Context) (model.WALPosition, error) {
+	return model.WALPosition{}, nil
+}
+func (m *mockErrorReader) Stop(context.Context) error { return nil }
+func (m *mockErrorReader) Err() error                 { return m.fatalErr }
+
+// mockErrorParser implements parser.Parser and parser.ErrorReporter for testing
+// fatal error propagation from the parser to the engine.
+type mockErrorParser struct {
+	fatalErr error
+}
+
+var _ parser.Parser = (*mockErrorParser)(nil)
+var _ parser.ErrorReporter = (*mockErrorParser)(nil)
+
+func (m *mockErrorParser) Parse(context.Context, <-chan *parser.RawMessage) (<-chan *model.WALEvent, error) {
+	return nil, nil
+}
+func (m *mockErrorParser) Err() error { return m.fatalErr }
+
+func TestRunBatched_ReaderFatalError(t *testing.T) {
+	mockReader := &mockErrorReader{fatalErr: errors.New("replication slot \"cdc_slot\" does not exist")}
+
+	e := &Engine{
+		reader:       mockReader,
+		logger:       zap.NewNop(),
+		batchSize:    100,
+		batchTimeout: time.Second,
+		promMetrics:  getTestMetrics(),
+	}
+
+	// Simulate the reader goroutine closing the stream due to fatal error.
+	stream := make(chan *model.WALEvent)
+	close(stream)
+
+	err := e.runBatched(context.Background(), stream)
+	if err == nil {
+		t.Fatal("expected error from fatal reader failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "replication stopped") {
+		t.Errorf("expected 'replication stopped' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cdc_slot") {
+		t.Errorf("expected underlying error to be preserved, got: %v", err)
+	}
+}
+
+func TestRunBatched_GracefulShutdown(t *testing.T) {
+	// A reader without ErrorReporter (or one returning nil) should result in nil from runBatched.
+	mockReader := &mockErrorReader{fatalErr: nil}
+
+	e := &Engine{
+		reader:       mockReader,
+		logger:       zap.NewNop(),
+		batchSize:    100,
+		batchTimeout: time.Second,
+		promMetrics:  getTestMetrics(),
+	}
+
+	stream := make(chan *model.WALEvent)
+	close(stream)
+
+	err := e.runBatched(context.Background(), stream)
+	if err != nil {
+		t.Errorf("expected nil error for graceful shutdown, got: %v", err)
+	}
+}
+
+func TestRunBatched_ParserFatalError(t *testing.T) {
+	mockReader := &mockErrorReader{fatalErr: nil}
+	mockParser := &mockErrorParser{fatalErr: errors.New("decode wal2json failed: invalid character")}
+
+	e := &Engine{
+		reader:       mockReader,
+		parser:       mockParser,
+		logger:       zap.NewNop(),
+		batchSize:    100,
+		batchTimeout: time.Second,
+		promMetrics:  getTestMetrics(),
+	}
+
+	stream := make(chan *model.WALEvent)
+	close(stream)
+
+	err := e.runBatched(context.Background(), stream)
+	if err == nil {
+		t.Fatal("expected error from fatal parser failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "parser stopped") {
+		t.Errorf("expected 'parser stopped' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "decode wal2json failed") {
+		t.Errorf("expected underlying parser error to be preserved, got: %v", err)
+	}
+}
+
+func TestCheckpointPositionForCommit(t *testing.T) {
+	tests := []struct {
+		name string
+		evt  *model.WALEvent
+		want string
+	}{
+		{
+			name: "uses position when present",
+			evt: &model.WALEvent{
+				Position: model.WALPosition{LSN: "0/ABC"},
+				LSN:      "0/DEF",
+			},
+			want: "0/ABC",
+		},
+		{
+			name: "falls back to LSN when position is empty",
+			evt: &model.WALEvent{
+				LSN: "0/DEF",
+			},
+			want: "0/DEF",
+		},
+		{
+			name: "empty when both are missing",
+			evt:  &model.WALEvent{},
+			want: "",
+		},
+		{
+			name: "empty on nil event",
+			evt:  nil,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := checkpointPositionForCommit(tt.evt)
+			if got.LSN != tt.want {
+				t.Fatalf("checkpointPositionForCommit() = %q, want %q", got.LSN, tt.want)
+			}
+		})
 	}
 }

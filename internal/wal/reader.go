@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +46,13 @@ type Acknowledger interface {
 	SetAckedPosition(pos model.WALPosition) error
 }
 
+// ErrorReporter exposes the fatal error (if any) that caused the reader to stop.
+// The engine checks this when the WAL stream channel closes to distinguish
+// a fatal failure from a normal shutdown.
+type ErrorReporter interface {
+	Err() error
+}
+
 var sendStandbyStatusUpdate = pglogrepl.SendStandbyStatusUpdate
 
 // Reader streams logical replication changes from PostgreSQL.
@@ -74,6 +82,9 @@ type PGReader struct {
 	promMetrics *metrics.Metrics
 
 	ackedLSN atomic.Uint64
+
+	mu       sync.Mutex
+	fatalErr error
 }
 
 func NewPGReader(slot SlotConfig, bufferSize int, logger *zap.Logger) *PGReader {
@@ -180,6 +191,7 @@ func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LS
 		if r.conn == nil {
 			if err := r.Start(ctx); err != nil {
 				if isFatalReplicationError(err) {
+					r.setFatalError(err)
 					r.logger.Error("replication connection failed", zap.String("plugin", plugin), zap.Error(err))
 					return
 				}
@@ -194,6 +206,7 @@ func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LS
 				return
 			}
 			if isFatalReplicationError(err) {
+				r.setFatalError(err)
 				r.logger.Error("replication start failed", zap.String("plugin", plugin), zap.Error(err))
 				return
 			}
@@ -212,6 +225,7 @@ func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LS
 			return
 		}
 		if isFatalReplicationError(err) {
+			r.setFatalError(err)
 			r.logger.Error("replication loop stopped due to fatal error", zap.String("plugin", plugin), zap.Error(err))
 			return
 		}
@@ -530,4 +544,19 @@ func (r *PGReader) setAckedLSN(lsn pglogrepl.LSN) {
 			return
 		}
 	}
+}
+
+func (r *PGReader) setFatalError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fatalErr == nil {
+		r.fatalErr = err
+	}
+}
+
+// Err returns the fatal error that caused the reader to stop, or nil.
+func (r *PGReader) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.fatalErr
 }

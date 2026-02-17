@@ -162,7 +162,20 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			return flush()
 		case evt, ok := <-stream:
 			if !ok {
-				return flush()
+				if err := flush(); err != nil {
+					return err
+				}
+				if ep, ok := e.parser.(parser.ErrorReporter); ok {
+					if perr := ep.Err(); perr != nil {
+						return fmt.Errorf("parser stopped: %w", perr)
+					}
+				}
+				if er, ok := e.reader.(wal.ErrorReporter); ok {
+					if rerr := er.Err(); rerr != nil {
+						return fmt.Errorf("replication stopped: %w", rerr)
+					}
+				}
+				return nil
 			}
 			batch = append(batch, evt)
 			if evt.Commit {
@@ -252,11 +265,12 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 	if len(items) == 0 {
 		// Only BEGIN/COMMIT markers, still checkpoint if needed
 		if last.Commit {
-			if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
+			cpPos := checkpointPositionForCommit(last)
+			if err := e.checkpointer.MaybeFlush(ctx, cpPos, true, time.Now()); err != nil {
 				return fmt.Errorf("checkpoint: %w", err)
 			}
 			e.maybeAcknowledgeCheckpoint()
-			e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
+			e.logger.Debug("checkpointed lsn", zap.String("lsn", cpPos.LSN))
 		}
 		return nil
 	}
@@ -317,11 +331,12 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 	// Phase 4: Checkpoint only on commit boundaries (full success)
 	if last.Commit {
-		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
+		cpPos := checkpointPositionForCommit(last)
+		if err := e.checkpointer.MaybeFlush(ctx, cpPos, true, time.Now()); err != nil {
 			return fmt.Errorf("checkpoint: %w", err)
 		}
 		e.maybeAcknowledgeCheckpoint()
-		e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
+		e.logger.Debug("checkpointed lsn", zap.String("lsn", cpPos.LSN))
 	}
 
 	return nil
@@ -407,8 +422,10 @@ func (e *Engine) publishWithRetry(ctx context.Context, batchPub publisher.BatchP
 				succeeded[indexed.originalIdx] = true
 			} else {
 				failedItems = append(failedItems, indexed)
-				if i < len(pending) && pending[i].Err != nil && lastError == nil {
-					lastError = pending[i].Err
+				if i < len(pending) && lastError == nil {
+					if pErr := pending[i].GetErr(); pErr != nil {
+						lastError = pErr
+					}
 				}
 			}
 		}
@@ -444,20 +461,26 @@ func (e *Engine) buildFinalResult(items []publisher.PublishItem, succeeded []boo
 		FirstError:  lastError,
 	}
 
-	var lastSuccessIdx = -1
+	var lastContiguousIdx = -1
+	var contiguousBroken bool
 	for i, ok := range succeeded {
 		if ok {
 			result.Succeeded++
-			lastSuccessIdx = i
+			if !contiguousBroken {
+				lastContiguousIdx = i
+			}
 		} else {
 			result.Failed++
 			result.FailedItems = append(result.FailedItems, i)
+			contiguousBroken = true
 		}
 	}
 
-	// Set last successful position for partial checkpointing
-	if lastSuccessIdx >= 0 && items[lastSuccessIdx].Position.LSN != "" {
-		pos := items[lastSuccessIdx].Position
+	// Set last successful position for partial checkpointing.
+	// Only checkpoint up to the last contiguous success from the start
+	// to avoid skipping failed events that precede later successes.
+	if lastContiguousIdx >= 0 && items[lastContiguousIdx].Position.LSN != "" {
+		pos := items[lastContiguousIdx].Position
 		result.LastSuccessPosition = &pos
 	}
 
@@ -526,13 +549,27 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 
 	// Checkpoint only on commit boundaries to ensure transactional consistency.
 	if last.Commit {
-		if err := e.checkpointer.MaybeFlush(ctx, last.Position, true, time.Now()); err != nil {
+		cpPos := checkpointPositionForCommit(last)
+		if err := e.checkpointer.MaybeFlush(ctx, cpPos, true, time.Now()); err != nil {
 			return fmt.Errorf("checkpoint: %w", err)
 		}
 		e.maybeAcknowledgeCheckpoint()
-		e.logger.Debug("checkpointed lsn", zap.String("lsn", last.Position.LSN))
+		e.logger.Debug("checkpointed lsn", zap.String("lsn", cpPos.LSN))
 	}
 	return nil
+}
+
+func checkpointPositionForCommit(last *model.WALEvent) model.WALPosition {
+	if last == nil {
+		return model.WALPosition{}
+	}
+	if last.Position.LSN != "" {
+		return last.Position
+	}
+	if last.LSN != "" {
+		return model.WALPosition{LSN: last.LSN}
+	}
+	return model.WALPosition{}
 }
 
 func (e *Engine) maybeAcknowledgeCheckpoint() {

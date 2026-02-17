@@ -28,3 +28,10 @@ type RawMessage struct {
 type Parser interface {
 	Parse(ctx context.Context, stream <-chan *RawMessage) (<-chan *model.WALEvent, error)
 }
+
+// ErrorReporter exposes the fatal parse error (if any) that caused the parser to stop.
+// The engine checks this when the parsed stream closes to distinguish
+// a parser failure from a normal shutdown.
+type ErrorReporter interface {
+	Err() error
+}
