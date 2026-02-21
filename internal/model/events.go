@@ -55,6 +55,8 @@ func AcquireWALEvent() *WALEvent {
 }
 
 // ReleaseWALEvent returns a WALEvent to the pool after resetting it.
+// Safe to call on events that were not originally acquired from the pool
+// (e.g. pgoutput Begin/Commit markers allocated with &WALEvent{}).
 func ReleaseWALEvent(evt *WALEvent) {
 	if evt == nil {
 		return
@@ -72,12 +74,22 @@ func ReleaseWALEvent(evt *WALEvent) {
 	evt.LSN = ""
 	evt.TxID = 0
 
-	// Clear maps but keep the underlying storage
-	for k := range evt.OldValues {
-		delete(evt.OldValues, k)
+	// Clear maps but keep the underlying storage.
+	// Reinitialize nil maps so the pool invariant (non-nil maps) is preserved.
+	// This handles events not originally from the pool (e.g. pgoutput Begin/Commit).
+	if evt.OldValues == nil {
+		evt.OldValues = make(map[string]interface{}, defaultMapCapacity)
+	} else {
+		for k := range evt.OldValues {
+			delete(evt.OldValues, k)
+		}
 	}
-	for k := range evt.NewValues {
-		delete(evt.NewValues, k)
+	if evt.NewValues == nil {
+		evt.NewValues = make(map[string]interface{}, defaultMapCapacity)
+	} else {
+		for k := range evt.NewValues {
+			delete(evt.NewValues, k)
+		}
 	}
 
 	walEventPool.Put(evt)

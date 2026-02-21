@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -87,12 +88,15 @@ func (r *Reporter) Start(ctx context.Context) {
 }
 
 // RateCounter tracks events/second with a sliding window.
+// All methods are safe for concurrent use.
 type RateCounter struct {
-	count     uint64
+	count uint64 // atomic, written by Inc/Add, read by Rate/Total
+	desc  string
+
+	mu        sync.Mutex // protects lastCount, lastTime, rate
 	lastCount uint64
 	lastTime  time.Time
 	rate      float64
-	desc      string
 }
 
 func NewRateCounter(desc string) *RateCounter {
@@ -116,8 +120,11 @@ func (r *RateCounter) Total() uint64 {
 func (r *RateCounter) Rate() float64 {
 	now := time.Now()
 	current := atomic.LoadUint64(&r.count)
-	elapsed := now.Sub(r.lastTime).Seconds()
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	elapsed := now.Sub(r.lastTime).Seconds()
 	if elapsed >= 1.0 {
 		r.rate = float64(current-r.lastCount) / elapsed
 		r.lastCount = current

@@ -21,11 +21,12 @@ import (
 )
 
 func main() {
-	// Enable block and mutex profiling for contention analysis
-	runtime.SetBlockProfileRate(1)
-	runtime.SetMutexProfileFraction(1)
-
 	cfg := config.Load()
+
+	if cfg.EnableProfiling {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+	}
 	logger, err := logging.New(cfg.Debug)
 	if err != nil {
 		panic(err)
@@ -70,6 +71,7 @@ func main() {
 
 	logger.Info("starting better-cdc",
 		zap.Bool("debug", cfg.Debug),
+		zap.Bool("profiling", cfg.EnableProfiling),
 		zap.String("slot", cfg.SlotName),
 		zap.Strings("publications", cfg.Publications),
 		zap.String("db", cfg.Database),

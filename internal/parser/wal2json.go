@@ -184,7 +184,11 @@ type pgTime struct {
 }
 
 func (t *pgTime) UnmarshalJSON(data []byte) error {
-	// Remove quotes
+	// Handle JSON null (unquoted)
+	if string(data) == "null" {
+		return nil
+	}
+	// Remove quotes from JSON string value
 	s := string(data)
 	if len(s) < 2 {
 		return nil

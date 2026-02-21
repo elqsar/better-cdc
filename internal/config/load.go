@@ -95,6 +95,9 @@ func Load() Config {
 			cfg.MaxTxBufferSize = i
 		}
 	}
+	if v := strings.ToLower(os.Getenv("ENABLE_PROFILING")); v == "1" || v == "true" || v == "yes" {
+		cfg.EnableProfiling = true
+	}
 
 	return cfg
 }

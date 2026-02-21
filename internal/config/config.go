@@ -30,6 +30,11 @@ type Config struct {
 	// When exceeded, events are streamed immediately instead of buffered until COMMIT
 	// This prevents OOM during large transactions (bulk inserts, migrations)
 	MaxTxBufferSize int // Maximum events to buffer per transaction (default: 100000, 0 = unlimited)
+
+	// EnableProfiling enables block and mutex profiling (pprof).
+	// Disabled by default because SetBlockProfileRate(1) captures every blocking
+	// event and adds non-trivial overhead to channel/mutex operations.
+	EnableProfiling bool
 }
 
 // DefaultConfig provides safe defaults for local prototyping.

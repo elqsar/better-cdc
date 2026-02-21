@@ -145,6 +145,11 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			err = e.flushSequential(ctx, batch, last)
 		}
 
+		// Release WALEvents back to pool. At this point all event data has
+		// been marshaled to JSON bytes and CDCEvents have been released.
+		for _, evt := range batch {
+			model.ReleaseWALEvent(evt)
+		}
 		batch = batch[:0]
 		if !timer.Stop() {
 			select {

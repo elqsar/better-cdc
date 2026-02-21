@@ -14,26 +14,6 @@ type Store interface {
 	Load(ctx context.Context) (model.WALPosition, error)
 }
 
-// MemoryStore is a simple in-memory checkpoint store useful for initial wiring.
-type MemoryStore struct {
-	last model.WALPosition
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{}
-}
-
-func (s *MemoryStore) Save(ctx context.Context, pos model.WALPosition) error {
-	_ = ctx
-	s.last = pos
-	return nil
-}
-
-func (s *MemoryStore) Load(ctx context.Context) (model.WALPosition, error) {
-	_ = ctx
-	return s.last, nil
-}
-
 // Manager coordinates periodic checkpointing tied to JetStream ack success.
 type Manager struct {
 	store     Store
