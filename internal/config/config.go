@@ -31,6 +31,14 @@ type Config struct {
 	// This prevents OOM during large transactions (bulk inserts, migrations)
 	MaxTxBufferSize int // Maximum events to buffer per transaction (default: 100000, 0 = unlimited)
 
+	// JetStream stream durability configuration
+	StreamName       string        // JetStream stream name (default: "CDC")
+	StreamSubjects   []string      // Stream subject filters (default: ["cdc.>"])
+	StreamStorage    string        // "file" or "memory" (default: "file")
+	StreamReplicas   int           // Number of replicas (default: 1)
+	StreamMaxAge     time.Duration // Max age for messages (default: 72h)
+	DuplicateWindow  time.Duration // De-duplication window (default: 2m)
+
 	// EnableProfiling enables block and mutex profiling (pprof).
 	// Disabled by default because SetBlockProfileRate(1) captures every blocking
 	// event and adds non-trivial overhead to channel/mutex operations.
@@ -54,5 +62,11 @@ func DefaultConfig() Config {
 		RawMessageBufferSize:  5000,
 		ParsedEventBufferSize: 5000,
 		MaxTxBufferSize:       100000, // 100k events max per transaction before streaming
+		StreamName:            "CDC",
+		StreamSubjects:        []string{"cdc.>"},
+		StreamStorage:         "file",
+		StreamReplicas:        1,
+		StreamMaxAge:          72 * time.Hour,
+		DuplicateWindow:       2 * time.Minute,
 	}
 }

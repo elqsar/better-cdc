@@ -15,8 +15,8 @@ import (
 // Publisher pushes CDCEvents to NATS JetStream.
 type Publisher interface {
 	Connect() error
-	Publish(ctx context.Context, subject string, data []byte) error
-	PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int) error
+	Publish(ctx context.Context, subject string, data []byte, eventID string) error
+	PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error
 	Close() error
 }
 
@@ -157,18 +157,19 @@ func NewNoopPublisher() *NoopPublisher {
 
 func (p *NoopPublisher) Connect() error { return nil }
 
-func (p *NoopPublisher) Publish(ctx context.Context, subject string, data []byte) error {
+func (p *NoopPublisher) Publish(ctx context.Context, subject string, data []byte, eventID string) error {
 	_ = ctx
+	_ = eventID
 	p.LastSubject = subject
 	_ = data
 	p.logger.Debug("noop publisher invoked", zap.String("subject", subject))
 	return nil
 }
 
-func (p *NoopPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int) error {
+func (p *NoopPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error {
 	_ = ctx
 	_ = maxRetries
-	return p.Publish(ctx, subject, data)
+	return p.Publish(ctx, subject, data, eventID)
 }
 
 func (p *NoopPublisher) Close() error { return nil }

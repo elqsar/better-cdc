@@ -27,13 +27,17 @@ type JetStreamPublisher struct {
 }
 
 type JetStreamOptions struct {
-	URLs           []string
-	Username       string
-	Password       string
-	ConnectTimeout time.Duration
-	PublishTimeout time.Duration
-	StreamName     string
-	StreamSubjects []string
+	URLs            []string
+	Username        string
+	Password        string
+	ConnectTimeout  time.Duration
+	PublishTimeout  time.Duration
+	StreamName      string
+	StreamSubjects  []string
+	StreamStorage   string        // "file" or "memory" (default: file)
+	StreamReplicas  int           // Number of replicas (default: 1)
+	StreamMaxAge    time.Duration // Max age for messages (default: 72h)
+	DuplicateWindow time.Duration // De-duplication window (default: 2m)
 }
 
 func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStreamPublisher {
@@ -89,11 +93,15 @@ func (p *JetStreamPublisher) Connect() error {
 	return nil
 }
 
-func (p *JetStreamPublisher) Publish(ctx context.Context, subject string, data []byte) error {
+func (p *JetStreamPublisher) Publish(ctx context.Context, subject string, data []byte, eventID string) error {
 	if p.js == nil {
 		return fmt.Errorf("jetstream not connected")
 	}
-	pa, err := p.js.PublishAsync(subject, data)
+	var opts []nats.PubOpt
+	if eventID != "" {
+		opts = append(opts, nats.MsgId(eventID))
+	}
+	pa, err := p.js.PublishAsync(subject, data, opts...)
 	if err != nil {
 		return fmt.Errorf("publish async: %w", err)
 	}
@@ -113,10 +121,10 @@ func (p *JetStreamPublisher) Publish(ctx context.Context, subject string, data [
 	}
 }
 
-func (p *JetStreamPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int) error {
+func (p *JetStreamPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error {
 	var lastErr error
 	for i := 0; i <= maxRetries; i++ {
-		if err := p.Publish(ctx, subject, data); err != nil {
+		if err := p.Publish(ctx, subject, data, eventID); err != nil {
 			lastErr = err
 			select {
 			case <-ctx.Done():
@@ -169,6 +177,23 @@ func (p *JetStreamPublisher) ensureStream() error {
 		subjects = []string{"cdc.>"}
 	}
 
+	storage := nats.FileStorage
+	if strings.EqualFold(p.opts.StreamStorage, "memory") {
+		storage = nats.MemoryStorage
+	}
+	replicas := p.opts.StreamReplicas
+	if replicas < 1 {
+		replicas = 1
+	}
+	maxAge := p.opts.StreamMaxAge
+	if maxAge <= 0 {
+		maxAge = 72 * time.Hour
+	}
+	dupWindow := p.opts.DuplicateWindow
+	if dupWindow <= 0 {
+		dupWindow = 2 * time.Minute
+	}
+
 	if _, err := p.js.StreamInfo(streamName); err == nil {
 		p.logger.Debug("stream already exists", zap.String("stream", streamName))
 		return nil
@@ -177,13 +202,23 @@ func (p *JetStreamPublisher) ensureStream() error {
 	}
 
 	if _, err := p.js.AddStream(&nats.StreamConfig{
-		Name:      streamName,
-		Subjects:  subjects,
-		Retention: nats.LimitsPolicy,
+		Name:       streamName,
+		Subjects:   subjects,
+		Retention:  nats.LimitsPolicy,
+		Storage:    storage,
+		Replicas:   replicas,
+		MaxAge:     maxAge,
+		Duplicates: dupWindow,
 	}); err != nil {
 		return fmt.Errorf("create stream: %w", err)
 	}
-	p.logger.Info("created jetstream stream", zap.String("stream", streamName), zap.Strings("subjects", subjects))
+	p.logger.Info("created jetstream stream",
+		zap.String("stream", streamName),
+		zap.Strings("subjects", subjects),
+		zap.String("storage", p.opts.StreamStorage),
+		zap.Int("replicas", replicas),
+		zap.Duration("max_age", maxAge),
+		zap.Duration("duplicate_window", dupWindow))
 	return nil
 }
 
@@ -217,7 +252,11 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 			done:    make(chan struct{}),
 		}
 
-		pa, err := p.js.PublishAsync(item.Subject, item.Data)
+		var opts []nats.PubOpt
+		if item.EventID != "" {
+			opts = append(opts, nats.MsgId(item.EventID))
+		}
+		pa, err := p.js.PublishAsync(item.Subject, item.Data, opts...)
 		if err != nil {
 			pend.Err = err
 			close(pend.done)
@@ -291,9 +330,9 @@ func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*Pending
 			p.countResults(pending, items, completed, result)
 			return result, ctx.Err()
 		case <-deadline.C:
-			// Timeout - count what completed before deadline
-			result.FirstError = fmt.Errorf("timeout waiting for acks: %d/%d resolved", result.Succeeded, len(pending))
+			// Timeout - tally actual results, then build error with accurate counts
 			p.countResults(pending, items, completed, result)
+			result.FirstError = fmt.Errorf("timeout waiting for acks: %d/%d resolved", result.Succeeded, len(pending))
 			return result, result.FirstError
 		case <-pend.done:
 			completed[i] = true

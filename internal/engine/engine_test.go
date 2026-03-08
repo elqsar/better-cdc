@@ -51,10 +51,10 @@ func newMockBatchPublisher() *mockBatchPublisher {
 
 func (m *mockBatchPublisher) Connect() error { return nil }
 func (m *mockBatchPublisher) Close() error   { return nil }
-func (m *mockBatchPublisher) Publish(ctx context.Context, subject string, data []byte) error {
+func (m *mockBatchPublisher) Publish(ctx context.Context, subject string, data []byte, eventID string) error {
 	return nil
 }
-func (m *mockBatchPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int) error {
+func (m *mockBatchPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error {
 	return nil
 }
 

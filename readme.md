@@ -62,6 +62,14 @@ Environment variables (defaults in `internal/config`):
 - `NATS_USERNAME`, `NATS_PASSWORD`
 - `NATS_TIMEOUT` (default `5s`)
 
+**JetStream Stream:**
+- `STREAM_NAME` (default `CDC`)
+- `STREAM_SUBJECTS` (comma-separated; default `cdc.>`)
+- `STREAM_STORAGE` (`file` or `memory`; default `file`)
+- `STREAM_REPLICAS` (default `1`)
+- `STREAM_MAX_AGE` (default `72h`) - max retention age for messages
+- `DUPLICATE_WINDOW` (default `2m`) - JetStream de-duplication window; publishes with the same `event_id` within this window are idempotent
+
 **Other:**
 - `HEALTH_ADDR` (default `:8080`)
 - `DEBUG` (set `true` for verbose logging)
@@ -85,7 +93,8 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 
 ## Delivery semantics
 - Postgres replication feedback is only advanced to the last *durably persisted* checkpoint, so a crash/restart can replay already-published events (**at-least-once**).
-- Consumers that need exactly-once processing should de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
+- JetStream de-duplication is enabled by default: each message is published with `Nats-Msg-Id` set to the deterministic `event_id`. Duplicate publishes within the configured `DUPLICATE_WINDOW` (default 2 minutes) are silently discarded by JetStream, providing **effectively-once** delivery within that window.
+- Consumers that need exactly-once processing beyond the de-dup window should de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
 
 ## Throughput Tuning
 
@@ -111,7 +120,22 @@ Set buffer sizes to `0` to revert to unbuffered (sequential) behavior for debugg
 - JetStream stream can be customized via `JetStreamOptions` (stream name, subjects); defaults target `cdc.*` topics.
 - wal2json path now emits begin/commit markers so checkpoints persist; `pgoutput` remains the recommended plugin for RDS-like environments.
 
+## Integration Tests
+
+End-to-end tests validate the full CDC pipeline (Postgres WAL -> Parser -> Engine -> JetStream -> Checkpoint) using testcontainers-go. Requires Docker running.
+
+```bash
+go test -tags=integration -v -timeout=3m ./tests/integration/
+```
+
+Tests cover:
+- **Basic CDC** (`TestBasicCDC`): INSERT/UPDATE/DELETE capture with both `wal2json` and `pgoutput` parsers, plus cross-table validation.
+- **Checkpoint Recovery** (`TestCheckpointRecovery`): Graceful restart resumes from checkpoint without replaying old events.
+- **At-Least-Once Recovery** (`TestRecoveryAtLeastOnce`): Hard-kill mid-stream, verify all events are captured across two engine runs.
+- **JetStream Dedup** (`TestJetStreamDedup`): Duplicate messages with the same `event_id` are rejected by JetStream.
+
 ## Development
 - Requires Go 1.23+
-- Run `go test ./...` (unit-level only; no integration harness yet).
+- Run `go test ./...` for unit tests.
+- Run `go test -tags=integration -v -timeout=3m ./tests/integration/` for integration tests (requires Docker).
 - Code lives under `internal/`; entrypoint `cmd/cdc-handler/main.go`.

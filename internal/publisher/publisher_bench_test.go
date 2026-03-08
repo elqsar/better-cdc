@@ -110,7 +110,7 @@ func BenchmarkNoopPublish(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		err := p.Publish(context.TODO(), "cdc.mydb.public.users", data)
+		err := p.Publish(context.TODO(), "cdc.mydb.public.users", data, "test-event-id")
 		if err != nil {
 			b.Fatal(err)
 		}

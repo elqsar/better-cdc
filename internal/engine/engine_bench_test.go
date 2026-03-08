@@ -138,10 +138,10 @@ type MockBatchPublisher struct {
 
 func (m *MockBatchPublisher) Connect() error { return nil }
 func (m *MockBatchPublisher) Close() error   { return nil }
-func (m *MockBatchPublisher) Publish(ctx context.Context, subject string, data []byte) error {
+func (m *MockBatchPublisher) Publish(ctx context.Context, subject string, data []byte, eventID string) error {
 	return nil
 }
-func (m *MockBatchPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int) error {
+func (m *MockBatchPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error {
 	return nil
 }
 

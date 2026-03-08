@@ -529,10 +529,11 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 			model.ReleaseCDCEvent(cdcEvt)
 			return fmt.Errorf("marshal event: %w", err)
 		}
+		eventID := cdcEvt.EventID
 		// Release event after marshaling
 		model.ReleaseCDCEvent(cdcEvt)
 
-		if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3); err != nil {
+		if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3, eventID); err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}
 		eventCount++

@@ -100,11 +100,17 @@ func buildPublisher(cfg config.Config, logger *zap.Logger) publisher.Publisher {
 		return publisher.NewNoopPublisher()
 	}
 	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
-		URLs:           cfg.NATSURLs,
-		Username:       cfg.NATSUsername,
-		Password:       cfg.NATSPassword,
-		ConnectTimeout: cfg.NATSTimeout,
-		PublishTimeout: cfg.NATSTimeout,
+		URLs:            cfg.NATSURLs,
+		Username:        cfg.NATSUsername,
+		Password:        cfg.NATSPassword,
+		ConnectTimeout:  cfg.NATSTimeout,
+		PublishTimeout:  cfg.NATSTimeout,
+		StreamName:      cfg.StreamName,
+		StreamSubjects:  cfg.StreamSubjects,
+		StreamStorage:   cfg.StreamStorage,
+		StreamReplicas:  cfg.StreamReplicas,
+		StreamMaxAge:    cfg.StreamMaxAge,
+		DuplicateWindow: cfg.DuplicateWindow,
 	}, logger)
 }
 

@@ -95,6 +95,39 @@ func Load() Config {
 			cfg.MaxTxBufferSize = i
 		}
 	}
+	if v := os.Getenv("STREAM_NAME"); v != "" {
+		cfg.StreamName = v
+	}
+	if v := os.Getenv("STREAM_SUBJECTS"); v != "" {
+		parts := strings.Split(v, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		if len(out) > 0 {
+			cfg.StreamSubjects = out
+		}
+	}
+	if v := strings.ToLower(os.Getenv("STREAM_STORAGE")); v == "file" || v == "memory" {
+		cfg.StreamStorage = v
+	}
+	if v := os.Getenv("STREAM_REPLICAS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			cfg.StreamReplicas = i
+		}
+	}
+	if v := os.Getenv("STREAM_MAX_AGE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.StreamMaxAge = d
+		}
+	}
+	if v := os.Getenv("DUPLICATE_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.DuplicateWindow = d
+		}
+	}
 	if v := strings.ToLower(os.Getenv("ENABLE_PROFILING")); v == "1" || v == "true" || v == "yes" {
 		cfg.EnableProfiling = true
 	}
