@@ -6,21 +6,22 @@ import (
 
 // Config captures minimal settings for initial wiring.
 type Config struct {
-	Database       string
-	SlotName       string
-	Plugin         string
-	DatabaseURL    string
-	BatchSize      int
-	BatchTimeout   time.Duration
-	CheckpointFreq time.Duration
-	NATSURLs       []string
-	NATSUsername   string
-	NATSPassword   string
-	NATSTimeout    time.Duration
-	HealthAddr     string
-	TableFilters   []string
-	Publications   []string
-	Debug          bool
+	Database           string
+	SlotName           string
+	Plugin             string
+	DatabaseURL        string
+	BatchSize          int
+	BatchTimeout       time.Duration
+	CheckpointFreq     time.Duration
+	NATSURLs           []string
+	NATSUsername       string
+	NATSPassword       string
+	NATSTimeout        time.Duration
+	AllowNoopPublisher bool
+	HealthAddr         string
+	TableFilters       []string
+	Publications       []string
+	Debug              bool
 
 	// Pipeline buffer sizes for throughput optimization
 	RawMessageBufferSize  int // Buffer between WAL reader and parser (default: 5000)
@@ -32,12 +33,12 @@ type Config struct {
 	MaxTxBufferSize int // Maximum events to buffer per transaction (default: 100000, 0 = unlimited)
 
 	// JetStream stream durability configuration
-	StreamName       string        // JetStream stream name (default: "CDC")
-	StreamSubjects   []string      // Stream subject filters (default: ["cdc.>"])
-	StreamStorage    string        // "file" or "memory" (default: "file")
-	StreamReplicas   int           // Number of replicas (default: 1)
-	StreamMaxAge     time.Duration // Max age for messages (default: 72h)
-	DuplicateWindow  time.Duration // De-duplication window (default: 2m)
+	StreamName      string        // JetStream stream name (default: "CDC")
+	StreamSubjects  []string      // Stream subject filters (default: ["cdc.>"])
+	StreamStorage   string        // "file" or "memory" (default: "file")
+	StreamReplicas  int           // Number of replicas (default: 1)
+	StreamMaxAge    time.Duration // Max age for messages (default: 72h)
+	DuplicateWindow time.Duration // De-duplication window (default: 2m)
 
 	// EnableProfiling enables block and mutex profiling (pprof).
 	// Disabled by default because SetBlockProfileRate(1) captures every blocking

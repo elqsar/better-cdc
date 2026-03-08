@@ -52,6 +52,9 @@ func Load() Config {
 			cfg.NATSTimeout = d
 		}
 	}
+	if v := strings.ToLower(os.Getenv("ALLOW_NOOP_PUBLISHER")); v == "1" || v == "true" || v == "yes" {
+		cfg.AllowNoopPublisher = true
+	}
 	if v := os.Getenv("HEALTH_ADDR"); v != "" {
 		cfg.HealthAddr = v
 	}

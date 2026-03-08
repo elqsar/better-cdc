@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,13 +67,18 @@ func main() {
 		})
 	}
 	trans := transformer.NewSimpleTransformer(cfg.Database)
-	pub := buildPublisher(cfg, logger)
+	pub, err := buildPublisher(cfg, logger)
+	if err != nil {
+		logger.Error("invalid publisher configuration", zap.Error(err))
+		os.Exit(1)
+	}
 	store := checkpoint.NewSlotStore(cfg.DatabaseURL, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
 
 	logger.Info("starting better-cdc",
 		zap.Bool("debug", cfg.Debug),
 		zap.Bool("profiling", cfg.EnableProfiling),
+		zap.Bool("allow_noop_publisher", cfg.AllowNoopPublisher),
 		zap.String("slot", cfg.SlotName),
 		zap.Strings("publications", cfg.Publications),
 		zap.String("db", cfg.Database),
@@ -94,13 +101,17 @@ func main() {
 	}
 }
 
-func buildPublisher(cfg config.Config, logger *zap.Logger) publisher.Publisher {
-	if len(cfg.NATSURLs) == 0 {
-		logger.Warn("NATS URLs missing, using noop publisher")
-		return publisher.NewNoopPublisher()
+func buildPublisher(cfg config.Config, logger *zap.Logger) (publisher.Publisher, error) {
+	urls := compactStrings(cfg.NATSURLs)
+	if len(urls) == 0 {
+		if !cfg.AllowNoopPublisher {
+			return nil, fmt.Errorf("NATS_URL is required unless ALLOW_NOOP_PUBLISHER=true")
+		}
+		logger.Warn("NATS URLs missing, using noop publisher because ALLOW_NOOP_PUBLISHER is enabled")
+		return publisher.NewNoopPublisher(), nil
 	}
 	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
-		URLs:            cfg.NATSURLs,
+		URLs:            urls,
 		Username:        cfg.NATSUsername,
 		Password:        cfg.NATSPassword,
 		ConnectTimeout:  cfg.NATSTimeout,
@@ -111,7 +122,7 @@ func buildPublisher(cfg config.Config, logger *zap.Logger) publisher.Publisher {
 		StreamReplicas:  cfg.StreamReplicas,
 		StreamMaxAge:    cfg.StreamMaxAge,
 		DuplicateWindow: cfg.DuplicateWindow,
-	}, logger)
+	}, logger), nil
 }
 
 func buildTableFilter(filters []string) map[string]struct{} {
@@ -121,6 +132,19 @@ func buildTableFilter(filters []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(filters))
 	for _, f := range filters {
 		out[f] = struct{}{}
+	}
+	return out
+}
+
+func compactStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
 	}
 	return out
 }
