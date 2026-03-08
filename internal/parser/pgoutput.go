@@ -169,6 +169,11 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 			return nil
 		}
 		p.tx.commitLSN = pglogrepl.LSN(m.CommitLSN)
+		checkpointLSN := pglogrepl.LSN(m.TransactionEndLSN)
+		if checkpointLSN == 0 {
+			checkpointLSN = p.tx.commitLSN
+		}
+		checkpointPos := model.WALPosition{LSN: checkpointLSN.String()}
 		p.tx.commitTime = m.CommitTime
 		if !m.CommitTime.IsZero() {
 			lag := time.Since(m.CommitTime).Milliseconds()
@@ -180,7 +185,7 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		if !p.tx.streaming {
 			for _, evt := range p.tx.events {
 				evt.CommitTime = p.tx.commitTime
-				evt.Position = model.WALPosition{LSN: p.tx.commitLSN.String()}
+				evt.Position = checkpointPos
 				evt.LSN = p.tx.commitLSN.String()
 				evt.TxID = uint64(p.tx.xid)
 				evt.Timestamp = p.tx.commitTime
@@ -201,7 +206,7 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 
 		commitEvt := &model.WALEvent{
 			Commit:     true,
-			Position:   model.WALPosition{LSN: p.tx.commitLSN.String()},
+			Position:   checkpointPos,
 			LSN:        p.tx.commitLSN.String(),
 			CommitTime: p.tx.commitTime,
 			TxID:       uint64(p.tx.xid),
@@ -242,6 +247,12 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		}
 		evt := p.buildEventFromTuple(m.RelationID, m.OldTuple.Columns, model.OperationDelete)
 		if evt != nil {
+			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+				return err
+			}
+		}
+	case *pglogrepl.TruncateMessage:
+		for _, evt := range p.buildTruncateEvents(m.RelationIDs) {
 			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
 				return err
 			}
@@ -312,8 +323,35 @@ func (p *PGOutputParser) lookupRelation(relID uint32) relationInfo {
 	return relationInfo{}
 }
 
+func (p *PGOutputParser) buildTruncateEvents(relIDs []uint32) []*model.WALEvent {
+	events := make([]*model.WALEvent, 0, len(relIDs))
+	for _, relID := range relIDs {
+		rel := p.lookupRelation(relID)
+		evt := p.buildRelationEvent(rel, model.OperationDDL)
+		if evt != nil {
+			events = append(events, evt)
+		}
+	}
+	return events
+}
+
 func (p *PGOutputParser) buildEventFromTuple(relID uint32, cols []*pglogrepl.TupleDataColumn, op model.OperationType) *model.WALEvent {
 	rel := p.lookupRelation(relID)
+	evt := p.buildRelationEvent(rel, op)
+	if evt == nil {
+		return nil
+	}
+
+	switch op {
+	case model.OperationInsert, model.OperationUpdate:
+		p.populateTupleColumnMap(evt.NewValues, rel, cols)
+	case model.OperationDelete:
+		p.populateTupleColumnMap(evt.OldValues, rel, cols)
+	}
+	return evt
+}
+
+func (p *PGOutputParser) buildRelationEvent(rel relationInfo, op model.OperationType) *model.WALEvent {
 	if rel.ID == 0 {
 		return nil
 	}
@@ -334,13 +372,6 @@ func (p *PGOutputParser) buildEventFromTuple(relID uint32, cols []*pglogrepl.Tup
 	evt.TxID = uint64(p.tx.xid)
 	evt.LSN = p.tx.beginLSN.String()
 	evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
-
-	switch op {
-	case model.OperationInsert, model.OperationUpdate:
-		p.populateTupleColumnMap(evt.NewValues, rel, cols)
-	case model.OperationDelete:
-		p.populateTupleColumnMap(evt.OldValues, rel, cols)
-	}
 	return evt
 }
 

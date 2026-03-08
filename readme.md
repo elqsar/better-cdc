@@ -3,7 +3,7 @@
 A lightweight Go CDC handler that reads PostgreSQL logical replication changes and publishes normalized events to NATS JetStream. Comes with Docker-based local stack (Postgres + NATS JetStream) for quick end-to-end testing.
 
 ## Features
-- PostgreSQL logical replication via `pgoutput` (default) or `wal2json`.
+- PostgreSQL logical replication via `pgoutput` or `wal2json` (`wal2json` is the config default; `pgoutput` is the recommended production plugin).
 - Deterministic event IDs, before/after images, commit timestamps.
 - NATS JetStream publisher with automatic stream creation and publish retries.
 - **High throughput pipeline** with configurable buffered channels and batch async publishing.
@@ -94,9 +94,17 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - **Health/Metrics**: `/health` for liveness, `/ready` for dependency readiness, `/metrics` for Prometheus.
 
 ## Delivery semantics
-- Postgres replication feedback is only advanced to the last *durably persisted* checkpoint, so a crash/restart can replay already-published events (**at-least-once**).
-- JetStream de-duplication is enabled by default: each message is published with `Nats-Msg-Id` set to the deterministic `event_id`. Duplicate publishes within the configured `DUPLICATE_WINDOW` (default 2 minutes) are silently discarded by JetStream, providing **effectively-once** delivery within that window.
-- Consumers that need exactly-once processing beyond the de-dup window should de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
+- The engine checkpoints only on commit boundaries after publish acks succeed. PostgreSQL replication feedback is advanced only to that durable checkpoint, so the base guarantee is **at-least-once**.
+- On a graceful shutdown, the engine flushes any pending durable checkpoint and sends a final `StandbyStatusUpdate` before closing the replication connection. If the slot was already current, `confirmed_flush_lsn` may not visibly move during shutdown; either way, restarting the same slot resumes from the last flushed checkpoint so already-acknowledged commits should not be replayed on a clean stop/start cycle.
+- Unclean exits can still replay already-published commits: process crashes, host loss, network failures before feedback reaches PostgreSQL, and partial batch failures all fall back to **at-least-once** behavior.
+- JetStream de-duplication is enabled by default: each message is published with `Nats-Msg-Id` set to the deterministic `event_id`. Duplicate publishes within the configured `DUPLICATE_WINDOW` (default 2 minutes) are silently discarded by JetStream, providing **effectively-once** delivery only within that window.
+- Consumers that need exactly-once processing beyond the de-dup window must de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
+
+## Known limitations
+- Schema evolution is not tracked as first-class CDC. `ALTER TABLE` and most other DDL are not emitted as structured events, so consumers must tolerate shape changes during deploys.
+- `TRUNCATE` is supported by both plugins and is emitted as `cdc.ddl` with empty `before` / `after` images. Other DDL is still unsupported.
+- Large `pgoutput` transactions are buffered until commit. If `MAX_TX_BUFFER_SIZE` is exceeded, the parser switches to streaming mode to avoid unbounded memory growth; row events from that overflowed transaction can be published before commit metadata is available.
+- Duplicate delivery remains possible after crashes, after publish retries, or after recovery outside the JetStream de-dup window.
 
 ## Throughput Tuning
 
@@ -132,8 +140,9 @@ go test -tags=integration -v -timeout=3m ./tests/integration/
 
 Tests cover:
 - **Basic CDC** (`TestBasicCDC`): INSERT/UPDATE/DELETE capture with both `wal2json` and `pgoutput` parsers, plus cross-table validation.
-- **Checkpoint Recovery** (`TestCheckpointRecovery`): Graceful restart resumes from checkpoint without replaying old events.
+- **Checkpoint Recovery** (`TestCheckpointRecovery`): Graceful shutdown preserves the flushed checkpoint, and restart on the same slot resumes with only post-shutdown work.
 - **At-Least-Once Recovery** (`TestRecoveryAtLeastOnce`): Hard-kill mid-stream, verify all events are captured across two engine runs.
+- **Truncate Parity** (`TestTruncateCDC`): `TRUNCATE` is emitted as `cdc.ddl` for both `wal2json` and `pgoutput`.
 - **JetStream Dedup** (`TestJetStreamDedup`): Duplicate messages with the same `event_id` are rejected by JetStream.
 
 ## Development
