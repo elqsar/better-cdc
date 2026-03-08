@@ -134,6 +134,9 @@ func Load() Config {
 	if v := strings.ToLower(os.Getenv("ENABLE_PROFILING")); v == "1" || v == "true" || v == "yes" {
 		cfg.EnableProfiling = true
 	}
+	if v := strings.ToLower(os.Getenv("ENABLE_PPROF")); v == "1" || v == "true" || v == "yes" {
+		cfg.EnablePprof = true
+	}
 
 	return cfg
 }

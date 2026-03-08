@@ -54,6 +54,9 @@ type ErrorReporter interface {
 }
 
 var sendStandbyStatusUpdate = pglogrepl.SendStandbyStatusUpdate
+var closeReplicationConn = func(ctx context.Context, conn *pgconn.PgConn) error {
+	return conn.Close(ctx)
+}
 
 // Reader streams logical replication changes from PostgreSQL.
 type Reader interface {
@@ -161,10 +164,19 @@ func (r *PGReader) GetCurrentPosition(ctx context.Context) (model.WALPosition, e
 }
 
 func (r *PGReader) Stop(ctx context.Context) error {
+	finalCtx := ctx
+	if finalCtx == nil || finalCtx.Err() != nil {
+		var cancel context.CancelFunc
+		finalCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
 	if r.conn != nil {
 		r.logger.Info("stopping replication connection")
+		if err := r.sendStandbyStatus(finalCtx, true); err != nil {
+			r.logger.Warn("final standby status failed", zap.Error(err))
+		}
 	}
-	return r.resetConnection(ctx)
+	return r.resetConnection(finalCtx)
 }
 
 func (r *PGReader) replicationHandlers() (replicationStartFunc, replicationLoopFunc, string, error) {
@@ -432,7 +444,7 @@ func (r *PGReader) resetConnection(ctx context.Context) error {
 	if r.conn == nil {
 		return nil
 	}
-	err := r.conn.Close(ctx)
+	err := closeReplicationConn(ctx, r.conn)
 	if err != nil {
 		r.logger.Warn("close replication connection failed", zap.Error(err))
 	}

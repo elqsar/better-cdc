@@ -11,3 +11,13 @@ func TestLoad_AllowNoopPublisher(t *testing.T) {
 		t.Fatal("expected AllowNoopPublisher to be true")
 	}
 }
+
+func TestLoad_EnablePprof(t *testing.T) {
+	t.Setenv("ENABLE_PPROF", "true")
+
+	cfg := Load()
+
+	if !cfg.EnablePprof {
+		t.Fatal("expected EnablePprof to be true")
+	}
+}

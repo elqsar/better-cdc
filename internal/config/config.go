@@ -44,6 +44,10 @@ type Config struct {
 	// Disabled by default because SetBlockProfileRate(1) captures every blocking
 	// event and adds non-trivial overhead to channel/mutex operations.
 	EnableProfiling bool
+
+	// EnablePprof exposes /debug/pprof endpoints on the health server.
+	// Disabled by default to avoid exposing diagnostic endpoints in production.
+	EnablePprof bool
 }
 
 // DefaultConfig provides safe defaults for local prototyping.

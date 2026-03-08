@@ -37,8 +37,6 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	health.Start(ctx, cfg.HealthAddr, logger)
-	logger.Info("prometheus metrics available", zap.String("endpoint", cfg.HealthAddr+"/metrics"))
 
 	tableFilter := buildTableFilter(cfg.TableFilters)
 
@@ -74,6 +72,37 @@ func main() {
 	}
 	store := checkpoint.NewSlotStore(cfg.DatabaseURL, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
+	health.Start(ctx, health.Options{
+		Addr:        cfg.HealthAddr,
+		EnablePprof: cfg.EnablePprof,
+		Logger:      logger,
+		Readiness: []health.Check{
+			{
+				Name: "postgres",
+				Func: func(ctx context.Context) error {
+					_, err := store.Load(ctx)
+					return err
+				},
+			},
+			{
+				Name: "publisher",
+				Func: func(ctx context.Context) error {
+					ready, ok := pub.(interface {
+						Ready(context.Context) error
+					})
+					if !ok {
+						return nil
+					}
+					return ready.Ready(ctx)
+				},
+			},
+		},
+	})
+	logger.Info("health server configured",
+		zap.String("health_endpoint", cfg.HealthAddr+"/health"),
+		zap.String("ready_endpoint", cfg.HealthAddr+"/ready"),
+		zap.String("metrics_endpoint", cfg.HealthAddr+"/metrics"),
+		zap.Bool("pprof_enabled", cfg.EnablePprof))
 
 	logger.Info("starting better-cdc",
 		zap.Bool("debug", cfg.Debug),

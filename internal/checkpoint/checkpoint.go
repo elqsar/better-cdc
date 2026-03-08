@@ -18,6 +18,7 @@ type Store interface {
 type Manager struct {
 	store     Store
 	interval  time.Duration
+	lastAcked model.WALPosition
 	lastFlush model.WALPosition
 	lastTime  time.Time
 	logger    *zap.Logger
@@ -35,6 +36,7 @@ func (m *Manager) Init(pos model.WALPosition, now time.Time) {
 	if pos.LSN == "" {
 		return
 	}
+	m.lastAcked = pos
 	m.lastFlush = pos
 	m.lastTime = now
 }
@@ -50,13 +52,27 @@ func (m *Manager) MaybeFlush(ctx context.Context, pos model.WALPosition, acked b
 	if !acked {
 		return nil
 	}
+	m.lastAcked = pos
 	if m.lastFlush.LSN == "" || now.Sub(m.lastTime) >= m.interval {
-		m.logger.Debug("saving checkpoint", zap.String("lsn", pos.LSN))
-		if err := m.store.Save(ctx, pos); err != nil {
-			return err
-		}
-		m.lastFlush = pos
-		m.lastTime = now
+		return m.flush(ctx, pos, now)
 	}
+	return nil
+}
+
+// FlushPending persists the most recent durable position regardless of interval.
+func (m *Manager) FlushPending(ctx context.Context, now time.Time) error {
+	if m.lastAcked.LSN == "" || m.lastAcked.LSN == m.lastFlush.LSN {
+		return nil
+	}
+	return m.flush(ctx, m.lastAcked, now)
+}
+
+func (m *Manager) flush(ctx context.Context, pos model.WALPosition, now time.Time) error {
+	m.logger.Debug("saving checkpoint", zap.String("lsn", pos.LSN))
+	if err := m.store.Save(ctx, pos); err != nil {
+		return err
+	}
+	m.lastFlush = pos
+	m.lastTime = now
 	return nil
 }

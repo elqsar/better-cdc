@@ -74,6 +74,7 @@ Environment variables (defaults in `internal/config`):
 **Other:**
 - `HEALTH_ADDR` (default `:8080`)
 - `DEBUG` (set `true` for verbose logging)
+- `ENABLE_PPROF` (default `false`) - exposes `/debug/pprof/*` endpoints on the health server
 
 ## Architecture (high level)
 
@@ -90,7 +91,7 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - **Publisher** (`internal/publisher`): connects to NATS JetStream, ensures stream exists (defaults: name `CDC`, subjects `cdc.>`). Supports batch async publishing for high throughput.
 - **Engine** (`internal/engine`): orchestrates the pipeline; batches events by size/timeout/commit boundaries; uses async batch publishing when available.
 - **Checkpoint Manager** (`internal/checkpoint`): on startup, reads `confirmed_flush_lsn` from the PostgreSQL replication slot. During operation, the `StandbyStatusUpdate` heartbeat advances the slot position in Postgres; the checkpoint `Save` is a no-op since Postgres already tracks the position durably.
-- **Health/Metrics**: `/health` endpoint; periodic counters/gauges logger.
+- **Health/Metrics**: `/health` for liveness, `/ready` for dependency readiness, `/metrics` for Prometheus.
 
 ## Delivery semantics
 - Postgres replication feedback is only advanced to the last *durably persisted* checkpoint, so a crash/restart can replay already-published events (**at-least-once**).

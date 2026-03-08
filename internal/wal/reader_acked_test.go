@@ -98,3 +98,43 @@ func TestPGReader_sendStandbyStatus_ReplyRequestedSendsEvenWhenZero(t *testing.T
 		t.Fatalf("expected ReplyRequested=true")
 	}
 }
+
+func TestPGReader_Stop_SendsFinalStandbyStatusWithCanceledContext(t *testing.T) {
+	r := NewPGReader(SlotConfig{}, 0, zap.NewNop())
+	r.conn = &pgconn.PgConn{}
+	acked, _ := pglogrepl.ParseLSN("0/42")
+	r.setAckedLSN(acked)
+
+	var (
+		called int
+		got    pglogrepl.StandbyStatusUpdate
+	)
+
+	origSend := sendStandbyStatusUpdate
+	sendStandbyStatusUpdate = func(ctx context.Context, conn *pgconn.PgConn, s pglogrepl.StandbyStatusUpdate) error {
+		called++
+		got = s
+		return nil
+	}
+	defer func() { sendStandbyStatusUpdate = origSend }()
+
+	origClose := closeReplicationConn
+	closeReplicationConn = func(ctx context.Context, conn *pgconn.PgConn) error { return nil }
+	defer func() { closeReplicationConn = origClose }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := r.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("expected 1 standby status update, got %d", called)
+	}
+	if got.WALFlushPosition != acked {
+		t.Fatalf("expected flush LSN %s, got %s", acked, got.WALFlushPosition)
+	}
+	if !got.ReplyRequested {
+		t.Fatal("expected final standby status to request reply")
+	}
+}

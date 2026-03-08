@@ -12,4 +12,5 @@ This folder tracks engineering tasks to move `better-cdc` from a local/dev proto
 - `007-derive-subject-database-name-from-database-url.md`
 - ~~`008-add-e2e-integration-test-harness.md`~~ **Done**
 - `009-document-delivery-semantics-and-operational-runbook.md`
-
+- `010-fix-config-and-docs-consistency.md`
+- `011-fix-replication-correctness-and-plugin-parity.md`

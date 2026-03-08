@@ -99,7 +99,11 @@ func (e *Engine) Run(ctx context.Context, start model.WALPosition) error {
 	if err := e.reader.Start(ctx); err != nil {
 		return fmt.Errorf("start reader: %w", err)
 	}
-	defer e.reader.Stop(ctx)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), e.shutdownTimeout())
+		defer cancel()
+		_ = e.reader.Stop(stopCtx)
+	}()
 
 	rawStream, err := e.reader.ReadWAL(ctx, start)
 	if err != nil {
@@ -130,7 +134,7 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 		e.logger.Info("batch publisher detected, using async batch publishing")
 	}
 
-	flush := func() error {
+	flush := func(flushCtx context.Context) error {
 		if len(batch) == 0 {
 			return nil
 		}
@@ -140,9 +144,9 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 
 		var err error
 		if hasBatch {
-			err = e.flushWithBatchPublish(ctx, batch, last, batchPub)
+			err = e.flushWithBatchPublish(flushCtx, batch, last, batchPub)
 		} else {
-			err = e.flushSequential(ctx, batch, last)
+			err = e.flushSequential(flushCtx, batch, last)
 		}
 
 		// Release WALEvents back to pool. At this point all event data has
@@ -164,10 +168,21 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 	for {
 		select {
 		case <-ctx.Done():
-			return flush()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), e.shutdownTimeout())
+			defer cancel()
+			if err := flush(shutdownCtx); err != nil {
+				return err
+			}
+			if err := e.flushPendingCheckpoint(shutdownCtx); err != nil {
+				return err
+			}
+			return nil
 		case evt, ok := <-stream:
 			if !ok {
-				if err := flush(); err != nil {
+				if err := flush(ctx); err != nil {
+					return err
+				}
+				if err := e.flushPendingCheckpoint(ctx); err != nil {
 					return err
 				}
 				if ep, ok := e.parser.(parser.ErrorReporter); ok {
@@ -184,18 +199,18 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 			}
 			batch = append(batch, evt)
 			if evt.Commit {
-				if err := flush(); err != nil {
+				if err := flush(ctx); err != nil {
 					return err
 				}
 				continue
 			}
 			if e.batchSize > 0 && len(batch) >= e.batchSize {
-				if err := flush(); err != nil {
+				if err := flush(ctx); err != nil {
 					return err
 				}
 			}
 		case <-timer.C:
-			if err := flush(); err != nil {
+			if err := flush(ctx); err != nil {
 				return err
 			}
 		}
@@ -592,10 +607,25 @@ func (e *Engine) maybeAcknowledgeCheckpoint() {
 	}
 }
 
+func (e *Engine) flushPendingCheckpoint(ctx context.Context) error {
+	if e.checkpointer == nil {
+		return nil
+	}
+	if err := e.checkpointer.FlushPending(ctx, time.Now()); err != nil {
+		return fmt.Errorf("flush pending checkpoint: %w", err)
+	}
+	e.maybeAcknowledgeCheckpoint()
+	return nil
+}
+
 // publishTimeout returns the timeout for waiting on batch acks.
 func (e *Engine) publishTimeout() time.Duration {
 	timeout := max(e.batchTimeout*3, 5*time.Second)
 	return timeout
+}
+
+func (e *Engine) shutdownTimeout() time.Duration {
+	return max(e.publishTimeout()*2, 10*time.Second)
 }
 
 // EngineMetrics contains throughput metrics for external access.

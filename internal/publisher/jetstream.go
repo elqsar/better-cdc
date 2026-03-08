@@ -146,6 +146,16 @@ func (p *JetStreamPublisher) Close() error {
 	return nil
 }
 
+func (p *JetStreamPublisher) Ready(context.Context) error {
+	if p.nc == nil || p.js == nil {
+		return fmt.Errorf("jetstream not connected")
+	}
+	if !p.nc.IsConnected() {
+		return fmt.Errorf("nats connection status is %s", p.nc.Status().String())
+	}
+	return nil
+}
+
 func backoff(attempt int) time.Duration {
 	if attempt < 0 {
 		return time.Second

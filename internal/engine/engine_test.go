@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"better-cdc/internal/checkpoint"
 	"better-cdc/internal/metrics"
 	"better-cdc/internal/model"
 	"better-cdc/internal/parser"
@@ -17,6 +18,50 @@ import (
 
 	"go.uber.org/zap"
 )
+
+type mockStore struct {
+	saved []model.WALPosition
+}
+
+func (m *mockStore) Save(_ context.Context, pos model.WALPosition) error {
+	m.saved = append(m.saved, pos)
+	return nil
+}
+
+func (m *mockStore) Load(context.Context) (model.WALPosition, error) {
+	return model.WALPosition{}, nil
+}
+
+type mockTransformer struct{}
+
+func (m *mockTransformer) Transform(context.Context, *model.WALEvent) (*model.CDCEvent, error) {
+	return &model.CDCEvent{
+		EventID:   "evt-1",
+		EventType: "cdc.insert",
+		Source:    "test",
+		Schema:    "public",
+		Table:     "accounts",
+		Operation: "INSERT",
+		After: map[string]interface{}{
+			"id": 1,
+		},
+		Metadata: map[string]interface{}{"txid": "1"},
+	}, nil
+}
+
+type shutdownPublisher struct {
+	publishCtxCanceled bool
+}
+
+func (p *shutdownPublisher) Connect() error { return nil }
+func (p *shutdownPublisher) Close() error   { return nil }
+func (p *shutdownPublisher) Publish(context.Context, string, []byte, string) error {
+	return nil
+}
+func (p *shutdownPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error {
+	p.publishCtxCanceled = ctx.Err() != nil
+	return nil
+}
 
 // testMetrics is a singleton to avoid duplicate Prometheus registration
 var (
@@ -464,6 +509,112 @@ func TestRunBatched_ParserFatalError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode wal2json failed") {
 		t.Errorf("expected underlying parser error to be preserved, got: %v", err)
+	}
+}
+
+func TestRunBatched_GracefulShutdownUsesShutdownContextForFinalFlush(t *testing.T) {
+	reader := &mockErrorReader{}
+	pub := &shutdownPublisher{}
+	store := &mockStore{}
+	ckpt := checkpoint.NewManager(store, time.Hour, zap.NewNop())
+
+	e := &Engine{
+		reader:           reader,
+		transformer:      &mockTransformer{},
+		publisher:        pub,
+		checkpointer:     ckpt,
+		database:         "postgres",
+		logger:           zap.NewNop(),
+		batchSize:        100,
+		batchTimeout:     time.Hour,
+		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
+		batchesPublished: metrics.NewCounter("batches_published"),
+		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
+		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
+		promMetrics:      getTestMetrics(),
+	}
+
+	stream := make(chan *model.WALEvent, 1)
+	stream <- &model.WALEvent{
+		Operation:     model.OperationInsert,
+		Schema:        "public",
+		Table:         "accounts",
+		NewValues:     map[string]interface{}{"id": 1},
+		TransactionID: "1",
+		LSN:           "0/10",
+		TxID:          1,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.runBatched(ctx, stream)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runBatched returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runBatched did not exit")
+	}
+
+	if pub.publishCtxCanceled {
+		t.Fatal("expected shutdown flush to publish with a live shutdown context")
+	}
+}
+
+func TestRunBatched_GracefulShutdownFlushesPendingCheckpoint(t *testing.T) {
+	reader := &mockErrorReader{}
+	store := &mockStore{}
+	ckpt := checkpoint.NewManager(store, time.Hour, zap.NewNop())
+	ckpt.Init(model.WALPosition{LSN: "0/05"}, time.Now())
+
+	e := &Engine{
+		reader:           reader,
+		checkpointer:     ckpt,
+		logger:           zap.NewNop(),
+		batchSize:        100,
+		batchTimeout:     time.Hour,
+		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
+		batchesPublished: metrics.NewCounter("batches_published"),
+		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
+		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
+		promMetrics:      getTestMetrics(),
+	}
+
+	stream := make(chan *model.WALEvent, 1)
+	stream <- &model.WALEvent{
+		Commit:   true,
+		Position: model.WALPosition{LSN: "0/20"},
+		LSN:      "0/20",
+		TxID:     1,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.runBatched(ctx, stream)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runBatched returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runBatched did not exit")
+	}
+
+	if got := ckpt.LastFlushed().LSN; got != "0/20" {
+		t.Fatalf("expected flushed checkpoint 0/20, got %q", got)
 	}
 }
 
