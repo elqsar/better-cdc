@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,9 +12,6 @@ import (
 func Load() Config {
 	cfg := DefaultConfig()
 
-	if v := os.Getenv("AWS_RDS_DATABASE"); v != "" {
-		cfg.Database = v
-	}
 	if v := os.Getenv("CDC_SLOT_NAME"); v != "" {
 		cfg.SlotName = v
 	}
@@ -22,6 +20,13 @@ func Load() Config {
 	}
 	if v := os.Getenv("DATABASE_URL"); v != "" {
 		cfg.DatabaseURL = v
+	}
+	if v := os.Getenv("CDC_DATABASE_NAME"); v != "" {
+		cfg.Database = v
+	} else if v := os.Getenv("AWS_RDS_DATABASE"); v != "" {
+		cfg.Database = v
+	} else if derived := databaseNameFromURL(cfg.DatabaseURL); derived != "" {
+		cfg.Database = derived
 	}
 	if v := os.Getenv("BATCH_SIZE"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
@@ -139,4 +144,19 @@ func Load() Config {
 	}
 
 	return cfg
+}
+
+func databaseNameFromURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	name := strings.Trim(parsed.Path, "/")
+	if name == "" {
+		return ""
+	}
+	return name
 }

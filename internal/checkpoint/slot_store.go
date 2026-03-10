@@ -2,12 +2,15 @@ package checkpoint
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"better-cdc/internal/model"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+var ErrSlotNotFound = errors.New("replication slot not found")
 
 // SlotStore reads the checkpoint from the PostgreSQL replication slot's
 // confirmed_flush_lsn. Save is a no-op because the StandbyStatusUpdate
@@ -35,13 +38,17 @@ func (s *SlotStore) Load(ctx context.Context) (model.WALPosition, error) {
 		ctx,
 		"SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
 		[][]byte{[]byte(s.slotName)},
-		nil,  // paramOIDs
-		nil,  // resultFormats (text)
-		nil,  // resultFormatCodes
+		nil, // paramOIDs
+		nil, // resultFormats (text)
+		nil, // resultFormatCodes
 	)
 
-	var lsn string
+	var (
+		lsn   string
+		found bool
+	)
 	for result.NextRow() {
+		found = true
 		if val := result.Values()[0]; val != nil {
 			lsn = string(val)
 		}
@@ -50,12 +57,19 @@ func (s *SlotStore) Load(ctx context.Context) (model.WALPosition, error) {
 		return model.WALPosition{}, fmt.Errorf("slot store query: %w", err)
 	}
 
-	if lsn == "" {
-		return model.WALPosition{}, nil
-	}
-	return model.WALPosition{LSN: lsn}, nil
+	return positionFromSlotRow(found, lsn, s.slotName)
 }
 
 func (s *SlotStore) Save(_ context.Context, _ model.WALPosition) error {
 	return nil
+}
+
+func positionFromSlotRow(found bool, lsn string, slotName string) (model.WALPosition, error) {
+	if !found {
+		return model.WALPosition{}, fmt.Errorf("%w: %s", ErrSlotNotFound, slotName)
+	}
+	if lsn == "" {
+		return model.WALPosition{}, nil
+	}
+	return model.WALPosition{LSN: lsn}, nil
 }

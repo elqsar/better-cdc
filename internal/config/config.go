@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -74,4 +75,12 @@ func DefaultConfig() Config {
 		StreamMaxAge:          72 * time.Hour,
 		DuplicateWindow:       2 * time.Minute,
 	}
+}
+
+// Validate rejects configuration values that would crash or degrade the engine.
+func (c Config) Validate() error {
+	if c.BatchSize < 0 {
+		return fmt.Errorf("BATCH_SIZE must be >= 0")
+	}
+	return nil
 }

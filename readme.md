@@ -21,7 +21,7 @@ A lightweight Go CDC handler that reads PostgreSQL logical replication changes a
    ```bash
    export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
    export CDC_SLOT_NAME=better_cdc_slot
-   export CDC_PLUGIN=pgoutput
+   export CDC_PLUGIN=wal2json
    export CDC_PUBLICATIONS=better_cdc_pub
    go run ./cmd/cdc-handler
    ```
@@ -43,13 +43,14 @@ Environment variables (defaults in `internal/config`):
 
 **Database & Replication:**
 - `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/postgres`)
+- `CDC_DATABASE_NAME` (optional explicit subject/source database name override; otherwise derived from `DATABASE_URL`)
 - `CDC_SLOT_NAME` (default `better_cdc_slot`)
 - `CDC_PLUGIN` (`pgoutput` | `wal2json`)
 - `CDC_PUBLICATIONS` (comma-separated; default `better_cdc_pub`)
 - `TABLE_FILTERS` (comma-separated `schema.table` allowlist)
 
 **Batching & Throughput:**
-- `BATCH_SIZE` (default `500`) - events per batch before flush
+- `BATCH_SIZE` (default `500`) - events per batch before flush; must be `>= 0`
 - `BATCH_TIMEOUT` (default `100ms`) - max time before flush
 - `RAW_MESSAGE_BUFFER_SIZE` (default `5000`) - buffer between WAL reader and parser
 - `PARSED_EVENT_BUFFER_SIZE` (default `5000`) - buffer between parser and engine
@@ -126,7 +127,8 @@ Set buffer sizes to `0` to revert to unbuffered (sequential) behavior for debugg
 
 ## Notes / Tips
 - Postgres in compose is configured with `wal_level=logical`, `max_wal_senders=10`, `max_replication_slots=10` and initializes schema, publication, and replication slot via `docker/postgres/init/001_init.sql`.
-- If you change the publication/slot names, update both the init SQL and env vars.
+- The local bootstrap provisions `better_cdc_slot` with `wal2json`, so the local quickstart should keep `CDC_PLUGIN=wal2json` unless you recreate the slot with `pgoutput`.
+- If you change the publication, slot, or plugin, update both the init SQL and env vars.
 - JetStream stream can be customized via `JetStreamOptions` (stream name, subjects); defaults target `cdc.*` topics.
 - wal2json path now emits begin/commit markers so checkpoints persist; `pgoutput` remains the recommended plugin for RDS-like environments.
 

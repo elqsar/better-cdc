@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -153,7 +155,7 @@ func (p *JetStreamPublisher) Ready(context.Context) error {
 	if !p.nc.IsConnected() {
 		return fmt.Errorf("nats connection status is %s", p.nc.Status().String())
 	}
-	return nil
+	return p.validateStream()
 }
 
 func backoff(attempt int) time.Duration {
@@ -178,11 +180,55 @@ func (p *JetStreamPublisher) ensureStream() error {
 	if p.js == nil {
 		return fmt.Errorf("jetstream not initialized")
 	}
-	streamName := p.opts.StreamName
-	if streamName == "" {
-		streamName = "CDC"
+	expected := p.expectedStreamConfig()
+	streamName := expected.Name
+
+	if info, err := p.js.StreamInfo(streamName); err == nil {
+		if err := validateStreamConfig(&info.Config, expected); err != nil {
+			return fmt.Errorf("existing stream %q does not match configuration: %w", streamName, err)
+		}
+		p.logger.Debug("stream already exists", zap.String("stream", streamName))
+		return nil
+	} else if !errors.Is(err, nats.ErrStreamNotFound) {
+		return fmt.Errorf("lookup stream: %w", err)
 	}
-	subjects := p.opts.StreamSubjects
+
+	if _, err := p.js.AddStream(expected); err != nil {
+		return fmt.Errorf("create stream: %w", err)
+	}
+	p.logger.Info("created jetstream stream",
+		zap.String("stream", streamName),
+		zap.Strings("subjects", expected.Subjects),
+		zap.String("storage", p.opts.StreamStorage),
+		zap.Int("replicas", expected.Replicas),
+		zap.Duration("max_age", expected.MaxAge),
+		zap.Duration("duplicate_window", expected.Duplicates))
+	return nil
+}
+
+func (p *JetStreamPublisher) streamName() string {
+	if p.opts.StreamName != "" {
+		return p.opts.StreamName
+	}
+	return "CDC"
+}
+
+func (p *JetStreamPublisher) validateStream() error {
+	info, err := p.js.StreamInfo(p.streamName())
+	if err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			return fmt.Errorf("stream %q not found", p.streamName())
+		}
+		return fmt.Errorf("lookup stream: %w", err)
+	}
+	if err := validateStreamConfig(&info.Config, p.expectedStreamConfig()); err != nil {
+		return fmt.Errorf("stream validation failed: %w", err)
+	}
+	return nil
+}
+
+func (p *JetStreamPublisher) expectedStreamConfig() *nats.StreamConfig {
+	subjects := append([]string(nil), p.opts.StreamSubjects...)
 	if len(subjects) == 0 {
 		subjects = []string{"cdc.>"}
 	}
@@ -204,39 +250,54 @@ func (p *JetStreamPublisher) ensureStream() error {
 		dupWindow = 2 * time.Minute
 	}
 
-	if _, err := p.js.StreamInfo(streamName); err == nil {
-		p.logger.Debug("stream already exists", zap.String("stream", streamName))
-		return nil
-	} else if !errors.Is(err, nats.ErrStreamNotFound) {
-		return fmt.Errorf("lookup stream: %w", err)
-	}
-
-	if _, err := p.js.AddStream(&nats.StreamConfig{
-		Name:       streamName,
+	return &nats.StreamConfig{
+		Name:       p.streamName(),
 		Subjects:   subjects,
 		Retention:  nats.LimitsPolicy,
 		Storage:    storage,
 		Replicas:   replicas,
 		MaxAge:     maxAge,
 		Duplicates: dupWindow,
-	}); err != nil {
-		return fmt.Errorf("create stream: %w", err)
 	}
-	p.logger.Info("created jetstream stream",
-		zap.String("stream", streamName),
-		zap.Strings("subjects", subjects),
-		zap.String("storage", p.opts.StreamStorage),
-		zap.Int("replicas", replicas),
-		zap.Duration("max_age", maxAge),
-		zap.Duration("duplicate_window", dupWindow))
+}
+
+func validateStreamConfig(actual *nats.StreamConfig, expected *nats.StreamConfig) error {
+	if actual == nil {
+		return fmt.Errorf("stream config is nil")
+	}
+	if expected == nil {
+		return fmt.Errorf("expected stream config is nil")
+	}
+	if actual.Name != expected.Name {
+		return fmt.Errorf("name mismatch: got %q want %q", actual.Name, expected.Name)
+	}
+	if !sameSubjects(actual.Subjects, expected.Subjects) {
+		return fmt.Errorf("subjects mismatch: got %v want %v", actual.Subjects, expected.Subjects)
+	}
+	if actual.Retention != expected.Retention {
+		return fmt.Errorf("retention mismatch: got %v want %v", actual.Retention, expected.Retention)
+	}
+	if actual.Storage != expected.Storage {
+		return fmt.Errorf("storage mismatch: got %v want %v", actual.Storage, expected.Storage)
+	}
+	if actual.Replicas != expected.Replicas {
+		return fmt.Errorf("replicas mismatch: got %d want %d", actual.Replicas, expected.Replicas)
+	}
+	if actual.MaxAge != expected.MaxAge {
+		return fmt.Errorf("max age mismatch: got %v want %v", actual.MaxAge, expected.MaxAge)
+	}
+	if actual.Duplicates != expected.Duplicates {
+		return fmt.Errorf("duplicate window mismatch: got %v want %v", actual.Duplicates, expected.Duplicates)
+	}
 	return nil
 }
 
-func (p *JetStreamPublisher) streamName() string {
-	if p.opts.StreamName != "" {
-		return p.opts.StreamName
-	}
-	return "CDC"
+func sameSubjects(actual []string, expected []string) bool {
+	a := append([]string(nil), actual...)
+	e := append([]string(nil), expected...)
+	sort.Strings(a)
+	sort.Strings(e)
+	return slices.Equal(a, e)
 }
 
 // PublishBatchAsync sends multiple messages asynchronously without waiting for acks.
