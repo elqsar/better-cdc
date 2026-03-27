@@ -64,6 +64,46 @@ func TestLoad_EnablePprof(t *testing.T) {
 	}
 }
 
+func TestLoad_PublishAsyncMaxPendingOverride(t *testing.T) {
+	t.Setenv("PUBLISH_ASYNC_MAX_PENDING", "1024")
+
+	cfg := Load()
+
+	if cfg.PublishAsyncMaxPending != 1024 {
+		t.Fatalf("expected PublishAsyncMaxPending %d, got %d", 1024, cfg.PublishAsyncMaxPending)
+	}
+}
+
+func TestConfigEffectivePublishAsyncMaxPending_UsesBatchSizeWhenLarger(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BatchSize = 500
+	cfg.PublishAsyncMaxPending = 0
+
+	if got := cfg.EffectivePublishAsyncMaxPending(); got != 500 {
+		t.Fatalf("expected effective pending %d, got %d", 500, got)
+	}
+}
+
+func TestConfigEffectivePublishAsyncMaxPending_UsesFloorWhenBatchSizeIsZero(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BatchSize = 0
+	cfg.PublishAsyncMaxPending = 0
+
+	if got := cfg.EffectivePublishAsyncMaxPending(); got != 256 {
+		t.Fatalf("expected effective pending %d, got %d", 256, got)
+	}
+}
+
+func TestConfigEffectivePublishAsyncMaxPending_UsesExplicitOverride(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BatchSize = 500
+	cfg.PublishAsyncMaxPending = 64
+
+	if got := cfg.EffectivePublishAsyncMaxPending(); got != 64 {
+		t.Fatalf("expected explicit pending %d, got %d", 64, got)
+	}
+}
+
 func TestConfigValidate_RejectsNegativeBatchSize(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.BatchSize = -1
@@ -80,5 +120,15 @@ func TestConfigValidate_AllowsZeroBatchSize(t *testing.T) {
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected zero batch size to be valid, got %v", err)
+	}
+}
+
+func TestConfigValidate_RejectsNegativePublishAsyncMaxPending(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PublishAsyncMaxPending = -1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error for negative publish async max pending")
 	}
 }

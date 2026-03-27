@@ -422,6 +422,26 @@ func (m *mockErrorReader) GetCurrentPosition(context.Context) (model.WALPosition
 func (m *mockErrorReader) Stop(context.Context) error { return nil }
 func (m *mockErrorReader) Err() error                 { return m.fatalErr }
 
+type mockAcknowledgerReader struct {
+	acked model.WALPosition
+}
+
+var _ wal.Reader = (*mockAcknowledgerReader)(nil)
+var _ wal.Acknowledger = (*mockAcknowledgerReader)(nil)
+
+func (m *mockAcknowledgerReader) Start(context.Context) error { return nil }
+func (m *mockAcknowledgerReader) ReadWAL(context.Context, model.WALPosition) (<-chan *parser.RawMessage, error) {
+	return nil, nil
+}
+func (m *mockAcknowledgerReader) GetCurrentPosition(context.Context) (model.WALPosition, error) {
+	return model.WALPosition{}, nil
+}
+func (m *mockAcknowledgerReader) Stop(context.Context) error { return nil }
+func (m *mockAcknowledgerReader) SetAckedPosition(pos model.WALPosition) error {
+	m.acked = pos
+	return nil
+}
+
 // mockErrorParser implements parser.Parser and parser.ErrorReporter for testing
 // fatal error propagation from the parser to the engine.
 type mockErrorParser struct {
@@ -460,6 +480,32 @@ func TestRunBatched_ReaderFatalError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cdc_slot") {
 		t.Errorf("expected underlying error to be preserved, got: %v", err)
+	}
+}
+
+func TestMaybeAcknowledgeCheckpoint_UsesLatestAckedPosition(t *testing.T) {
+	reader := &mockAcknowledgerReader{}
+	store := &mockStore{}
+	ckpt := checkpoint.NewManager(store, time.Hour, zap.NewNop())
+
+	now := time.Now()
+	if err := ckpt.MaybeFlush(context.Background(), model.WALPosition{LSN: "0/10"}, true, now); err != nil {
+		t.Fatalf("MaybeFlush initial: %v", err)
+	}
+	if err := ckpt.MaybeFlush(context.Background(), model.WALPosition{LSN: "0/20"}, true, now.Add(10*time.Second)); err != nil {
+		t.Fatalf("MaybeFlush second: %v", err)
+	}
+
+	e := &Engine{
+		reader:       reader,
+		checkpointer: ckpt,
+		logger:       zap.NewNop(),
+	}
+
+	e.maybeAcknowledgeCheckpoint()
+
+	if got := reader.acked.LSN; got != "0/20" {
+		t.Fatalf("expected acked LSN 0/20, got %q", got)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"better-cdc/internal/checkpoint"
+	"better-cdc/internal/config"
 	"better-cdc/internal/engine"
 	"better-cdc/internal/model"
 	"better-cdc/internal/parser"
@@ -56,7 +57,7 @@ func startPostgres(t *testing.T, plugin string) (connString string, slotName str
 		ExposedPorts: []string{"5432/tcp"},
 		Env: map[string]string{
 			"POSTGRES_PASSWORD": "postgres",
-			"POSTGRES_DB":      "postgres",
+			"POSTGRES_DB":       "postgres",
 		},
 		Cmd: []string{
 			"postgres",
@@ -282,11 +283,14 @@ func drainEvents(t *testing.T, natsURL, streamName, filterSubject string, timeou
 
 // engineConfig holds configuration for starting a test engine instance.
 type engineConfig struct {
-	ConnString string
-	SlotName   string
-	Plugin     string
-	NATSURLs   []string
-	StreamName string
+	ConnString             string
+	SlotName               string
+	Plugin                 string
+	NATSURLs               []string
+	StreamName             string
+	BatchSize              int
+	PublishAsyncMaxPending int
+	StandbyTimeout         time.Duration
 }
 
 // startEngine boots the full CDC pipeline and returns a cancel function and error channel.
@@ -295,6 +299,10 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 	logger, _ := zap.NewDevelopment()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var restoreStandbyTimeout func()
+	if cfg.StandbyTimeout > 0 {
+		restoreStandbyTimeout = wal.SetStandbyTimeoutForTesting(cfg.StandbyTimeout)
+	}
 
 	reader := wal.NewPGReader(wal.SlotConfig{
 		SlotName:     cfg.SlotName,
@@ -327,22 +335,32 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 	if streamName == "" {
 		streamName = "CDC"
 	}
+	defaultCfg := config.DefaultConfig()
+	batchSize := cfg.BatchSize
+	if batchSize == 0 {
+		batchSize = defaultCfg.BatchSize
+	}
+	publishAsyncMaxPending := config.Config{
+		BatchSize:              batchSize,
+		PublishAsyncMaxPending: cfg.PublishAsyncMaxPending,
+	}.EffectivePublishAsyncMaxPending()
 	pub := publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
-		URLs:            cfg.NATSURLs,
-		ConnectTimeout:  5 * time.Second,
-		PublishTimeout:  5 * time.Second,
-		StreamName:      streamName,
-		StreamSubjects:  []string{"cdc.>"},
-		StreamStorage:   "memory",
-		StreamReplicas:  1,
-		StreamMaxAge:    1 * time.Hour,
-		DuplicateWindow: 30 * time.Second,
+		URLs:                   cfg.NATSURLs,
+		ConnectTimeout:         5 * time.Second,
+		PublishTimeout:         5 * time.Second,
+		PublishAsyncMaxPending: publishAsyncMaxPending,
+		StreamName:             streamName,
+		StreamSubjects:         []string{"cdc.>"},
+		StreamStorage:          "memory",
+		StreamReplicas:         1,
+		StreamMaxAge:           1 * time.Hour,
+		DuplicateWindow:        30 * time.Second,
 	}, logger)
 
 	store := checkpoint.NewSlotStore(cfg.ConnString, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, 1*time.Second, logger)
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, "postgres", 100, 100*time.Millisecond, logger)
+	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, "postgres", batchSize, 100*time.Millisecond, logger)
 
 	startPos, err := store.Load(ctx)
 	if err != nil {
@@ -362,6 +380,9 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 		case <-doneCh:
 		case <-time.After(10 * time.Second):
 			t.Log("engine did not stop within 10s")
+		}
+		if restoreStandbyTimeout != nil {
+			restoreStandbyTimeout()
 		}
 	})
 

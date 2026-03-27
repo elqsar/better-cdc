@@ -83,3 +83,19 @@ func TestValidateStreamConfig_RejectsMismatchedReplicas(t *testing.T) {
 		t.Fatal("expected mismatch error")
 	}
 }
+
+func TestPublishAsyncMaxPending_UsesConfiguredValue(t *testing.T) {
+	p := NewJetStreamPublisher(JetStreamOptions{PublishAsyncMaxPending: 1024}, zap.NewNop())
+
+	if got := p.publishAsyncMaxPending(); got != 1024 {
+		t.Fatalf("expected publish async max pending %d, got %d", 1024, got)
+	}
+}
+
+func TestPublishAsyncMaxPending_DefaultsToFloor(t *testing.T) {
+	p := NewJetStreamPublisher(JetStreamOptions{}, zap.NewNop())
+
+	if got := p.publishAsyncMaxPending(); got != 256 {
+		t.Fatalf("expected publish async max pending %d, got %d", 256, got)
+	}
+}

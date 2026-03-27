@@ -23,6 +23,8 @@ import (
 
 const maxBackoff = 30 * time.Second
 
+var replicationStandbyTimeoutNanos atomic.Int64
+
 type (
 	replicationStartFunc func(context.Context, pglogrepl.LSN) error
 	replicationLoopFunc  func(context.Context, pglogrepl.LSN, chan<- *parser.RawMessage) (pglogrepl.LSN, error)
@@ -54,8 +56,16 @@ type ErrorReporter interface {
 }
 
 var sendStandbyStatusUpdate = pglogrepl.SendStandbyStatusUpdate
+var receiveReplicationMessage = func(ctx context.Context, conn *pgconn.PgConn) (pgproto3.BackendMessage, error) {
+	return conn.ReceiveMessage(ctx)
+}
+var isReplicationReceiveTimeout = pgconn.Timeout
 var closeReplicationConn = func(ctx context.Context, conn *pgconn.PgConn) error {
 	return conn.Close(ctx)
+}
+
+func init() {
+	replicationStandbyTimeoutNanos.Store(int64(45 * time.Second))
 }
 
 // Reader streams logical replication changes from PostgreSQL.
@@ -267,7 +277,7 @@ func (r *PGReader) startWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) er
 }
 
 func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out chan<- *parser.RawMessage) (pglogrepl.LSN, error) {
-	standbyTimeout := 45 * time.Second
+	standbyTimeout := r.standbyTimeout()
 	standbyDeadline := time.Now().Add(standbyTimeout)
 
 	for {
@@ -275,11 +285,14 @@ func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out
 			return r.currentAckedLSN(), ctx.Err()
 		}
 		msgCtx, cancel := context.WithDeadline(ctx, standbyDeadline)
-		msg, err := r.conn.ReceiveMessage(msgCtx)
+		msg, err := receiveReplicationMessage(msgCtx, r.conn)
 		cancel()
 		if err != nil {
-			if pgconn.Timeout(err) {
-				standbyDeadline = time.Now().Add(standbyTimeout)
+			if isReplicationReceiveTimeout(err) {
+				if ctx.Err() != nil {
+					return r.currentAckedLSN(), ctx.Err()
+				}
+				standbyDeadline = r.handleStandbyTimeout(ctx, standbyTimeout)
 				continue
 			}
 			if ctx.Err() != nil {
@@ -361,7 +374,7 @@ func (r *PGReader) startPGOutput(ctx context.Context, startLSN pglogrepl.LSN) er
 }
 
 func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out chan<- *parser.RawMessage) (pglogrepl.LSN, error) {
-	standbyTimeout := 45 * time.Second
+	standbyTimeout := r.standbyTimeout()
 	standbyDeadline := time.Now().Add(standbyTimeout)
 
 	for {
@@ -369,11 +382,14 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 			return r.currentAckedLSN(), ctx.Err()
 		}
 		msgCtx, cancel := context.WithDeadline(ctx, standbyDeadline)
-		msg, err := r.conn.ReceiveMessage(msgCtx)
+		msg, err := receiveReplicationMessage(msgCtx, r.conn)
 		cancel()
 		if err != nil {
-			if pgconn.Timeout(err) {
-				standbyDeadline = time.Now().Add(standbyTimeout)
+			if isReplicationReceiveTimeout(err) {
+				if ctx.Err() != nil {
+					return r.currentAckedLSN(), ctx.Err()
+				}
+				standbyDeadline = r.handleStandbyTimeout(ctx, standbyTimeout)
 				continue
 			}
 			if ctx.Err() != nil {
@@ -450,6 +466,19 @@ func (r *PGReader) resetConnection(ctx context.Context) error {
 	}
 	r.conn = nil
 	return err
+}
+
+func (r *PGReader) standbyTimeout() time.Duration {
+	return time.Duration(replicationStandbyTimeoutNanos.Load())
+}
+
+func (r *PGReader) handleStandbyTimeout(ctx context.Context, standbyTimeout time.Duration) time.Time {
+	if err := r.sendStandbyStatus(ctx, false); err != nil {
+		r.errs.Inc()
+		r.promMetrics.ReplicationErrors.Inc()
+		r.logger.Warn("send standby status failed", zap.Error(err))
+	}
+	return time.Now().Add(standbyTimeout)
 }
 
 func (r *PGReader) sleepWithBackoff(ctx context.Context, backoff, max time.Duration) time.Duration {

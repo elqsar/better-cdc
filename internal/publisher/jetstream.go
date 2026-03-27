@@ -29,17 +29,18 @@ type JetStreamPublisher struct {
 }
 
 type JetStreamOptions struct {
-	URLs            []string
-	Username        string
-	Password        string
-	ConnectTimeout  time.Duration
-	PublishTimeout  time.Duration
-	StreamName      string
-	StreamSubjects  []string
-	StreamStorage   string        // "file" or "memory" (default: file)
-	StreamReplicas  int           // Number of replicas (default: 1)
-	StreamMaxAge    time.Duration // Max age for messages (default: 72h)
-	DuplicateWindow time.Duration // De-duplication window (default: 2m)
+	URLs                   []string
+	Username               string
+	Password               string
+	ConnectTimeout         time.Duration
+	PublishTimeout         time.Duration
+	PublishAsyncMaxPending int
+	StreamName             string
+	StreamSubjects         []string
+	StreamStorage          string        // "file" or "memory" (default: file)
+	StreamReplicas         int           // Number of replicas (default: 1)
+	StreamMaxAge           time.Duration // Max age for messages (default: 72h)
+	DuplicateWindow        time.Duration // De-duplication window (default: 2m)
 }
 
 func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStreamPublisher {
@@ -80,7 +81,7 @@ func (p *JetStreamPublisher) Connect() error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	js, err := nc.JetStream(nats.PublishAsyncMaxPending(256))
+	js, err := nc.JetStream(nats.PublishAsyncMaxPending(p.publishAsyncMaxPending()))
 	if err != nil {
 		_ = nc.Drain()
 		return fmt.Errorf("jetstream: %w", err)
@@ -167,6 +168,13 @@ func backoff(attempt int) time.Duration {
 		attempt = maxAttempt
 	}
 	return time.Duration(1<<attempt) * time.Second
+}
+
+func (p *JetStreamPublisher) publishAsyncMaxPending() int {
+	if p.opts.PublishAsyncMaxPending > 0 {
+		return p.opts.PublishAsyncMaxPending
+	}
+	return 256
 }
 
 func (p *JetStreamPublisher) publishTimeout() time.Duration {

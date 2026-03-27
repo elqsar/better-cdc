@@ -2,13 +2,18 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"better-cdc/internal/model"
+	"better-cdc/internal/parser"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestPGReader_SetAckedPosition_Monotonic(t *testing.T) {
@@ -137,4 +142,181 @@ func TestPGReader_Stop_SendsFinalStandbyStatusWithCanceledContext(t *testing.T) 
 	if !got.ReplyRequested {
 		t.Fatal("expected final standby status to request reply")
 	}
+}
+
+func TestPGReader_LoopPGOutput_SendsStandbyStatusOnReceiveTimeout(t *testing.T) {
+	restoreReceive, restoreSend, restoreTimeoutCheck, restoreTimeout := stubReplicationTimeoutHooks(t, 5*time.Millisecond)
+	defer restoreReceive()
+	defer restoreSend()
+	defer restoreTimeoutCheck()
+	defer restoreTimeout()
+
+	r := NewPGReader(SlotConfig{}, 0, zap.NewNop())
+	r.conn = &pgconn.PgConn{}
+	acked, _ := pglogrepl.ParseLSN("0/42")
+	r.setAckedLSN(acked)
+
+	var got []pglogrepl.StandbyStatusUpdate
+	sendStandbyStatusUpdate = func(ctx context.Context, conn *pgconn.PgConn, s pglogrepl.StandbyStatusUpdate) error {
+		got = append(got, s)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	receiveReplicationMessage = func(ctx context.Context, conn *pgconn.PgConn) (pgproto3.BackendMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			<-ctx.Done()
+			return nil, errors.New("timeout")
+		default:
+			cancel()
+			return nil, context.Canceled
+		}
+	}
+
+	lastLSN, err := r.loopPGOutput(ctx, 0, make(chan *parser.RawMessage))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if lastLSN != acked {
+		t.Fatalf("lastLSN = %s, want %s", lastLSN, acked)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 standby status update, got %d", len(got))
+	}
+	if got[0].WALFlushPosition != acked {
+		t.Fatalf("expected flush LSN %s, got %s", acked, got[0].WALFlushPosition)
+	}
+	if got[0].ReplyRequested {
+		t.Fatal("expected idle heartbeat to keep ReplyRequested=false")
+	}
+}
+
+func TestPGReader_LoopPGOutput_DoesNotSendStandbyStatusOnReceiveTimeoutWhenAckIsZero(t *testing.T) {
+	restoreReceive, restoreSend, restoreTimeoutCheck, restoreTimeout := stubReplicationTimeoutHooks(t, 5*time.Millisecond)
+	defer restoreReceive()
+	defer restoreSend()
+	defer restoreTimeoutCheck()
+	defer restoreTimeout()
+
+	r := NewPGReader(SlotConfig{}, 0, zap.NewNop())
+	r.conn = &pgconn.PgConn{}
+
+	var called int
+	sendStandbyStatusUpdate = func(ctx context.Context, conn *pgconn.PgConn, s pglogrepl.StandbyStatusUpdate) error {
+		called++
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	receiveReplicationMessage = func(ctx context.Context, conn *pgconn.PgConn) (pgproto3.BackendMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			<-ctx.Done()
+			return nil, errors.New("timeout")
+		default:
+			cancel()
+			return nil, context.Canceled
+		}
+	}
+
+	lastLSN, err := r.loopPGOutput(ctx, 0, make(chan *parser.RawMessage))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if lastLSN != 0 {
+		t.Fatalf("lastLSN = %s, want 0/0", lastLSN)
+	}
+	if called != 0 {
+		t.Fatalf("expected 0 standby status updates, got %d", called)
+	}
+}
+
+func TestPGReader_LoopPGOutput_LogsAndContinuesWhenIdleStandbyStatusFails(t *testing.T) {
+	restoreReceive, restoreSend, restoreTimeoutCheck, restoreTimeout := stubReplicationTimeoutHooks(t, 5*time.Millisecond)
+	defer restoreReceive()
+	defer restoreSend()
+	defer restoreTimeoutCheck()
+	defer restoreTimeout()
+
+	core, logs := observer.New(zap.WarnLevel)
+	r := NewPGReader(SlotConfig{}, 0, zap.New(core))
+	r.conn = &pgconn.PgConn{}
+	acked, _ := pglogrepl.ParseLSN("0/42")
+	r.setAckedLSN(acked)
+
+	wantErr := errors.New("send failed")
+	sendStandbyStatusUpdate = func(ctx context.Context, conn *pgconn.PgConn, s pglogrepl.StandbyStatusUpdate) error {
+		return wantErr
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	receiveReplicationMessage = func(ctx context.Context, conn *pgconn.PgConn) (pgproto3.BackendMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			<-ctx.Done()
+			return nil, errors.New("timeout")
+		default:
+			cancel()
+			return nil, context.Canceled
+		}
+	}
+
+	lastLSN, err := r.loopPGOutput(ctx, 0, make(chan *parser.RawMessage))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if lastLSN != acked {
+		t.Fatalf("lastLSN = %s, want %s", lastLSN, acked)
+	}
+	if calls != 2 {
+		t.Fatalf("expected loop to continue after timeout send failure, got %d receive calls", calls)
+	}
+	if r.errs.Value() != 1 {
+		t.Fatalf("expected replication error counter to be 1, got %d", r.errs.Value())
+	}
+	if logs.Len() != 1 {
+		t.Fatalf("expected 1 warning log, got %d", logs.Len())
+	}
+	if logs.All()[0].Message != "send standby status failed" {
+		t.Fatalf("unexpected warning message %q", logs.All()[0].Message)
+	}
+}
+
+func stubReplicationTimeoutHooks(t *testing.T, timeout time.Duration) (restoreReceive func(), restoreSend func(), restoreTimeoutCheck func(), restoreTimeout func()) {
+	t.Helper()
+
+	origReceive := receiveReplicationMessage
+	origSend := sendStandbyStatusUpdate
+	origTimeoutCheck := isReplicationReceiveTimeout
+	origTimeout := time.Duration(replicationStandbyTimeoutNanos.Load())
+	replicationStandbyTimeoutNanos.Store(int64(timeout))
+	isReplicationReceiveTimeout = func(err error) bool {
+		return err != nil && err.Error() == "timeout"
+	}
+
+	return func() {
+			receiveReplicationMessage = origReceive
+		},
+		func() {
+			sendStandbyStatusUpdate = origSend
+		},
+		func() {
+			isReplicationReceiveTimeout = origTimeoutCheck
+		},
+		func() {
+			replicationStandbyTimeoutNanos.Store(int64(origTimeout))
+		}
 }

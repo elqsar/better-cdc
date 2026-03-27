@@ -594,11 +594,14 @@ func checkpointPositionForCommit(last *model.WALEvent) model.WALPosition {
 }
 
 func (e *Engine) maybeAcknowledgeCheckpoint() {
+	if e.checkpointer == nil {
+		return
+	}
 	ack, ok := e.reader.(wal.Acknowledger)
 	if !ok {
 		return
 	}
-	pos := e.checkpointer.LastFlushed()
+	pos := e.checkpointer.LastAcked()
 	if pos.LSN == "" {
 		return
 	}

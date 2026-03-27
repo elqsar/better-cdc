@@ -52,6 +52,7 @@ Environment variables (defaults in `internal/config`):
 **Batching & Throughput:**
 - `BATCH_SIZE` (default `500`) - events per batch before flush; must be `>= 0`
 - `BATCH_TIMEOUT` (default `100ms`) - max time before flush
+- `PUBLISH_ASYNC_MAX_PENDING` (default `max(256, BATCH_SIZE)`) - JetStream async publishes allowed in flight before `PublishAsync` stalls/errors; set this to at least your effective batch size for safer defaults under higher RTT
 - `RAW_MESSAGE_BUFFER_SIZE` (default `5000`) - buffer between WAL reader and parser
 - `PARSED_EVENT_BUFFER_SIZE` (default `5000`) - buffer between parser and engine
 
@@ -121,6 +122,7 @@ PARSED_EVENT_BUFFER_SIZE=5000   # Increase if parser is faster than publisher
 ```bash
 BATCH_SIZE=500       # Larger = higher throughput, more latency
 BATCH_TIMEOUT=100ms  # Lower = less latency, more flushes
+PUBLISH_ASYNC_MAX_PENDING=500  # Keep >= effective batch size for async JetStream publishes
 ```
 
 Set buffer sizes to `0` to revert to unbuffered (sequential) behavior for debugging.

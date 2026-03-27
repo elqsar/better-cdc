@@ -116,6 +116,8 @@ func main() {
 		zap.Strings("publications", cfg.Publications),
 		zap.String("db", cfg.Database),
 		zap.String("plugin", cfg.Plugin),
+		zap.Int("batch_size", cfg.BatchSize),
+		zap.Int("publish_async_max_pending", cfg.EffectivePublishAsyncMaxPending()),
 		zap.Int("raw_buffer", cfg.RawMessageBufferSize),
 		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize),
 		zap.Int("max_tx_buffer", cfg.MaxTxBufferSize))
@@ -144,17 +146,18 @@ func buildPublisher(cfg config.Config, logger *zap.Logger) (publisher.Publisher,
 		return publisher.NewNoopPublisher(), nil
 	}
 	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
-		URLs:            urls,
-		Username:        cfg.NATSUsername,
-		Password:        cfg.NATSPassword,
-		ConnectTimeout:  cfg.NATSTimeout,
-		PublishTimeout:  cfg.NATSTimeout,
-		StreamName:      cfg.StreamName,
-		StreamSubjects:  cfg.StreamSubjects,
-		StreamStorage:   cfg.StreamStorage,
-		StreamReplicas:  cfg.StreamReplicas,
-		StreamMaxAge:    cfg.StreamMaxAge,
-		DuplicateWindow: cfg.DuplicateWindow,
+		URLs:                   urls,
+		Username:               cfg.NATSUsername,
+		Password:               cfg.NATSPassword,
+		ConnectTimeout:         cfg.NATSTimeout,
+		PublishTimeout:         cfg.NATSTimeout,
+		PublishAsyncMaxPending: cfg.EffectivePublishAsyncMaxPending(),
+		StreamName:             cfg.StreamName,
+		StreamSubjects:         cfg.StreamSubjects,
+		StreamStorage:          cfg.StreamStorage,
+		StreamReplicas:         cfg.StreamReplicas,
+		StreamMaxAge:           cfg.StreamMaxAge,
+		DuplicateWindow:        cfg.DuplicateWindow,
 	}, logger), nil
 }
 

@@ -45,6 +45,10 @@ func (m *Manager) LastFlushed() model.WALPosition {
 	return m.lastFlush
 }
 
+func (m *Manager) LastAcked() model.WALPosition {
+	return m.lastAcked
+}
+
 func (m *Manager) MaybeFlush(ctx context.Context, pos model.WALPosition, acked bool, now time.Time) error {
 	if pos.LSN == "" {
 		return nil
