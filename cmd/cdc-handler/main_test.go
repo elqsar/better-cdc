@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -26,6 +27,25 @@ func TestBuildPublisher_AllowsExplicitNoopPublisher(t *testing.T) {
 	}
 	if _, ok := pub.(*publisher.NoopPublisher); !ok {
 		t.Fatalf("expected noop publisher, got %T", pub)
+	}
+}
+
+func TestBuildPublisher_NoopPublisherIsNotReady(t *testing.T) {
+	pub, err := buildPublisher(config.Config{
+		AllowNoopPublisher: true,
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ready, ok := pub.(interface {
+		Ready(context.Context) error
+	})
+	if !ok {
+		t.Fatalf("expected readiness-capable publisher, got %T", pub)
+	}
+	if err := ready.Ready(context.Background()); err == nil {
+		t.Fatal("expected noop publisher to report not ready")
 	}
 }
 

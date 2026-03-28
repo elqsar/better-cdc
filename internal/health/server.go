@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"strings"
@@ -90,17 +91,22 @@ func NewHandler(opts Options) http.Handler {
 }
 
 // Start launches the health server.
-func Start(ctx context.Context, opts Options) {
+func Start(ctx context.Context, opts Options) error {
 	if opts.Addr == "" {
-		return
+		return nil
 	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 
+	ln, err := net.Listen("tcp", opts.Addr)
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
-		Addr:    opts.Addr,
+		Addr:    ln.Addr().String(),
 		Handler: NewHandler(opts),
 	}
 
@@ -110,8 +116,10 @@ func Start(ctx context.Context, opts Options) {
 	}()
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logger.Warn("health server error", zap.Error(err))
 		}
 	}()
+
+	return nil
 }

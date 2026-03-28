@@ -63,7 +63,7 @@ Environment variables (defaults in `internal/config`):
 - `NATS_URL` (comma-separated; default `nats://localhost:4222`)
 - `NATS_USERNAME`, `NATS_PASSWORD`
 - `NATS_TIMEOUT` (default `5s`)
-- `ALLOW_NOOP_PUBLISHER` (default `false`) - allows startup without NATS and drops publishes intentionally; use only for local testing
+- `ALLOW_NOOP_PUBLISHER` (default `false`) - allows startup without NATS and drops publishes intentionally; use only for local testing, and note that `/ready` will stay unhealthy while it is enabled
 
 **JetStream Stream:**
 - `STREAM_NAME` (default `CDC`)

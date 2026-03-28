@@ -12,6 +12,8 @@ import (
 	"go.uber.org/zap"
 )
 
+const noopPublisherReadyError = "noop publisher is enabled for local/testing only; publishes are being dropped"
+
 // Publisher pushes CDCEvents to NATS JetStream.
 type Publisher interface {
 	Connect() error
@@ -174,7 +176,7 @@ func (p *NoopPublisher) PublishWithRetries(ctx context.Context, subject string, 
 
 func (p *NoopPublisher) Close() error { return nil }
 
-func (p *NoopPublisher) Ready(context.Context) error { return nil }
+func (p *NoopPublisher) Ready(context.Context) error { return fmt.Errorf(noopPublisherReadyError) }
 
 // SubjectForEvent builds subject cdc.{database}.{schema}.{table}.
 func SubjectForEvent(database string, evt *model.CDCEvent) (string, error) {

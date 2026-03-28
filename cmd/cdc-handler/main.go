@@ -76,7 +76,7 @@ func main() {
 	}
 	store := checkpoint.NewSlotStore(cfg.DatabaseURL, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
-	health.Start(ctx, health.Options{
+	if err := health.Start(ctx, health.Options{
 		Addr:        cfg.HealthAddr,
 		EnablePprof: cfg.EnablePprof,
 		Logger:      logger,
@@ -101,7 +101,10 @@ func main() {
 				},
 			},
 		},
-	})
+	}); err != nil {
+		logger.Error("failed to start health server", zap.Error(err), zap.String("addr", cfg.HealthAddr))
+		os.Exit(1)
+	}
 	logger.Info("health server configured",
 		zap.String("health_endpoint", cfg.HealthAddr+"/health"),
 		zap.String("ready_endpoint", cfg.HealthAddr+"/ready"),
@@ -142,7 +145,7 @@ func buildPublisher(cfg config.Config, logger *zap.Logger) (publisher.Publisher,
 		if !cfg.AllowNoopPublisher {
 			return nil, fmt.Errorf("NATS_URL is required unless ALLOW_NOOP_PUBLISHER=true")
 		}
-		logger.Warn("NATS URLs missing, using noop publisher because ALLOW_NOOP_PUBLISHER is enabled")
+		logger.Warn("NATS URLs missing, using noop publisher because ALLOW_NOOP_PUBLISHER is enabled; all publishes will be dropped and readiness will fail")
 		return publisher.NewNoopPublisher(), nil
 	}
 	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
