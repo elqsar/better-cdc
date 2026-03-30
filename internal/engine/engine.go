@@ -1,11 +1,9 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"better-cdc/internal/checkpoint"
@@ -19,32 +17,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// jsonBufPool provides reusable buffers for JSON marshaling.
-var jsonBufPool = sync.Pool{
-	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 4096))
-	},
-}
-
-// marshalCDCEvent marshals a CDCEvent using a pooled buffer.
+// marshalCDCEvent marshals a CDCEvent to JSON.
 func marshalCDCEvent(evt *model.CDCEvent) ([]byte, error) {
-	buf := jsonBufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer jsonBufPool.Put(buf)
-
-	enc := json.NewEncoder(buf)
-	if err := enc.Encode(evt); err != nil {
-		return nil, err
-	}
-
-	// Copy result since buffer is pooled; remove trailing newline from Encode
-	data := buf.Bytes()
-	if len(data) > 0 && data[len(data)-1] == '\n' {
-		data = data[:len(data)-1]
-	}
-	result := make([]byte, len(data))
-	copy(result, data)
-	return result, nil
+	return json.Marshal(evt)
 }
 
 // Engine coordinates the end-to-end CDC flow.
