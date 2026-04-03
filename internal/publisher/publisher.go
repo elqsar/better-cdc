@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,12 +38,13 @@ type PublishItem struct {
 // The Err field is written by a background goroutine and must only be read after
 // waiting on the done channel (via Wait method or direct channel read).
 type PendingAck struct {
-	Subject string
-	EventID string
-	TxID    uint64
-	acked   atomic.Bool // thread-safe, can be read at any time
-	Err     error       // safe to read only after done is closed
-	done    chan struct{}
+	Subject  string
+	EventID  string
+	TxID     uint64
+	acked    atomic.Bool // thread-safe, can be read at any time
+	Err      error       // safe to read only after done is closed
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // IsAcked returns whether the publish was acknowledged. Thread-safe.
@@ -53,6 +55,16 @@ func (p *PendingAck) IsAcked() bool {
 // setAcked marks the publish as acknowledged. Thread-safe.
 func (p *PendingAck) setAcked(v bool) {
 	p.acked.Store(v)
+}
+
+// complete finalizes the pending ack exactly once.
+// It is safe to race multiple terminal outcomes; the first one wins.
+func (p *PendingAck) complete(acked bool, err error) {
+	p.doneOnce.Do(func() {
+		p.acked.Store(acked)
+		p.Err = err
+		close(p.done)
+	})
 }
 
 // Wait blocks until the ack is resolved or context is cancelled.
@@ -99,12 +111,9 @@ func (p *PendingAck) SetError(err error) {
 
 // Close closes the done channel to signal completion (for testing).
 func (p *PendingAck) Close() {
-	select {
-	case <-p.done:
-		// Already closed
-	default:
+	p.doneOnce.Do(func() {
 		close(p.done)
-	}
+	})
 }
 
 // BatchPublisher extends Publisher with batch async capabilities for high throughput.

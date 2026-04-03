@@ -337,8 +337,7 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 		}
 		pa, err := p.js.PublishAsync(item.Subject, item.Data, opts...)
 		if err != nil {
-			pend.Err = err
-			close(pend.done)
+			pend.complete(false, err)
 			pending = append(pending, pend)
 			p.ackFailCnt.Inc()
 			p.promMetrics.JetstreamAckFailure.Inc()
@@ -348,39 +347,36 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 		pending = append(pending, pend)
 
 		// Launch goroutine to await this specific ack
-		go func(pend *PendingAck, pa nats.PubAckFuture, subject string) {
-			defer close(pend.done)
-			select {
-			case <-ctx.Done():
-				pend.Err = ctx.Err()
-				p.ackFailCnt.Inc()
-				p.promMetrics.JetstreamAckFailure.Inc()
-			case ack := <-pa.Ok():
-				if ack != nil {
-					pend.setAcked(true)
-					p.publishedCnt.Inc()
-					p.promMetrics.JetstreamPublished.Inc()
-					p.logger.Debug("async ack received",
-						zap.String("subject", subject),
-						zap.Uint64("seq", ack.Sequence))
-				} else {
-					pend.Err = fmt.Errorf("nil ack")
-					p.ackFailCnt.Inc()
-					p.promMetrics.JetstreamAckFailure.Inc()
-				}
-			case err := <-pa.Err():
-				pend.Err = err
-				p.ackFailCnt.Inc()
-				p.promMetrics.JetstreamAckFailure.Inc()
-			case <-time.After(p.publishTimeout()):
-				pend.Err = fmt.Errorf("ack timeout")
-				p.ackFailCnt.Inc()
-				p.promMetrics.JetstreamAckFailure.Inc()
-			}
-		}(pend, pa, item.Subject)
+		go p.awaitPendingAck(pend, pa, item.Subject)
 	}
 
 	return pending, nil
+}
+
+func (p *JetStreamPublisher) awaitPendingAck(pend *PendingAck, pa nats.PubAckFuture, subject string) {
+	select {
+	case ack := <-pa.Ok():
+		if ack != nil {
+			pend.complete(true, nil)
+			p.publishedCnt.Inc()
+			p.promMetrics.JetstreamPublished.Inc()
+			p.logger.Debug("async ack received",
+				zap.String("subject", subject),
+				zap.Uint64("seq", ack.Sequence))
+			return
+		}
+		pend.complete(false, fmt.Errorf("nil ack"))
+		p.ackFailCnt.Inc()
+		p.promMetrics.JetstreamAckFailure.Inc()
+	case err := <-pa.Err():
+		pend.complete(false, err)
+		p.ackFailCnt.Inc()
+		p.promMetrics.JetstreamAckFailure.Inc()
+	case <-time.After(p.publishTimeout()):
+		pend.complete(false, fmt.Errorf("ack timeout"))
+		p.ackFailCnt.Inc()
+		p.promMetrics.JetstreamAckFailure.Inc()
+	}
 }
 
 // WaitForAcks blocks until all pending acks are resolved or timeout.
