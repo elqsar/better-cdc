@@ -2,7 +2,10 @@ package parser
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -28,7 +31,83 @@ type txBuffer struct {
 	commitLSN  pglogrepl.LSN
 	commitTime time.Time
 	events     []*model.WALEvent
-	streaming  bool // true when buffer limit exceeded, events emitted immediately
+	rawMsgs    [][]byte
+	spill      *txSpill
+}
+
+type txSpill struct {
+	file *os.File
+	path string
+}
+
+func newTxSpill() (*txSpill, error) {
+	file, err := os.CreateTemp("", "better-cdc-pgoutput-*")
+	if err != nil {
+		return nil, fmt.Errorf("create tx spill file: %w", err)
+	}
+	return &txSpill{
+		file: file,
+		path: file.Name(),
+	}, nil
+}
+
+func (s *txSpill) Write(raw []byte) error {
+	if s == nil {
+		return nil
+	}
+	var size [8]byte
+	binary.LittleEndian.PutUint64(size[:], uint64(len(raw)))
+	if _, err := s.file.Write(size[:]); err != nil {
+		return fmt.Errorf("write tx spill size: %w", err)
+	}
+	if _, err := s.file.Write(raw); err != nil {
+		return fmt.Errorf("write tx spill payload: %w", err)
+	}
+	return nil
+}
+
+func (s *txSpill) Replay(fn func([]byte) error) error {
+	if s == nil {
+		return nil
+	}
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek tx spill: %w", err)
+	}
+	var size [8]byte
+	for {
+		_, err := io.ReadFull(s.file, size[:])
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			if err == io.ErrUnexpectedEOF {
+				return fmt.Errorf("read tx spill size: %w", err)
+			}
+			return fmt.Errorf("read tx spill size: %w", err)
+		}
+		raw := make([]byte, binary.LittleEndian.Uint64(size[:]))
+		if _, err := io.ReadFull(s.file, raw); err != nil {
+			return fmt.Errorf("read tx spill payload: %w", err)
+		}
+		if err := fn(raw); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *txSpill) CloseAndRemove() error {
+	if s == nil {
+		return nil
+	}
+	closeErr := s.file.Close()
+	removeErr := os.Remove(s.path)
+	if closeErr != nil {
+		return fmt.Errorf("close tx spill: %w", closeErr)
+	}
+	if removeErr != nil && !os.IsNotExist(removeErr) {
+		return fmt.Errorf("remove tx spill: %w", removeErr)
+	}
+	return nil
 }
 
 // PGOutputConfig configures parsing for pgoutput.
@@ -78,6 +157,7 @@ func (p *PGOutputParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 	out := make(chan *model.WALEvent, p.bufferSize)
 	go func() {
 		defer close(out)
+		defer p.cleanupTx()
 		for {
 			select {
 			case <-ctx.Done():
@@ -101,7 +181,7 @@ func (p *PGOutputParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 					p.logger.Error("parse pgoutput message failed", zap.Error(fatal))
 					return
 				}
-				if err := p.handlePGOutputMessage(ctx, logical, out); err != nil {
+				if err := p.handlePGOutputMessage(ctx, msg.Data, logical, out); err != nil {
 					if ctx.Err() != nil {
 						return
 					}
@@ -131,7 +211,7 @@ func (p *PGOutputParser) Err() error {
 	return p.fatalErr
 }
 
-func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglogrepl.Message, out chan<- *model.WALEvent) error {
+func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, rawData []byte, logical pglogrepl.Message, out chan<- *model.WALEvent) error {
 	switch m := logical.(type) {
 	case *pglogrepl.RelationMessage:
 		cols := make([]string, 0, len(m.Columns))
@@ -180,16 +260,9 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 			p.lagGauge.Set(lag)
 			p.promMetrics.ReplicationLag.Set(lag)
 		}
-		// If in streaming mode, events were already sent without commit metadata.
-		// In normal mode, emit buffered events with full commit info.
-		if !p.tx.streaming {
+		if p.tx.spill == nil {
 			for _, evt := range p.tx.events {
-				evt.CommitTime = p.tx.commitTime
-				evt.Position = checkpointPos
-				evt.LSN = p.tx.commitLSN.String()
-				evt.TxID = uint64(p.tx.xid)
-				evt.Timestamp = p.tx.commitTime
-				evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
+				p.enrichEventForCommit(evt, checkpointPos)
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -197,7 +270,10 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 				}
 			}
 		} else {
-			p.logger.Debug("pgoutput commit (streamed transaction)",
+			if err := p.emitSpilledEvents(ctx, checkpointPos, out); err != nil {
+				return err
+			}
+			p.logger.Debug("pgoutput commit (spilled transaction)",
 				zap.String("lsn", p.tx.commitLSN.String()),
 				zap.Uint64("txid", uint64(p.tx.xid)))
 		}
@@ -217,14 +293,16 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 			return ctx.Err()
 		case out <- commitEvt:
 		}
-		p.tx = nil
+		if err := p.finishTx(); err != nil {
+			return err
+		}
 	case *pglogrepl.InsertMessage:
 		if m.Tuple == nil {
 			return nil
 		}
 		evt := p.buildEventFromTuple(m.RelationID, m.Tuple.Columns, model.OperationInsert)
 		if evt != nil {
-			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+			if err := p.bufferOrSpillEvents(ctx, rawData, []*model.WALEvent{evt}); err != nil {
 				return err
 			}
 		}
@@ -237,7 +315,7 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 			if m.OldTuple != nil {
 				p.populateTupleColumnMap(evt.OldValues, p.lookupRelation(m.RelationID), m.OldTuple.Columns)
 			}
-			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+			if err := p.bufferOrSpillEvents(ctx, rawData, []*model.WALEvent{evt}); err != nil {
 				return err
 			}
 		}
@@ -247,13 +325,14 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 		}
 		evt := p.buildEventFromTuple(m.RelationID, m.OldTuple.Columns, model.OperationDelete)
 		if evt != nil {
-			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+			if err := p.bufferOrSpillEvents(ctx, rawData, []*model.WALEvent{evt}); err != nil {
 				return err
 			}
 		}
 	case *pglogrepl.TruncateMessage:
-		for _, evt := range p.buildTruncateEvents(m.RelationIDs) {
-			if err := p.bufferOrStreamEvent(ctx, evt, out); err != nil {
+		events := p.buildTruncateEvents(m.RelationIDs)
+		if len(events) > 0 {
+			if err := p.bufferOrSpillEvents(ctx, rawData, events); err != nil {
 				return err
 			}
 		}
@@ -261,57 +340,176 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, logical pglo
 	return nil
 }
 
-// bufferOrStreamEvent either buffers the event or streams it immediately if limit exceeded.
-// Returns error only if streaming and context is cancelled.
-func (p *PGOutputParser) bufferOrStreamEvent(ctx context.Context, evt *model.WALEvent, out chan<- *model.WALEvent) error {
+func (p *PGOutputParser) cleanupTx() {
+	if p.tx == nil {
+		return
+	}
+	for _, evt := range p.tx.events {
+		model.ReleaseWALEvent(evt)
+	}
+	p.tx.events = nil
+	p.tx.rawMsgs = nil
+	if p.tx.spill != nil {
+		if err := p.tx.spill.CloseAndRemove(); err != nil {
+			p.logger.Warn("cleanup tx spill failed", zap.Error(err))
+		}
+		p.tx.spill = nil
+	}
+	p.promMetrics.TxBufferSize.Set(0)
+	p.tx = nil
+}
+
+func (p *PGOutputParser) finishTx() error {
+	if p.tx == nil {
+		return nil
+	}
+	p.tx.events = nil
+	p.tx.rawMsgs = nil
+	if p.tx.spill != nil {
+		if err := p.tx.spill.CloseAndRemove(); err != nil {
+			return err
+		}
+		p.tx.spill = nil
+	}
+	p.promMetrics.TxBufferSize.Set(0)
+	p.tx = nil
+	return nil
+}
+
+func (p *PGOutputParser) enrichEventForCommit(evt *model.WALEvent, checkpointPos model.WALPosition) {
+	evt.CommitTime = p.tx.commitTime
+	evt.Position = checkpointPos
+	evt.LSN = p.tx.commitLSN.String()
+	evt.TxID = uint64(p.tx.xid)
+	evt.Timestamp = p.tx.commitTime
+	evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
+}
+
+func (p *PGOutputParser) emitSpilledEvents(ctx context.Context, checkpointPos model.WALPosition, out chan<- *model.WALEvent) error {
+	return p.tx.spill.Replay(func(raw []byte) error {
+		logical, err := pglogrepl.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("parse spilled pgoutput message failed: %w", err)
+		}
+		events, err := p.buildEventsForReplay(logical)
+		if err != nil {
+			return err
+		}
+		for _, evt := range events {
+			p.enrichEventForCommit(evt, checkpointPos)
+			select {
+			case <-ctx.Done():
+				model.ReleaseWALEvent(evt)
+				return ctx.Err()
+			case out <- evt:
+			}
+		}
+		return nil
+	})
+}
+
+func (p *PGOutputParser) buildEventsForReplay(logical pglogrepl.Message) ([]*model.WALEvent, error) {
+	switch m := logical.(type) {
+	case *pglogrepl.InsertMessage:
+		if m.Tuple == nil {
+			return nil, nil
+		}
+		evt := p.buildEventFromTuple(m.RelationID, m.Tuple.Columns, model.OperationInsert)
+		if evt == nil {
+			return nil, nil
+		}
+		return []*model.WALEvent{evt}, nil
+	case *pglogrepl.UpdateMessage:
+		if m.NewTuple == nil {
+			return nil, nil
+		}
+		evt := p.buildEventFromTuple(m.RelationID, m.NewTuple.Columns, model.OperationUpdate)
+		if evt == nil {
+			return nil, nil
+		}
+		if m.OldTuple != nil {
+			p.populateTupleColumnMap(evt.OldValues, p.lookupRelation(m.RelationID), m.OldTuple.Columns)
+		}
+		return []*model.WALEvent{evt}, nil
+	case *pglogrepl.DeleteMessage:
+		if m.OldTuple == nil {
+			return nil, nil
+		}
+		evt := p.buildEventFromTuple(m.RelationID, m.OldTuple.Columns, model.OperationDelete)
+		if evt == nil {
+			return nil, nil
+		}
+		return []*model.WALEvent{evt}, nil
+	case *pglogrepl.TruncateMessage:
+		return p.buildTruncateEvents(m.RelationIDs), nil
+	default:
+		return nil, fmt.Errorf("unexpected spilled pgoutput message type %T", logical)
+	}
+}
+
+// bufferOrSpillEvents either buffers transaction events in memory or spills them for replay on commit.
+func (p *PGOutputParser) bufferOrSpillEvents(ctx context.Context, rawData []byte, events []*model.WALEvent) error {
 	if p.tx == nil {
 		p.tx = &txBuffer{}
 	}
+	if len(events) == 0 {
+		return nil
+	}
 
-	// Check if we're already in streaming mode
-	if p.tx.streaming {
-		// Stream event immediately
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case out <- evt:
+	if p.tx.spill != nil {
+		if err := p.tx.spill.Write(rawData); err != nil {
+			return err
+		}
+		for _, evt := range events {
+			model.ReleaseWALEvent(evt)
 		}
 		return nil
 	}
 
-	// Check if we should switch to streaming mode
-	if p.maxTxBufferSize > 0 && len(p.tx.events) >= p.maxTxBufferSize {
-		// Switch to streaming mode
-		p.tx.streaming = true
+	if p.maxTxBufferSize > 0 && len(p.tx.events)+len(events) > p.maxTxBufferSize {
+		spill, err := newTxSpill()
+		if err != nil {
+			return err
+		}
+		p.tx.spill = spill
 		p.promMetrics.TxBufferOverflows.Inc()
-		p.logger.Warn("transaction buffer limit exceeded, switching to streaming mode",
+		p.logger.Warn("transaction buffer limit exceeded, spilling transaction until commit",
 			zap.Uint32("xid", p.tx.xid),
 			zap.Int("buffered_events", len(p.tx.events)),
 			zap.Int("limit", p.maxTxBufferSize))
 
-		// Flush all buffered events first
-		for _, bufferedEvt := range p.tx.events {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case out <- bufferedEvt:
+		for _, raw := range p.tx.rawMsgs {
+			if err := p.tx.spill.Write(raw); err != nil {
+				return err
 			}
 		}
-		// Clear the buffer (events are now sent)
+		for _, bufferedEvt := range p.tx.events {
+			model.ReleaseWALEvent(bufferedEvt)
+		}
 		p.tx.events = nil
+		p.tx.rawMsgs = nil
 		p.promMetrics.TxBufferSize.Set(0)
 
-		// Now stream the current event
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case out <- evt:
+		if err := p.tx.spill.Write(rawData); err != nil {
+			return err
+		}
+		for _, evt := range events {
+			model.ReleaseWALEvent(evt)
 		}
 		return nil
 	}
 
-	// Normal buffering
-	p.tx.events = append(p.tx.events, evt)
+	select {
+	case <-ctx.Done():
+		for _, evt := range events {
+			model.ReleaseWALEvent(evt)
+		}
+		return ctx.Err()
+	default:
+	}
+
+	p.tx.events = append(p.tx.events, events...)
+	p.tx.rawMsgs = append(p.tx.rawMsgs, append([]byte(nil), rawData...))
 	p.promMetrics.TxBufferSize.Set(int64(len(p.tx.events)))
 	return nil
 }
