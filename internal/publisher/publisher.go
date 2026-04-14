@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -185,7 +186,7 @@ func (p *NoopPublisher) PublishWithRetries(ctx context.Context, subject string, 
 
 func (p *NoopPublisher) Close() error { return nil }
 
-func (p *NoopPublisher) Ready(context.Context) error { return fmt.Errorf(noopPublisherReadyError) }
+func (p *NoopPublisher) Ready(context.Context) error { return errors.New(noopPublisherReadyError) }
 
 // SubjectForEvent builds subject cdc.{database}.{schema}.{table}.
 func SubjectForEvent(database string, evt *model.CDCEvent) (string, error) {

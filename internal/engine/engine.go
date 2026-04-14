@@ -93,7 +93,7 @@ func (e *Engine) Run(ctx context.Context, start model.WALPosition) error {
 	if err := e.publisher.Connect(); err != nil {
 		return fmt.Errorf("publisher connect: %w", err)
 	}
-	defer e.publisher.Close()
+	defer e.publisher.Close() //nolint:errcheck
 
 	return e.runBatched(ctx, parsedStream)
 }
@@ -397,7 +397,7 @@ func (e *Engine) publishWithRetry(ctx context.Context, batchPub publisher.BatchP
 		}
 
 		// Wait for acks
-		result, err := batchPub.WaitForAcks(ctx, pending, pubItems, timeout)
+		result, _ := batchPub.WaitForAcks(ctx, pending, pubItems, timeout)
 
 		// Context cancelled - return what we have
 		if ctx.Err() != nil {

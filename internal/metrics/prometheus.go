@@ -62,8 +62,6 @@ func (g *PrometheusGauge) Get() int64 {
 // PrometheusHistogram wraps prometheus.Histogram with the same interface as Histogram.
 type PrometheusHistogram struct {
 	histogram prometheus.Histogram
-	sum       float64
-	count     uint64
 }
 
 // NewPrometheusHistogram creates a new Prometheus histogram with the given buckets.

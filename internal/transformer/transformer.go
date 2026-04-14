@@ -144,6 +144,6 @@ func writeValue(sb *strings.Builder, v interface{}) {
 		sb.WriteString("null")
 	default:
 		// Fallback for complex types
-		sb.WriteString(fmt.Sprintf("%v", val))
+		fmt.Fprintf(sb, "%v", val)
 	}
 }
