@@ -24,15 +24,16 @@ func marshalCDCEvent(evt *model.CDCEvent) ([]byte, error) {
 
 // Engine coordinates the end-to-end CDC flow.
 type Engine struct {
-	reader       wal.Reader
-	parser       parser.Parser
-	transformer  transformer.Transformer
-	publisher    publisher.Publisher
-	checkpointer *checkpoint.Manager
-	database     string
-	batchSize    int
-	batchTimeout time.Duration
-	logger       *zap.Logger
+	reader            wal.Reader
+	parser            parser.Parser
+	transformer       transformer.Transformer
+	publisher         publisher.Publisher
+	checkpointer      *checkpoint.Manager
+	database          string
+	batchSize         int
+	batchTimeout      time.Duration
+	maxPublishRetries int
+	logger            *zap.Logger
 
 	// Throughput metrics (legacy, kept for backward compatibility)
 	eventsProcessed  *metrics.RateCounter
@@ -44,20 +45,21 @@ type Engine struct {
 	promMetrics *metrics.Metrics
 }
 
-func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, logger *zap.Logger) *Engine {
+func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, maxPublishRetries int, logger *zap.Logger) *Engine {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	return &Engine{
-		reader:       reader,
-		parser:       parser,
-		transformer:  transformer,
-		publisher:    publisher,
-		checkpointer: checkpointer,
-		database:     database,
-		batchSize:    batchSize,
-		batchTimeout: batchTimeout,
-		logger:       logger,
+		reader:            reader,
+		parser:            parser,
+		transformer:       transformer,
+		publisher:         publisher,
+		checkpointer:      checkpointer,
+		database:          database,
+		batchSize:         batchSize,
+		batchTimeout:      batchTimeout,
+		maxPublishRetries: maxPublishRetries,
+		logger:            logger,
 		// Initialize throughput metrics (legacy)
 		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
 		batchesPublished: metrics.NewCounter("batches_published"),
@@ -194,9 +196,8 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 
 // Retry configuration for transient publish failures.
 const (
-	maxPublishRetries = 3
-	baseRetryBackoff  = time.Second
-	maxRetryBackoff   = 8 * time.Second
+	baseRetryBackoff = time.Second
+	maxRetryBackoff  = 8 * time.Second
 )
 
 // flushWithBatchPublish uses async batch publishing with collected acks for high throughput.
@@ -358,7 +359,7 @@ func (e *Engine) publishWithRetry(ctx context.Context, batchPub publisher.BatchP
 	succeeded := make([]bool, len(items))
 	var lastError error
 
-	for attempt := 0; attempt <= maxPublishRetries; attempt++ {
+	for attempt := 0; attempt <= e.maxPublishRetries; attempt++ {
 		if len(itemsToPublish) == 0 {
 			break
 		}

@@ -13,6 +13,7 @@ type Config struct {
 	DatabaseURL            string
 	BatchSize              int
 	PublishAsyncMaxPending int
+	MaxPublishRetries      int
 	BatchTimeout           time.Duration
 	CheckpointFreq         time.Duration
 	NATSURLs               []string
@@ -63,6 +64,7 @@ func DefaultConfig() Config {
 		DatabaseURL:            "postgres://postgres:postgres@localhost:5432/postgres",
 		BatchSize:              500,
 		PublishAsyncMaxPending: 0,
+		MaxPublishRetries:      3,
 		BatchTimeout:           100 * time.Millisecond,
 		CheckpointFreq:         1 * time.Second,
 		NATSURLs:               []string{"nats://localhost:4222"},
@@ -88,6 +90,9 @@ func (c Config) Validate() error {
 	}
 	if c.PublishAsyncMaxPending < 0 {
 		return fmt.Errorf("PUBLISH_ASYNC_MAX_PENDING must be >= 0")
+	}
+	if c.MaxPublishRetries < 0 {
+		return fmt.Errorf("MAX_PUBLISH_RETRIES must be >= 0")
 	}
 	return nil
 }

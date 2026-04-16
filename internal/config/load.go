@@ -38,6 +38,11 @@ func Load() Config {
 			cfg.PublishAsyncMaxPending = i
 		}
 	}
+	if v := os.Getenv("MAX_PUBLISH_RETRIES"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			cfg.MaxPublishRetries = i
+		}
+	}
 	if v := os.Getenv("BATCH_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.BatchTimeout = d

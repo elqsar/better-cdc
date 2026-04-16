@@ -172,9 +172,10 @@ func TestPublishWithRetry_AllSucceedFirstAttempt(t *testing.T) {
 	// No failures configured = all succeed
 
 	e := &Engine{
-		logger:       zap.NewNop(),
-		batchTimeout: time.Second,
-		promMetrics:  getTestMetrics(),
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: 3,
+		promMetrics:       getTestMetrics(),
 	}
 
 	items := []publisher.PublishItem{
@@ -211,9 +212,10 @@ func TestPublishWithRetry_PartialFailureRecovery(t *testing.T) {
 	}
 
 	e := &Engine{
-		logger:       zap.NewNop(),
-		batchTimeout: time.Second,
-		promMetrics:  getTestMetrics(),
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: 3,
+		promMetrics:       getTestMetrics(),
 	}
 
 	items := []publisher.PublishItem{
@@ -249,10 +251,12 @@ func TestPublishWithRetry_ExhaustedRetries(t *testing.T) {
 		{0}, // Fourth: still fail (this is the last retry)
 	}
 
+	const maxRetries = 3
 	e := &Engine{
-		logger:       zap.NewNop(),
-		batchTimeout: time.Second,
-		promMetrics:  getTestMetrics(),
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: maxRetries,
+		promMetrics:       getTestMetrics(),
 	}
 
 	items := []publisher.PublishItem{
@@ -271,9 +275,9 @@ func TestPublishWithRetry_ExhaustedRetries(t *testing.T) {
 	if result.Failed != 1 {
 		t.Errorf("expected 1 failed, got %d", result.Failed)
 	}
-	// Should have maxPublishRetries + 1 attempts
-	if mock.publishBatchCalls.Load() != int32(maxPublishRetries+1) {
-		t.Errorf("expected %d publish calls, got %d", maxPublishRetries+1, mock.publishBatchCalls.Load())
+	// Should have maxRetries + 1 attempts
+	if mock.publishBatchCalls.Load() != int32(maxRetries+1) {
+		t.Errorf("expected %d publish calls, got %d", maxRetries+1, mock.publishBatchCalls.Load())
 	}
 }
 
@@ -284,9 +288,10 @@ func TestPublishWithRetry_ContextCancellation(t *testing.T) {
 	}
 
 	e := &Engine{
-		logger:       zap.NewNop(),
-		batchTimeout: time.Second,
-		promMetrics:  getTestMetrics(),
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: 3,
+		promMetrics:       getTestMetrics(),
 	}
 
 	items := []publisher.PublishItem{
@@ -319,9 +324,10 @@ func TestPublishWithRetry_PublishBatchError(t *testing.T) {
 	}
 
 	e := &Engine{
-		logger:       zap.NewNop(),
-		batchTimeout: time.Second,
-		promMetrics:  getTestMetrics(),
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: 3,
+		promMetrics:       getTestMetrics(),
 	}
 
 	items := []publisher.PublishItem{

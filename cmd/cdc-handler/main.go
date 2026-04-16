@@ -125,7 +125,7 @@ func main() {
 		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize),
 		zap.Int("max_tx_buffer", cfg.MaxTxBufferSize))
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, logger)
+	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, cfg.MaxPublishRetries, logger)
 
 	startPos, err := store.Load(ctx)
 	if err != nil {
