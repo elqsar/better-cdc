@@ -41,5 +41,4 @@ build/
 
 # Certificates
 certs/
-
-report-1.md
+report-*.md

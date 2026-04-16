@@ -69,24 +69,10 @@ func Load() Config {
 		cfg.HealthAddr = v
 	}
 	if v := os.Getenv("TABLE_FILTERS"); v != "" {
-		parts := strings.Split(v, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if trimmed := strings.TrimSpace(p); trimmed != "" {
-				out = append(out, trimmed)
-			}
-		}
-		cfg.TableFilters = out
+		cfg.TableFilters = splitAndTrimCSV(v)
 	}
 	if v := os.Getenv("CDC_PUBLICATIONS"); v != "" {
-		parts := strings.Split(v, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if trimmed := strings.TrimSpace(p); trimmed != "" {
-				out = append(out, trimmed)
-			}
-		}
-		if len(out) > 0 {
+		if out := splitAndTrimCSV(v); len(out) > 0 {
 			cfg.Publications = out
 		}
 	}
@@ -112,14 +98,7 @@ func Load() Config {
 		cfg.StreamName = v
 	}
 	if v := os.Getenv("STREAM_SUBJECTS"); v != "" {
-		parts := strings.Split(v, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if trimmed := strings.TrimSpace(p); trimmed != "" {
-				out = append(out, trimmed)
-			}
-		}
-		if len(out) > 0 {
+		if out := splitAndTrimCSV(v); len(out) > 0 {
 			cfg.StreamSubjects = out
 		}
 	}
@@ -149,6 +128,17 @@ func Load() Config {
 	}
 
 	return cfg
+}
+
+func splitAndTrimCSV(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func databaseNameFromURL(raw string) string {
