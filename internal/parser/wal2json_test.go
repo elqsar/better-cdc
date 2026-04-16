@@ -71,10 +71,10 @@ func TestPgTime_UnmarshalJSON(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if tt.isZero && !v.Time.IsZero() {
+			if tt.isZero && !v.IsZero() {
 				t.Fatalf("expected zero time, got %v", v.Time)
 			}
-			if !tt.isZero && v.Time.IsZero() {
+			if !tt.isZero && v.IsZero() {
 				t.Fatal("expected non-zero time, got zero")
 			}
 		})
@@ -89,7 +89,7 @@ func TestPgTime_InStruct(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatalf("unmarshal with null timestamp: %v", err)
 	}
-	if !msg.Timestamp.Time.IsZero() {
+	if !msg.Timestamp.IsZero() {
 		t.Fatalf("expected zero time for null timestamp, got %v", msg.Timestamp.Time)
 	}
 
@@ -98,11 +98,11 @@ func TestPgTime_InStruct(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatalf("unmarshal with real timestamp: %v", err)
 	}
-	if msg.Timestamp.Time.IsZero() {
+	if msg.Timestamp.IsZero() {
 		t.Fatal("expected non-zero time, got zero")
 	}
 	expected := time.Date(2024, 1, 15, 15, 30, 0, 123456000, time.UTC)
-	if !msg.Timestamp.Time.Equal(expected) {
+	if !msg.Timestamp.Equal(expected) {
 		t.Fatalf("expected %v, got %v", expected, msg.Timestamp.Time)
 	}
 }

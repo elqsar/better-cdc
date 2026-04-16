@@ -32,7 +32,7 @@ func (s *SlotStore) Load(ctx context.Context) (model.WALPosition, error) {
 	if err != nil {
 		return model.WALPosition{}, fmt.Errorf("slot store connect: %w", err)
 	}
-	defer conn.Close(ctx)
+	defer conn.Close(ctx) //nolint:errcheck
 
 	result := conn.ExecParams(
 		ctx,

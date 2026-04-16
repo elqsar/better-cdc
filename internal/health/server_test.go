@@ -100,7 +100,7 @@ func TestStart_ReturnsErrorWhenAddrInUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer ln.Close() //nolint:errcheck
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -131,7 +131,7 @@ func TestStart_ServesHealthEndpoint(t *testing.T) {
 	for time.Now().Before(deadline) {
 		resp, err := client.Get("http://" + addr + "/health")
 		if err == nil {
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("expected 200, got %d", resp.StatusCode)
 			}
