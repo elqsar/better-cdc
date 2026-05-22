@@ -23,7 +23,11 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(1)
+	}
 	if err := cfg.Validate(); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
 		os.Exit(1)

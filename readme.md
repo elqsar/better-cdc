@@ -105,7 +105,7 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 ## Known limitations
 - Schema evolution is not tracked as first-class CDC. `ALTER TABLE` and most other DDL are not emitted as structured events, so consumers must tolerate shape changes during deploys.
 - `TRUNCATE` is supported by both plugins and is emitted as `cdc.ddl` with empty `before` / `after` images. Other DDL is still unsupported.
-- Large `pgoutput` transactions are buffered until commit. If `MAX_TX_BUFFER_SIZE` is exceeded, the parser switches to streaming mode to avoid unbounded memory growth; row events from that overflowed transaction can be published before commit metadata is available.
+- Large `pgoutput` transactions are buffered until commit. If `MAX_TX_BUFFER_SIZE` is exceeded, the parser spills raw messages to disk and replays them at commit to avoid unbounded memory growth while preserving commit metadata.
 - Duplicate delivery remains possible after crashes, after publish retries, or after recovery outside the JetStream de-dup window.
 
 ## Throughput Tuning
@@ -150,7 +150,7 @@ Tests cover:
 - **JetStream Dedup** (`TestJetStreamDedup`): Duplicate messages with the same `event_id` are rejected by JetStream.
 
 ## Development
-- Requires Go 1.23+
+- Requires Go 1.25.2+
 - Run `go test ./...` for unit tests.
 - Run `go test -tags=integration -v -timeout=3m ./tests/integration/` for integration tests (requires Docker).
 - Code lives under `internal/`; entrypoint `cmd/cdc-handler/main.go`.

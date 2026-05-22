@@ -2,10 +2,19 @@ package config
 
 import "testing"
 
+func loadConfig(t *testing.T) Config {
+	t.Helper()
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	return cfg
+}
+
 func TestLoad_DerivesDatabaseNameFromDatabaseURL(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/appdb?sslmode=disable")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if cfg.Database != "appdb" {
 		t.Fatalf("expected database name %q, got %q", "appdb", cfg.Database)
@@ -16,7 +25,7 @@ func TestLoad_CDCDatabaseNameOverridesDerivedDatabase(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/appdb")
 	t.Setenv("CDC_DATABASE_NAME", "events")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if cfg.Database != "events" {
 		t.Fatalf("expected override database name %q, got %q", "events", cfg.Database)
@@ -27,7 +36,7 @@ func TestLoad_AWSRDSDatabaseStillOverridesDerivedDatabase(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/appdb")
 	t.Setenv("AWS_RDS_DATABASE", "legacy")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if cfg.Database != "legacy" {
 		t.Fatalf("expected legacy override database name %q, got %q", "legacy", cfg.Database)
@@ -37,7 +46,7 @@ func TestLoad_AWSRDSDatabaseStillOverridesDerivedDatabase(t *testing.T) {
 func TestLoad_KeepsDefaultDatabaseWhenURLHasNoPath(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if cfg.Database != "postgres" {
 		t.Fatalf("expected default database name %q, got %q", "postgres", cfg.Database)
@@ -47,7 +56,7 @@ func TestLoad_KeepsDefaultDatabaseWhenURLHasNoPath(t *testing.T) {
 func TestLoad_AllowNoopPublisher(t *testing.T) {
 	t.Setenv("ALLOW_NOOP_PUBLISHER", "true")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if !cfg.AllowNoopPublisher {
 		t.Fatal("expected AllowNoopPublisher to be true")
@@ -57,7 +66,7 @@ func TestLoad_AllowNoopPublisher(t *testing.T) {
 func TestLoad_EnablePprof(t *testing.T) {
 	t.Setenv("ENABLE_PPROF", "true")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if !cfg.EnablePprof {
 		t.Fatal("expected EnablePprof to be true")
@@ -67,7 +76,7 @@ func TestLoad_EnablePprof(t *testing.T) {
 func TestLoad_PublishAsyncMaxPendingOverride(t *testing.T) {
 	t.Setenv("PUBLISH_ASYNC_MAX_PENDING", "1024")
 
-	cfg := Load()
+	cfg := loadConfig(t)
 
 	if cfg.PublishAsyncMaxPending != 1024 {
 		t.Fatalf("expected PublishAsyncMaxPending %d, got %d", 1024, cfg.PublishAsyncMaxPending)
@@ -130,5 +139,74 @@ func TestConfigValidate_RejectsNegativePublishAsyncMaxPending(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("expected validation error for negative publish async max pending")
+	}
+}
+
+func TestLoad_RejectsInvalidInteger(t *testing.T) {
+	t.Setenv("BATCH_SIZE", "many")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid integer error")
+	}
+}
+
+func TestLoad_RejectsInvalidDuration(t *testing.T) {
+	t.Setenv("BATCH_TIMEOUT", "100")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid duration error")
+	}
+}
+
+func TestLoad_RejectsInvalidBool(t *testing.T) {
+	t.Setenv("DEBUG", "sure")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid bool error")
+	}
+}
+
+func TestConfigValidate_RejectsInvalidPlugin(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Plugin = "decoderbufs"
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error for invalid plugin")
+	}
+}
+
+func TestConfigValidate_RejectsNonPositiveBatchTimeout(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BatchTimeout = 0
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error for non-positive batch timeout")
+	}
+}
+
+func TestConfigValidate_RejectsNegativeBufferSize(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.RawMessageBufferSize = -1
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error for negative raw buffer size")
+	}
+}
+
+func TestConfigValidate_RejectsInvalidStreamStorage(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.StreamStorage = "disk"
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error for invalid stream storage")
+	}
+}
+
+func TestConfigValidate_RejectsNonPositiveStreamReplicas(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.StreamReplicas = 0
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error for non-positive stream replicas")
 	}
 }

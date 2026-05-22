@@ -286,29 +286,15 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 	e.promMetrics.BatchLatency.Observe(batchLatencyUs)
 	e.promMetrics.EventsPerSecond.Set(int64(e.eventsProcessed.Rate()))
 
-	// Handle partial success: checkpoint what we can
+	// Handle partial success without advancing the checkpoint. WAL feedback is
+	// only safe at commit boundaries after the whole flushed batch succeeds.
 	if result.IsPartialSuccess() {
 		e.promMetrics.PartialBatchFailures.Inc()
-		e.logger.Warn("partial batch success after retries - checkpointing last successful position",
+		e.logger.Warn("partial batch success after retries - checkpoint not advanced",
 			zap.Int("succeeded", result.Succeeded),
 			zap.Int("failed", result.Failed),
 			zap.Int("total", result.Total),
 			zap.Error(result.FirstError))
-
-		// Checkpoint the last successfully acked position to avoid replaying those events
-		if result.LastSuccessPosition != nil && result.LastSuccessPosition.LSN != "" {
-			if cpErr := e.checkpointer.MaybeFlush(ctx, *result.LastSuccessPosition, true, time.Now()); cpErr != nil {
-				e.logger.Error("failed to checkpoint partial success",
-					zap.Error(cpErr),
-					zap.String("lsn", result.LastSuccessPosition.LSN))
-			} else {
-				e.maybeAcknowledgeCheckpoint()
-				e.logger.Info("checkpointed partial batch success",
-					zap.String("lsn", result.LastSuccessPosition.LSN),
-					zap.Int("succeeded", result.Succeeded))
-			}
-		}
-
 		return fmt.Errorf("partial batch failure: %d/%d succeeded: %w", result.Succeeded, result.Total, result.FirstError)
 	}
 

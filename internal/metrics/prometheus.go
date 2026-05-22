@@ -137,7 +137,7 @@ func NewMetrics() *Metrics {
 			"Event transformation latency in nanoseconds",
 			[]float64{100, 500, 1000, 5000, 10000, 50000}),
 		PartialBatchFailures: NewPrometheusCounter("engine", "partial_batch_failures_total",
-			"Total number of batches with partial success (some items failed, checkpoint saved for successful items)"),
+			"Total number of batches with partial success (some items failed and checkpoint was not advanced)"),
 
 		// Publisher metrics
 		JetstreamPublished: NewPrometheusCounter("publisher", "jetstream_published_total",

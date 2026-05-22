@@ -261,12 +261,16 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, rawData []by
 			p.promMetrics.ReplicationLag.Set(lag)
 		}
 		if p.tx.spill == nil {
-			for _, evt := range p.tx.events {
+			for i, evt := range p.tx.events {
+				if evt == nil {
+					continue
+				}
 				p.enrichEventForCommit(evt, checkpointPos)
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
 				case out <- evt:
+					p.tx.events[i] = nil
 				}
 			}
 		} else {
@@ -345,7 +349,9 @@ func (p *PGOutputParser) cleanupTx() {
 		return
 	}
 	for _, evt := range p.tx.events {
-		model.ReleaseWALEvent(evt)
+		if evt != nil {
+			model.ReleaseWALEvent(evt)
+		}
 	}
 	p.tx.events = nil
 	p.tx.rawMsgs = nil

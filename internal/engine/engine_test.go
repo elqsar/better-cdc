@@ -409,6 +409,129 @@ func TestBuildFinalResult(t *testing.T) {
 	}
 }
 
+func TestFlushWithBatchPublish_PartialFailureDoesNotCheckpoint(t *testing.T) {
+	mock := newMockBatchPublisher()
+	mock.failuresPerAttempt = [][]int{{1}}
+
+	reader := &mockAcknowledgerReader{}
+	store := &mockStore{}
+	ckpt := checkpoint.NewManager(store, time.Hour, zap.NewNop())
+	e := &Engine{
+		reader:            reader,
+		transformer:       &mockTransformer{},
+		checkpointer:      ckpt,
+		database:          "postgres",
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: 0,
+		eventsProcessed:   metrics.NewRateCounter("events_per_second"),
+		batchesPublished:  metrics.NewCounter("batches_published"),
+		batchLatency:      metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
+		transformLatency:  metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
+		promMetrics:       getTestMetrics(),
+	}
+
+	commitPos := model.WALPosition{LSN: "0/30"}
+	batch := []*model.WALEvent{
+		{
+			Operation:     model.OperationInsert,
+			Schema:        "public",
+			Table:         "accounts",
+			NewValues:     map[string]interface{}{"id": 1},
+			TransactionID: "1",
+			Position:      commitPos,
+			LSN:           "0/20",
+			TxID:          1,
+		},
+		{
+			Operation:     model.OperationUpdate,
+			Schema:        "public",
+			Table:         "accounts",
+			OldValues:     map[string]interface{}{"id": 2},
+			NewValues:     map[string]interface{}{"id": 2},
+			TransactionID: "1",
+			Position:      commitPos,
+			LSN:           "0/20",
+			TxID:          1,
+		},
+		{
+			Commit:   true,
+			Position: commitPos,
+			LSN:      "0/20",
+			TxID:     1,
+		},
+	}
+
+	err := e.flushWithBatchPublish(context.Background(), batch, batch[len(batch)-1], mock)
+	if err == nil {
+		t.Fatal("expected partial batch failure")
+	}
+	if got := ckpt.LastAcked().LSN; got != "" {
+		t.Fatalf("expected no checkpoint ack after partial failure, got %q", got)
+	}
+	if got := reader.acked.LSN; got != "" {
+		t.Fatalf("expected reader ack to stay empty after partial failure, got %q", got)
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("expected no checkpoint saves after partial failure, got %+v", store.saved)
+	}
+}
+
+func TestFlushWithBatchPublish_FullSuccessCheckpointsCommit(t *testing.T) {
+	mock := newMockBatchPublisher()
+
+	reader := &mockAcknowledgerReader{}
+	store := &mockStore{}
+	ckpt := checkpoint.NewManager(store, time.Hour, zap.NewNop())
+	e := &Engine{
+		reader:            reader,
+		transformer:       &mockTransformer{},
+		checkpointer:      ckpt,
+		database:          "postgres",
+		logger:            zap.NewNop(),
+		batchTimeout:      time.Second,
+		maxPublishRetries: 0,
+		eventsProcessed:   metrics.NewRateCounter("events_per_second"),
+		batchesPublished:  metrics.NewCounter("batches_published"),
+		batchLatency:      metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
+		transformLatency:  metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
+		promMetrics:       getTestMetrics(),
+	}
+
+	commitPos := model.WALPosition{LSN: "0/30"}
+	batch := []*model.WALEvent{
+		{
+			Operation:     model.OperationInsert,
+			Schema:        "public",
+			Table:         "accounts",
+			NewValues:     map[string]interface{}{"id": 1},
+			TransactionID: "1",
+			Position:      commitPos,
+			LSN:           "0/20",
+			TxID:          1,
+		},
+		{
+			Commit:   true,
+			Position: commitPos,
+			LSN:      "0/20",
+			TxID:     1,
+		},
+	}
+
+	if err := e.flushWithBatchPublish(context.Background(), batch, batch[len(batch)-1], mock); err != nil {
+		t.Fatalf("flushWithBatchPublish returned error: %v", err)
+	}
+	if got := ckpt.LastAcked().LSN; got != "0/30" {
+		t.Fatalf("expected checkpoint ack 0/30, got %q", got)
+	}
+	if got := reader.acked.LSN; got != "0/30" {
+		t.Fatalf("expected reader ack 0/30, got %q", got)
+	}
+	if len(store.saved) != 1 || store.saved[0].LSN != "0/30" {
+		t.Fatalf("expected saved checkpoint 0/30, got %+v", store.saved)
+	}
+}
+
 // mockErrorReader implements wal.Reader and wal.ErrorReporter for testing
 // fatal error propagation from the reader to the engine.
 type mockErrorReader struct {

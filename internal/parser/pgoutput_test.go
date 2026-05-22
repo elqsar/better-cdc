@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -347,6 +348,73 @@ func TestPGOutputParser_OverflowSpillsUntilCommitAndPreservesMetadata(t *testing
 	if p.tx != nil {
 		t.Fatalf("expected transaction state to be cleared after commit, got %+v", p.tx)
 	}
+}
+
+func TestPGOutputParser_CleanupDoesNotReleaseEmittedTransactionEvents(t *testing.T) {
+	p := NewPGOutputParser(PGOutputConfig{
+		Logger:     zap.NewNop(),
+		BufferSize: 1,
+	})
+
+	first := model.AcquireWALEvent()
+	first.Schema = "public"
+	first.Table = "orders"
+	first.Operation = model.OperationInsert
+	second := model.AcquireWALEvent()
+	second.Schema = "public"
+	second.Table = "accounts"
+	second.Operation = model.OperationInsert
+
+	p.tx = &txBuffer{
+		xid:    42,
+		events: []*model.WALEvent{first, second},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan *model.WALEvent, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- p.handlePGOutputMessage(ctx, nil, &pglogrepl.CommitMessage{
+			CommitLSN: pglogrepl.LSN(0x16B3748),
+		}, out)
+	}()
+
+	deadline := time.After(1 * time.Second)
+	for len(out) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for first event to be emitted")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for commit handling to stop")
+	}
+
+	p.cleanupTx()
+
+	emitted := <-out
+	if emitted != first {
+		t.Fatalf("expected first event to be emitted, got %+v", emitted)
+	}
+	if emitted.Table != "orders" || emitted.Schema != "public" || emitted.Operation != model.OperationInsert {
+		t.Fatalf("emitted event was reset during cleanup: %+v", emitted)
+	}
+	if second.Table != "" || second.Schema != "" || second.Operation != "" {
+		t.Fatalf("expected unsent event to be released during cleanup, got %+v", second)
+	}
+
+	model.ReleaseWALEvent(emitted)
 }
 
 func encodeInsertMessage(relID uint32, values ...string) []byte {

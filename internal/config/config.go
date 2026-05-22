@@ -31,8 +31,8 @@ type Config struct {
 	ParsedEventBufferSize int // Buffer between parser and engine (default: 5000)
 
 	// Transaction buffer limit for pgoutput parser
-	// When exceeded, events are streamed immediately instead of buffered until COMMIT
-	// This prevents OOM during large transactions (bulk inserts, migrations)
+	// When exceeded, raw pgoutput messages are spilled to disk and replayed at COMMIT.
+	// This prevents OOM during large transactions (bulk inserts, migrations).
 	MaxTxBufferSize int // Maximum events to buffer per transaction (default: 100000, 0 = unlimited)
 
 	// JetStream stream durability configuration
@@ -85,14 +85,51 @@ func DefaultConfig() Config {
 
 // Validate rejects configuration values that would crash or degrade the engine.
 func (c Config) Validate() error {
+	switch c.Plugin {
+	case "", "wal2json", "pgoutput":
+	default:
+		return fmt.Errorf("CDC_PLUGIN must be pgoutput or wal2json")
+	}
 	if c.BatchSize < 0 {
 		return fmt.Errorf("BATCH_SIZE must be >= 0")
+	}
+	if c.BatchTimeout <= 0 {
+		return fmt.Errorf("BATCH_TIMEOUT must be > 0")
 	}
 	if c.PublishAsyncMaxPending < 0 {
 		return fmt.Errorf("PUBLISH_ASYNC_MAX_PENDING must be >= 0")
 	}
 	if c.MaxPublishRetries < 0 {
 		return fmt.Errorf("MAX_PUBLISH_RETRIES must be >= 0")
+	}
+	if c.CheckpointFreq <= 0 {
+		return fmt.Errorf("CHECKPOINT_INTERVAL must be > 0")
+	}
+	if c.NATSTimeout <= 0 {
+		return fmt.Errorf("NATS_TIMEOUT must be > 0")
+	}
+	if c.RawMessageBufferSize < 0 {
+		return fmt.Errorf("RAW_MESSAGE_BUFFER_SIZE must be >= 0")
+	}
+	if c.ParsedEventBufferSize < 0 {
+		return fmt.Errorf("PARSED_EVENT_BUFFER_SIZE must be >= 0")
+	}
+	if c.MaxTxBufferSize < 0 {
+		return fmt.Errorf("MAX_TX_BUFFER_SIZE must be >= 0")
+	}
+	switch c.StreamStorage {
+	case "", "file", "memory":
+	default:
+		return fmt.Errorf("STREAM_STORAGE must be file or memory")
+	}
+	if c.StreamReplicas <= 0 {
+		return fmt.Errorf("STREAM_REPLICAS must be > 0")
+	}
+	if c.StreamMaxAge <= 0 {
+		return fmt.Errorf("STREAM_MAX_AGE must be > 0")
+	}
+	if c.DuplicateWindow <= 0 {
+		return fmt.Errorf("DUPLICATE_WINDOW must be > 0")
 	}
 	return nil
 }

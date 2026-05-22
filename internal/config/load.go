@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"strconv"
@@ -9,7 +10,7 @@ import (
 )
 
 // Load reads configuration from environment variables, falling back to defaults.
-func Load() Config {
+func Load() (Config, error) {
 	cfg := DefaultConfig()
 
 	if v := os.Getenv("CDC_SLOT_NAME"); v != "" {
@@ -29,32 +30,42 @@ func Load() Config {
 		cfg.Database = derived
 	}
 	if v := os.Getenv("BATCH_SIZE"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			cfg.BatchSize = i
+		i, err := parseEnvInt("BATCH_SIZE", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.BatchSize = i
 	}
 	if v := os.Getenv("PUBLISH_ASYNC_MAX_PENDING"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			cfg.PublishAsyncMaxPending = i
+		i, err := parseEnvInt("PUBLISH_ASYNC_MAX_PENDING", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.PublishAsyncMaxPending = i
 	}
 	if v := os.Getenv("MAX_PUBLISH_RETRIES"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			cfg.MaxPublishRetries = i
+		i, err := parseEnvInt("MAX_PUBLISH_RETRIES", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.MaxPublishRetries = i
 	}
 	if v := os.Getenv("BATCH_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.BatchTimeout = d
+		d, err := parseEnvDuration("BATCH_TIMEOUT", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.BatchTimeout = d
 	}
 	if v := os.Getenv("CHECKPOINT_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.CheckpointFreq = d
+		d, err := parseEnvDuration("CHECKPOINT_INTERVAL", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.CheckpointFreq = d
 	}
 	if v := os.Getenv("NATS_URL"); v != "" {
-		cfg.NATSURLs = strings.Split(v, ",")
+		cfg.NATSURLs = splitAndTrimCSV(v)
 	}
 	if v := os.Getenv("NATS_USERNAME"); v != "" {
 		cfg.NATSUsername = v
@@ -63,12 +74,18 @@ func Load() Config {
 		cfg.NATSPassword = v
 	}
 	if v := os.Getenv("NATS_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.NATSTimeout = d
+		d, err := parseEnvDuration("NATS_TIMEOUT", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.NATSTimeout = d
 	}
-	if v := strings.ToLower(os.Getenv("ALLOW_NOOP_PUBLISHER")); v == "1" || v == "true" || v == "yes" {
-		cfg.AllowNoopPublisher = true
+	if v := os.Getenv("ALLOW_NOOP_PUBLISHER"); v != "" {
+		enabled, err := parseEnvBool("ALLOW_NOOP_PUBLISHER", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.AllowNoopPublisher = enabled
 	}
 	if v := os.Getenv("HEALTH_ADDR"); v != "" {
 		cfg.HealthAddr = v
@@ -81,23 +98,33 @@ func Load() Config {
 			cfg.Publications = out
 		}
 	}
-	if v := strings.ToLower(os.Getenv("DEBUG")); v == "1" || v == "true" || v == "yes" {
-		cfg.Debug = true
+	if v := os.Getenv("DEBUG"); v != "" {
+		enabled, err := parseEnvBool("DEBUG", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Debug = enabled
 	}
 	if v := os.Getenv("RAW_MESSAGE_BUFFER_SIZE"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
-			cfg.RawMessageBufferSize = i
+		i, err := parseEnvInt("RAW_MESSAGE_BUFFER_SIZE", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.RawMessageBufferSize = i
 	}
 	if v := os.Getenv("PARSED_EVENT_BUFFER_SIZE"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
-			cfg.ParsedEventBufferSize = i
+		i, err := parseEnvInt("PARSED_EVENT_BUFFER_SIZE", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.ParsedEventBufferSize = i
 	}
 	if v := os.Getenv("MAX_TX_BUFFER_SIZE"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil && i >= 0 {
-			cfg.MaxTxBufferSize = i
+		i, err := parseEnvInt("MAX_TX_BUFFER_SIZE", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.MaxTxBufferSize = i
 	}
 	if v := os.Getenv("STREAM_NAME"); v != "" {
 		cfg.StreamName = v
@@ -107,32 +134,46 @@ func Load() Config {
 			cfg.StreamSubjects = out
 		}
 	}
-	if v := strings.ToLower(os.Getenv("STREAM_STORAGE")); v == "file" || v == "memory" {
-		cfg.StreamStorage = v
+	if v := os.Getenv("STREAM_STORAGE"); v != "" {
+		cfg.StreamStorage = strings.ToLower(v)
 	}
 	if v := os.Getenv("STREAM_REPLICAS"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil && i > 0 {
-			cfg.StreamReplicas = i
+		i, err := parseEnvInt("STREAM_REPLICAS", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.StreamReplicas = i
 	}
 	if v := os.Getenv("STREAM_MAX_AGE"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.StreamMaxAge = d
+		d, err := parseEnvDuration("STREAM_MAX_AGE", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.StreamMaxAge = d
 	}
 	if v := os.Getenv("DUPLICATE_WINDOW"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.DuplicateWindow = d
+		d, err := parseEnvDuration("DUPLICATE_WINDOW", v)
+		if err != nil {
+			return cfg, err
 		}
+		cfg.DuplicateWindow = d
 	}
-	if v := strings.ToLower(os.Getenv("ENABLE_PROFILING")); v == "1" || v == "true" || v == "yes" {
-		cfg.EnableProfiling = true
+	if v := os.Getenv("ENABLE_PROFILING"); v != "" {
+		enabled, err := parseEnvBool("ENABLE_PROFILING", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.EnableProfiling = enabled
 	}
-	if v := strings.ToLower(os.Getenv("ENABLE_PPROF")); v == "1" || v == "true" || v == "yes" {
-		cfg.EnablePprof = true
+	if v := os.Getenv("ENABLE_PPROF"); v != "" {
+		enabled, err := parseEnvBool("ENABLE_PPROF", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.EnablePprof = enabled
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 func splitAndTrimCSV(v string) []string {
@@ -159,4 +200,31 @@ func databaseNameFromURL(raw string) string {
 		return ""
 	}
 	return name
+}
+
+func parseEnvInt(name, value string) (int, error) {
+	out, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
+	}
+	return out, nil
+}
+
+func parseEnvDuration(name, value string) (time.Duration, error) {
+	out, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration: %w", name, err)
+	}
+	return out, nil
+}
+
+func parseEnvBool(name, value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes":
+		return true, nil
+	case "0", "false", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean (true/false, yes/no, or 1/0)", name)
+	}
 }
