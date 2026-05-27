@@ -236,9 +236,9 @@ func TestBuildEventID_StableAcrossCalls(t *testing.T) {
 
 func TestWriteValue(t *testing.T) {
 	cases := []struct {
-		name    string
-		value   interface{}
-		wantPK  string
+		name   string
+		value  interface{}
+		wantPK string
 	}{
 		{"string", "hello", "k=hello"},
 		{"int", int(7), "k=7"},
