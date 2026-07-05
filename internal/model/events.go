@@ -35,6 +35,11 @@ type WALEvent struct {
 	CommitTime    time.Time
 	LSN           string
 	TxID          uint64
+	// SeqInTx is the event's deterministic ordinal (WAL order) within its
+	// transaction. It disambiguates events that share the same commit LSN and
+	// xid so the EventID stays unique per logical change while remaining stable
+	// across crash-replay.
+	SeqInTx uint32
 }
 
 // Default map capacity for pooled WALEvents (typical table has ~10-20 columns).
@@ -73,6 +78,7 @@ func ReleaseWALEvent(evt *WALEvent) {
 	evt.CommitTime = time.Time{}
 	evt.LSN = ""
 	evt.TxID = 0
+	evt.SeqInTx = 0
 
 	// Clear maps but keep the underlying storage.
 	// Reinitialize nil maps so the pool invariant (non-nil maps) is preserved.

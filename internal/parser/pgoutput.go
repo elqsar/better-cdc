@@ -261,16 +261,18 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, rawData []by
 			p.promMetrics.ReplicationLag.Set(lag)
 		}
 		if p.tx.spill == nil {
+			var seq uint32
 			for i, evt := range p.tx.events {
 				if evt == nil {
 					continue
 				}
-				p.enrichEventForCommit(evt, checkpointPos)
+				p.enrichEventForCommit(evt, checkpointPos, seq)
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
 				case out <- evt:
 					p.tx.events[i] = nil
+					seq++
 				}
 			}
 		} else {
@@ -382,16 +384,23 @@ func (p *PGOutputParser) finishTx() error {
 	return nil
 }
 
-func (p *PGOutputParser) enrichEventForCommit(evt *model.WALEvent, checkpointPos model.WALPosition) {
+func (p *PGOutputParser) enrichEventForCommit(evt *model.WALEvent, checkpointPos model.WALPosition, seq uint32) {
 	evt.CommitTime = p.tx.commitTime
 	evt.Position = checkpointPos
 	evt.LSN = p.tx.commitLSN.String()
 	evt.TxID = uint64(p.tx.xid)
 	evt.Timestamp = p.tx.commitTime
 	evt.TransactionID = fmt.Sprintf("%d", p.tx.xid)
+	// seq is the event's deterministic WAL-order position within the
+	// transaction. All events in a tx share the same commit LSN and xid, so
+	// this ordinal is what keeps their EventIDs unique (and stable on replay).
+	evt.SeqInTx = seq
 }
 
 func (p *PGOutputParser) emitSpilledEvents(ctx context.Context, checkpointPos model.WALPosition, out chan<- *model.WALEvent) error {
+	// seq lives outside the Replay closure so it keeps counting across messages,
+	// yielding the same WAL-order ordinals as the in-memory commit path.
+	var seq uint32
 	return p.tx.spill.Replay(func(raw []byte) error {
 		logical, err := pglogrepl.Parse(raw)
 		if err != nil {
@@ -402,12 +411,13 @@ func (p *PGOutputParser) emitSpilledEvents(ctx context.Context, checkpointPos mo
 			return err
 		}
 		for _, evt := range events {
-			p.enrichEventForCommit(evt, checkpointPos)
+			p.enrichEventForCommit(evt, checkpointPos, seq)
 			select {
 			case <-ctx.Done():
 				model.ReleaseWALEvent(evt)
 				return ctx.Err()
 			case out <- evt:
+				seq++
 			}
 		}
 		return nil

@@ -74,7 +74,14 @@ func eventType(op model.OperationType) string {
 }
 
 // buildEventID constructs EventID using pooled strings.Builder for efficiency.
-// Format: lsn:txid:schema.table:pk_fragment
+// Format: lsn:txid:op:schema.table:seq:pk_fragment
+//
+// The operation and per-transaction sequence (evt.SeqInTx) are included because
+// every event in a transaction shares the same commit LSN and txid; without them
+// two events touching the same table/tuple in one transaction (e.g. DELETE+INSERT
+// of a row, or two nopk rows) would produce identical IDs and the second would be
+// silently deduped by JetStream. seq is a deterministic WAL-order ordinal, so
+// genuine replayed duplicates still collapse to the same ID.
 func buildEventID(evt *model.WALEvent) string {
 	sb := stringBuilderPool.Get().(*strings.Builder)
 	sb.Reset()
@@ -87,9 +94,13 @@ func buildEventID(evt *model.WALEvent) string {
 	sb.WriteByte(':')
 	sb.WriteString(strconv.FormatUint(evt.TxID, 10))
 	sb.WriteByte(':')
+	sb.WriteString(string(evt.Operation))
+	sb.WriteByte(':')
 	sb.WriteString(evt.Schema)
 	sb.WriteByte('.')
 	sb.WriteString(evt.Table)
+	sb.WriteByte(':')
+	sb.WriteString(strconv.FormatUint(uint64(evt.SeqInTx), 10))
 	sb.WriteByte(':')
 	writePrimaryKeyFragment(sb, evt)
 

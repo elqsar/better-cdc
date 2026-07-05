@@ -108,3 +108,56 @@ func TestJetStreamDedup(t *testing.T) {
 		t.Log("Dedup verified: duplicate message was rejected by JetStream")
 	}
 }
+
+// TestJetStreamNoFalseDedupWithinTransaction guards the EventID-collision fix:
+// two distinct changes to the same row inside one transaction share the same
+// commit LSN and txid, and (values unchanged) the same tuple fragment. Before the
+// per-transaction sequence was added to the EventID, both events produced an
+// identical Nats-Msg-Id and JetStream silently dropped the second one. Both must
+// now survive.
+func TestJetStreamNoFalseDedupWithinTransaction(t *testing.T) {
+	connString, slotName := startPostgres(t, "pgoutput")
+	natsURL := startNATS(t)
+	streamName := fmt.Sprintf("CDC_nofalsededup_%d", rand.Int64N(100000))
+
+	cancel, _ := startEngine(t, engineConfig{
+		ConnString: connString,
+		SlotName:   slotName,
+		Plugin:     "pgoutput",
+		NATSURLs:   []string{natsURL},
+		StreamName: streamName,
+	})
+	defer cancel()
+
+	waitForEngineReady(t, connString, natsURL, streamName, "cdc.>", 15*time.Second)
+
+	// Two identical updates to the same row in ONE transaction. The values are
+	// unchanged between them, so their tuple fragments are identical; only the
+	// per-transaction sequence distinguishes their EventIDs.
+	probe := fmt.Sprintf("probe_%d", rand.Int64N(1_000_000))
+	execSQL(t, connString, fmt.Sprintf(
+		"BEGIN; UPDATE accounts SET status = '%s' WHERE id = 1; UPDATE accounts SET status = '%s' WHERE id = 1; COMMIT;",
+		probe, probe,
+	))
+
+	// Both update events for this probe value must land in the stream.
+	events := consumeEvents(t, natsURL, streamName, "cdc.>", 2, 10*time.Second)
+
+	matched := 0
+	var ids []string
+	for _, evt := range events {
+		if status, ok := evt.After["status"].(string); ok && status == probe {
+			matched++
+			ids = append(ids, evt.EventID)
+		}
+	}
+
+	if matched != 2 {
+		t.Fatalf("expected 2 events for probe %q (one per in-transaction update), got %d; EventIDs=%v",
+			probe, matched, ids)
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("the two in-transaction updates produced identical EventIDs %q — collision not fixed", ids[0])
+	}
+	t.Logf("Both in-transaction updates survived with distinct EventIDs: %v", ids)
+}

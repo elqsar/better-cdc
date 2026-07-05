@@ -177,7 +177,7 @@ func TestBuildEventID_Format(t *testing.T) {
 
 	got := buildEventID(evt)
 
-	want := "0/16A1B8:42:public.users:id=7"
+	want := "0/16A1B8:42:INSERT:public.users:0:id=7"
 	if got != want {
 		t.Errorf("buildEventID = %q, want %q", got, want)
 	}
@@ -202,7 +202,7 @@ func TestBuildEventID_NoPKFallback(t *testing.T) {
 
 	got := buildEventID(evt)
 
-	want := "0/16A1B8:42:public.users:nopk"
+	want := "0/16A1B8:42:INSERT:public.users:0:nopk"
 	if got != want {
 		t.Errorf("buildEventID = %q, want %q", got, want)
 	}
@@ -231,6 +231,32 @@ func TestBuildEventID_StableAcrossCalls(t *testing.T) {
 
 	if id1 != id2 {
 		t.Errorf("buildEventID not stable: %q vs %q", id1, id2)
+	}
+}
+
+// TestBuildEventID_SameTxDistinctEvents guards the collision fix: events that
+// share the same commit LSN, txid, schema, table, and tuple values but differ by
+// operation and/or per-transaction sequence must produce distinct EventIDs, so
+// JetStream does not silently dedup the second one.
+func TestBuildEventID_SameTxDistinctEvents(t *testing.T) {
+	// DELETE then re-INSERT of the same row in one transaction.
+	del := newWALEvent(model.OperationDelete, map[string]interface{}{"id": 7}, nil)
+	del.SeqInTx = 0
+	ins := newWALEvent(model.OperationInsert, nil, map[string]interface{}{"id": 7})
+	ins.SeqInTx = 1
+
+	if buildEventID(del) == buildEventID(ins) {
+		t.Errorf("DELETE and INSERT of same row collided: %q", buildEventID(del))
+	}
+
+	// Two same-operation events on nopk rows differ only by sequence.
+	a := newWALEvent(model.OperationInsert, nil, nil)
+	a.SeqInTx = 0
+	b := newWALEvent(model.OperationInsert, nil, nil)
+	b.SeqInTx = 1
+
+	if buildEventID(a) == buildEventID(b) {
+		t.Errorf("two nopk inserts collided: %q", buildEventID(a))
 	}
 }
 

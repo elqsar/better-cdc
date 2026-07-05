@@ -179,6 +179,9 @@ func TestPGOutputParser_TruncateEmitsDDLEventPerRelationOnCommit(t *testing.T) {
 		if evt.TxID != 42 {
 			t.Fatalf("ddl event %d txid = %d, want 42", i, evt.TxID)
 		}
+		if evt.SeqInTx != uint32(i) {
+			t.Fatalf("ddl event %d SeqInTx = %d, want %d", i, evt.SeqInTx, i)
+		}
 		if !evt.CommitTime.Equal(commitTime) {
 			t.Fatalf("ddl event %d commit time = %v, want %v", i, evt.CommitTime, commitTime)
 		}
@@ -345,13 +348,16 @@ func TestPGOutputParser_OverflowSpillsUntilCommitAndPreservesMetadata(t *testing
 		t.Fatalf("expected begin event, got %+v", begin)
 	}
 
-	assertSpilledInsert := func(name string, evt *model.WALEvent, wantValue string) {
+	assertSpilledInsert := func(name string, evt *model.WALEvent, wantValue string, wantSeq uint32) {
 		t.Helper()
 		if evt.Operation != model.OperationInsert {
 			t.Fatalf("%s operation = %q, want %q", name, evt.Operation, model.OperationInsert)
 		}
 		if evt.NewValues["id"] != wantValue {
 			t.Fatalf("%s new value = %#v, want %q", name, evt.NewValues["id"], wantValue)
+		}
+		if evt.SeqInTx != wantSeq {
+			t.Fatalf("%s SeqInTx = %d, want %d", name, evt.SeqInTx, wantSeq)
 		}
 		if evt.LSN != commitLSN.String() {
 			t.Fatalf("%s lsn = %q, want %q", name, evt.LSN, commitLSN.String())
@@ -370,8 +376,8 @@ func TestPGOutputParser_OverflowSpillsUntilCommitAndPreservesMetadata(t *testing
 		}
 	}
 
-	assertSpilledInsert("first", first, "one")
-	assertSpilledInsert("second", second, "two")
+	assertSpilledInsert("first", first, "one", 0)
+	assertSpilledInsert("second", second, "two", 1)
 
 	if !commit.Commit {
 		t.Fatalf("expected commit event, got %+v", commit)
