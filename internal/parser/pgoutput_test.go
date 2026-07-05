@@ -239,6 +239,40 @@ func TestPGOutputParser_TruncateRespectsTableFilter(t *testing.T) {
 	}
 }
 
+func TestPGOutputParser_EmptyStringIsNotNull(t *testing.T) {
+	p := NewPGOutputParser(PGOutputConfig{
+		Logger:     zap.NewNop(),
+		BufferSize: 1,
+	})
+	rel := relationInfo{
+		ID:          1,
+		Schema:      "public",
+		Table:       "orders",
+		Columns:     []string{"empty", "null"},
+		ColumnTypes: []uint32{25, 25},
+	}
+
+	out := make(map[string]interface{}, 2)
+	p.populateTupleColumnMap(out, rel, []*pglogrepl.TupleDataColumn{
+		{DataType: 't', Data: []byte("")}, // empty string
+		{DataType: 'n'},                   // SQL NULL
+	})
+
+	got, ok := out["empty"]
+	if !ok {
+		t.Fatalf("empty column missing from decoded tuple")
+	}
+	if got != "" {
+		t.Fatalf("empty string column = %#v, want %q", got, "")
+	}
+	if got == nil {
+		t.Fatalf("empty string column was corrupted into null")
+	}
+	if out["null"] != nil {
+		t.Fatalf("null column = %#v, want nil", out["null"])
+	}
+}
+
 func TestPGOutputParser_OverflowSpillsUntilCommitAndPreservesMetadata(t *testing.T) {
 	p := NewPGOutputParser(PGOutputConfig{
 		Logger:          zap.NewNop(),

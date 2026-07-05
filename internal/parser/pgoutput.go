@@ -610,8 +610,10 @@ func (p *PGOutputParser) populateTupleColumnMap(out map[string]interface{}, rel 
 }
 
 func (p *PGOutputParser) decodeColumn(oid uint32, data []byte) interface{} {
+	// NULL is handled by the 'n' datatype in populateTupleColumnMap; an empty
+	// payload here is a genuine empty string, not SQL NULL.
 	if len(data) == 0 {
-		return nil
+		return string(data) // ""
 	}
 	if p.typeMap == nil {
 		return string(data)
