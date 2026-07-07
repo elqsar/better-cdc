@@ -1,0 +1,105 @@
+version: "3"
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  deps:
+    desc: Download Go module dependencies
+    cmds:
+      - go mod download
+
+  tidy:
+    desc: Tidy Go modules
+    cmds:
+      - go mod tidy
+
+  fmt:
+    desc: Format Go code
+    cmds:
+      - gofmt -w ./cmd ./internal ./tests
+
+  fmt:check:
+    desc: Check Go formatting
+    cmds:
+      - |
+        unformatted="$(gofmt -l ./cmd ./internal ./tests)"
+        if [ -n "$unformatted" ]; then
+          echo "$unformatted"
+          exit 1
+        fi
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test ./...
+
+  test:integration:
+    desc: Run Docker-backed integration tests
+    cmds:
+      - go test -tags=integration -v -timeout=3m ./tests/integration/
+
+  bench:
+    desc: Run benchmarks
+    cmds:
+      - go test -bench=. -benchmem ./...
+
+  check:
+    desc: Run formatting check, vet, and unit tests
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: test
+
+  build:
+    desc: Build the CDC handler binary
+    cmds:
+      - go build -o ./bin/cdc-handler ./cmd/cdc-handler
+
+  run:
+    desc: Run the CDC handler with local defaults
+    cmds:
+      - |
+        DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/postgres}" \
+        CDC_SLOT_NAME="${CDC_SLOT_NAME:-better_cdc_slot}" \
+        CDC_PLUGIN="${CDC_PLUGIN:-wal2json}" \
+        CDC_PUBLICATIONS="${CDC_PUBLICATIONS:-better_cdc_pub}" \
+        go run ./cmd/cdc-handler
+
+  up:
+    desc: Start local Docker Compose stack
+    cmds:
+      - docker compose up -d
+
+  down:
+    desc: Stop local Docker Compose stack
+    cmds:
+      - docker compose down
+
+  logs:
+    desc: Follow Docker Compose logs
+    cmds:
+      - docker compose logs -f
+
+  ps:
+    desc: Show Docker Compose service status
+    cmds:
+      - docker compose ps
+
+  load-test:
+    desc: Run the E2E load test; pass options after --
+    cmds:
+      - ./scripts/e2e-load-test.sh {{.CLI_ARGS}}
+
+  clean:
+    desc: Remove local build artifacts
+    cmds:
+      - rm -rf ./bin

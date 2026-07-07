@@ -14,17 +14,14 @@ A lightweight Go CDC handler that reads PostgreSQL logical replication changes a
 ## Quickstart (Local E2E)
 1) Start infra (Postgres with logical replication, NATS):
    ```bash
-   docker compose up -d
+   task up
    ```
 
 2) Run the CDC app:
    ```bash
-   export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
-   export CDC_SLOT_NAME=better_cdc_slot
-   export CDC_PLUGIN=wal2json
-   export CDC_PUBLICATIONS=better_cdc_pub
-   go run ./cmd/cdc-handler
+   task run
    ```
+   `task run` uses the local defaults shown in the old manual command and still honors any existing `DATABASE_URL`, `CDC_SLOT_NAME`, `CDC_PLUGIN`, or `CDC_PUBLICATIONS` environment overrides.
 
 3) Generate changes:
    ```bash
@@ -37,6 +34,20 @@ A lightweight Go CDC handler that reads PostgreSQL logical replication changes a
    nats --server localhost:4222 sub 'cdc.>'
    ```
 5) Debug logging: set `DEBUG=true` to enable verbose zap logging of WAL events, publishes, and checkpoints.
+
+## Taskfile
+This project uses [Task](https://taskfile.dev/) as the local command runner. Task is expected to be installed locally.
+
+```bash
+task --list            # show available tasks
+task up                # start the local Docker Compose stack
+task run               # run the CDC handler with local defaults
+task test              # run unit tests
+task test:integration  # run Docker-backed integration tests
+task check             # run formatting check, go vet, and unit tests
+```
+
+Other useful tasks include `task fmt`, `task tidy`, `task build`, `task bench`, `task logs`, `task ps`, `task down`, and `task load-test -- -n 10000 -b`.
 
 ## Configuration
 Environment variables (defaults in `internal/config`):
@@ -141,7 +152,7 @@ Set buffer sizes to `0` to revert to unbuffered (sequential) behavior for debugg
 End-to-end tests validate the full CDC pipeline (Postgres WAL -> Parser -> Engine -> JetStream -> Checkpoint) using testcontainers-go. Requires Docker running.
 
 ```bash
-go test -tags=integration -v -timeout=3m ./tests/integration/
+task test:integration
 ```
 
 Tests cover:
@@ -153,6 +164,7 @@ Tests cover:
 
 ## Development
 - Requires Go 1.25.2+
-- Run `go test ./...` for unit tests.
-- Run `go test -tags=integration -v -timeout=3m ./tests/integration/` for integration tests (requires Docker).
+- Run `task test` for unit tests.
+- Run `task test:integration` for integration tests (requires Docker).
+- Run `task check` before opening a change.
 - Code lives under `internal/`; entrypoint `cmd/cdc-handler/main.go`.
