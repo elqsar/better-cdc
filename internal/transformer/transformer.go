@@ -3,7 +3,6 @@ package transformer
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +21,7 @@ type Transformer interface {
 	Transform(ctx context.Context, evt *model.WALEvent) (*model.CDCEvent, error)
 }
 
-// SimpleTransformer constructs a CDCEvent with deterministic EventID using lsn:txid:table:pk.
+// SimpleTransformer constructs a CDCEvent with deterministic EventID using lsn:txid:op:table:seq.
 type SimpleTransformer struct {
 	source string
 }
@@ -74,14 +73,15 @@ func eventType(op model.OperationType) string {
 }
 
 // buildEventID constructs EventID using pooled strings.Builder for efficiency.
-// Format: lsn:txid:op:schema.table:seq:pk_fragment
+// Format: lsn:txid:op:schema.table:seq
 //
 // The operation and per-transaction sequence (evt.SeqInTx) are included because
 // every event in a transaction shares the same commit LSN and txid; without them
-// two events touching the same table/tuple in one transaction (e.g. DELETE+INSERT
-// of a row, or two nopk rows) would produce identical IDs and the second would be
-// silently deduped by JetStream. seq is a deterministic WAL-order ordinal, so
-// genuine replayed duplicates still collapse to the same ID.
+// two events touching the same table in one transaction could produce identical
+// IDs and the second would be silently deduped by JetStream. seq is a
+// deterministic WAL-order ordinal, so genuine replayed duplicates still collapse
+// to the same ID. Row values are intentionally excluded so large payload fields
+// never become NATS message-id headers.
 func buildEventID(evt *model.WALEvent) string {
 	sb := stringBuilderPool.Get().(*strings.Builder)
 	sb.Reset()
@@ -101,60 +101,6 @@ func buildEventID(evt *model.WALEvent) string {
 	sb.WriteString(evt.Table)
 	sb.WriteByte(':')
 	sb.WriteString(strconv.FormatUint(uint64(evt.SeqInTx), 10))
-	sb.WriteByte(':')
-	writePrimaryKeyFragment(sb, evt)
 
 	return sb.String()
-}
-
-// writePrimaryKeyFragment writes sorted key=value pairs to the builder.
-func writePrimaryKeyFragment(sb *strings.Builder, evt *model.WALEvent) {
-	var keyset map[string]interface{}
-	if len(evt.OldValues) > 0 {
-		keyset = evt.OldValues
-	} else {
-		keyset = evt.NewValues
-	}
-	if len(keyset) == 0 {
-		sb.WriteString("nopk")
-		return
-	}
-
-	keys := make([]string, 0, len(keyset))
-	for k := range keyset {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for i, k := range keys {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(k)
-		sb.WriteByte('=')
-		writeValue(sb, keyset[k])
-	}
-}
-
-// writeValue writes a value without fmt.Sprintf allocation.
-func writeValue(sb *strings.Builder, v interface{}) {
-	switch val := v.(type) {
-	case string:
-		sb.WriteString(val)
-	case int:
-		sb.WriteString(strconv.Itoa(val))
-	case int64:
-		sb.WriteString(strconv.FormatInt(val, 10))
-	case uint64:
-		sb.WriteString(strconv.FormatUint(val, 10))
-	case float64:
-		sb.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
-	case bool:
-		sb.WriteString(strconv.FormatBool(val))
-	case nil:
-		sb.WriteString("null")
-	default:
-		// Fallback for complex types
-		fmt.Fprintf(sb, "%v", val)
-	}
 }

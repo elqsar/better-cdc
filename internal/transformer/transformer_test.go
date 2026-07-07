@@ -3,7 +3,6 @@ package transformer
 import (
 	"context"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -177,48 +176,24 @@ func TestBuildEventID_Format(t *testing.T) {
 
 	got := buildEventID(evt)
 
-	want := "0/16A1B8:42:INSERT:public.users:0:id=7"
+	want := "0/16A1B8:42:INSERT:public.users:0"
 	if got != want {
 		t.Errorf("buildEventID = %q, want %q", got, want)
 	}
 }
 
-func TestBuildEventID_PrefersOldValues(t *testing.T) {
+func TestBuildEventID_ExcludesRowValues(t *testing.T) {
 	evt := newWALEvent(
 		model.OperationUpdate,
-		map[string]interface{}{"id": 1},
-		map[string]interface{}{"id": 2},
+		map[string]interface{}{"id": 1, "payload": "old large json"},
+		map[string]interface{}{"id": 2, "payload": "new large json"},
 	)
 
 	got := buildEventID(evt)
 
-	if !strings.HasSuffix(got, ":id=1") {
-		t.Errorf("buildEventID = %q, want suffix :id=1 (OldValues should win)", got)
-	}
-}
-
-func TestBuildEventID_NoPKFallback(t *testing.T) {
-	evt := newWALEvent(model.OperationInsert, nil, nil)
-
-	got := buildEventID(evt)
-
-	want := "0/16A1B8:42:INSERT:public.users:0:nopk"
+	want := "0/16A1B8:42:UPDATE:public.users:0"
 	if got != want {
 		t.Errorf("buildEventID = %q, want %q", got, want)
-	}
-}
-
-func TestBuildEventID_KeysSortedAlphabetically(t *testing.T) {
-	evt := newWALEvent(model.OperationInsert, nil, map[string]interface{}{
-		"b": 2,
-		"a": 1,
-		"c": 3,
-	})
-
-	got := buildEventID(evt)
-
-	if !strings.HasSuffix(got, ":a=1,b=2,c=3") {
-		t.Errorf("buildEventID = %q, want suffix :a=1,b=2,c=3", got)
 	}
 }
 
@@ -249,43 +224,14 @@ func TestBuildEventID_SameTxDistinctEvents(t *testing.T) {
 		t.Errorf("DELETE and INSERT of same row collided: %q", buildEventID(del))
 	}
 
-	// Two same-operation events on nopk rows differ only by sequence.
+	// Two same-operation events differ by sequence even when row values are not
+	// part of the ID.
 	a := newWALEvent(model.OperationInsert, nil, nil)
 	a.SeqInTx = 0
 	b := newWALEvent(model.OperationInsert, nil, nil)
 	b.SeqInTx = 1
 
 	if buildEventID(a) == buildEventID(b) {
-		t.Errorf("two nopk inserts collided: %q", buildEventID(a))
-	}
-}
-
-func TestWriteValue(t *testing.T) {
-	cases := []struct {
-		name   string
-		value  interface{}
-		wantPK string
-	}{
-		{"string", "hello", "k=hello"},
-		{"int", int(7), "k=7"},
-		{"int64_negative", int64(-9000), "k=-9000"},
-		{"uint64_max", uint64(18446744073709551615), "k=18446744073709551615"},
-		{"float64", float64(1.5), "k=1.5"},
-		{"bool_true", true, "k=true"},
-		{"bool_false", false, "k=false"},
-		{"nil", nil, "k=null"},
-		{"slice_fallback", []int{1, 2}, "k=[1 2]"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			evt := newWALEvent(model.OperationInsert, nil, map[string]interface{}{"k": tc.value})
-
-			got := buildEventID(evt)
-
-			if !strings.HasSuffix(got, ":"+tc.wantPK) {
-				t.Errorf("buildEventID = %q, want suffix :%s", got, tc.wantPK)
-			}
-		})
+		t.Errorf("two inserts collided: %q", buildEventID(a))
 	}
 }
