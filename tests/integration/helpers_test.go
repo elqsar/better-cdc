@@ -360,7 +360,7 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 	store := checkpoint.NewSlotStore(cfg.ConnString, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, 1*time.Second, logger)
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, "postgres", batchSize, 100*time.Millisecond, 3, logger)
+	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, "postgres", batchSize, 100*time.Millisecond, 3, false, logger)
 
 	startPos, err := store.Load(ctx)
 	if err != nil {

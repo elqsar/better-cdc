@@ -81,6 +81,7 @@ type mockBatchPublisher struct {
 	// Track call counts
 	publishBatchCalls atomic.Int32
 	waitForAcksCalls  atomic.Int32
+	publishedBatches  [][]string
 
 	// Configure behavior per attempt
 	failuresPerAttempt [][]int // indices of items to fail per attempt
@@ -105,6 +106,11 @@ func (m *mockBatchPublisher) PublishWithRetries(ctx context.Context, subject str
 
 func (m *mockBatchPublisher) PublishBatchAsync(ctx context.Context, items []publisher.PublishItem) ([]*publisher.PendingAck, error) {
 	attempt := int(m.publishBatchCalls.Add(1)) - 1
+	batch := make([]string, len(items))
+	for i := range items {
+		batch[i] = items[i].EventID
+	}
+	m.publishedBatches = append(m.publishedBatches, batch)
 
 	// Return error if configured for this attempt
 	if attempt < len(m.publishBatchErrors) && m.publishBatchErrors[attempt] != nil {
@@ -167,6 +173,23 @@ func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publish
 	return result, err
 }
 
+func equalStringBatches(got, want [][]string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if len(got[i]) != len(want[i]) {
+			return false
+		}
+		for j := range got[i] {
+			if got[i][j] != want[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func TestPublishWithRetry_AllSucceedFirstAttempt(t *testing.T) {
 	mock := newMockBatchPublisher()
 	// No failures configured = all succeed
@@ -195,26 +218,30 @@ func TestPublishWithRetry_AllSucceedFirstAttempt(t *testing.T) {
 	if result.Failed != 0 {
 		t.Errorf("expected 0 failed, got %d", result.Failed)
 	}
-	if mock.publishBatchCalls.Load() != 1 {
-		t.Errorf("expected 1 publish call, got %d", mock.publishBatchCalls.Load())
+	if mock.publishBatchCalls.Load() != 3 {
+		t.Errorf("expected 3 ordered publish calls, got %d", mock.publishBatchCalls.Load())
+	}
+	wantBatches := [][]string{{"1"}, {"2"}, {"3"}}
+	if !equalStringBatches(mock.publishedBatches, wantBatches) {
+		t.Errorf("expected ordered single-item batches %v, got %v", wantBatches, mock.publishedBatches)
 	}
 }
 
 func TestPublishWithRetry_PartialFailureRecovery(t *testing.T) {
 	mock := newMockBatchPublisher()
-	// First attempt: items 1 and 2 fail
-	// Second attempt: item 1 fails (only 1 and 2 are retried)
-	// Third attempt: all succeed
+	// Ordered mode publishes one item at a time. Item 1 fails once, is retried,
+	// then item 2 is published only after item 1 succeeds.
 	mock.failuresPerAttempt = [][]int{
-		{1, 2}, // First: fail items at index 1, 2
-		{0},    // Second: fail item at index 0 (which is original item 1)
-		{},     // Third: all succeed
+		{},  // item 0 succeeds
+		{0}, // item 1 fails
+		{},  // item 1 retry succeeds
+		{},  // item 2 succeeds
 	}
 
 	e := &Engine{
 		logger:            zap.NewNop(),
 		batchTimeout:      time.Second,
-		maxPublishRetries: 3,
+		maxPublishRetries: 1,
 		promMetrics:       getTestMetrics(),
 	}
 
@@ -235,23 +262,60 @@ func TestPublishWithRetry_PartialFailureRecovery(t *testing.T) {
 	if result.Failed != 0 {
 		t.Errorf("expected 0 failed after retries, got %d", result.Failed)
 	}
-	// Should have 3 attempts (initial + 2 retries)
-	if mock.publishBatchCalls.Load() != 3 {
-		t.Errorf("expected 3 publish calls, got %d", mock.publishBatchCalls.Load())
+	if mock.publishBatchCalls.Load() != 4 {
+		t.Errorf("expected 4 ordered publish calls, got %d", mock.publishBatchCalls.Load())
+	}
+	wantBatches := [][]string{{"0"}, {"1"}, {"1"}, {"2"}}
+	if !equalStringBatches(mock.publishedBatches, wantBatches) {
+		t.Errorf("expected ordered retry batches %v, got %v", wantBatches, mock.publishedBatches)
+	}
+}
+
+func TestPublishWithRetry_UnsafeUnorderedModeRetriesOnlyFailedItems(t *testing.T) {
+	mock := newMockBatchPublisher()
+	mock.failuresPerAttempt = [][]int{
+		{1}, // item 1 fails while items 0 and 2 succeed
+		{},  // only item 1 is retried
+	}
+
+	e := &Engine{
+		logger:                      zap.NewNop(),
+		batchTimeout:                time.Second,
+		maxPublishRetries:           1,
+		unsafeUnorderedAsyncPublish: true,
+		promMetrics:                 getTestMetrics(),
+	}
+
+	items := []publisher.PublishItem{
+		{Subject: "test.0", EventID: "0", Position: model.WALPosition{LSN: "0/0"}},
+		{Subject: "test.1", EventID: "1", Position: model.WALPosition{LSN: "0/1"}},
+		{Subject: "test.2", EventID: "2", Position: model.WALPosition{LSN: "0/2"}},
+	}
+
+	result, err := e.publishWithRetry(context.Background(), mock, items)
+
+	if err != nil {
+		t.Errorf("expected no error after retry, got %v", err)
+	}
+	if result.Succeeded != 3 {
+		t.Errorf("expected 3 succeeded, got %d", result.Succeeded)
+	}
+	wantBatches := [][]string{{"0", "1", "2"}, {"1"}}
+	if !equalStringBatches(mock.publishedBatches, wantBatches) {
+		t.Errorf("expected unsafe unordered retry batches %v, got %v", wantBatches, mock.publishedBatches)
 	}
 }
 
 func TestPublishWithRetry_ExhaustedRetries(t *testing.T) {
 	mock := newMockBatchPublisher()
-	// All attempts fail item 1
+	// Item 1 never succeeds, so item 2 must never be published.
 	mock.failuresPerAttempt = [][]int{
-		{1}, // First: fail item 1
-		{0}, // Second: fail (item 1 is now at index 0)
-		{0}, // Third: still fail
-		{0}, // Fourth: still fail (this is the last retry)
+		{},  // item 0 succeeds
+		{0}, // item 1 fails
+		{0}, // item 1 retry fails
 	}
 
-	const maxRetries = 3
+	const maxRetries = 1
 	e := &Engine{
 		logger:            zap.NewNop(),
 		batchTimeout:      time.Second,
@@ -262,6 +326,7 @@ func TestPublishWithRetry_ExhaustedRetries(t *testing.T) {
 	items := []publisher.PublishItem{
 		{Subject: "test.0", EventID: "0", Position: model.WALPosition{LSN: "0/0"}},
 		{Subject: "test.1", EventID: "1", Position: model.WALPosition{LSN: "0/1"}},
+		{Subject: "test.2", EventID: "2", Position: model.WALPosition{LSN: "0/2"}},
 	}
 
 	result, err := e.publishWithRetry(context.Background(), mock, items)
@@ -272,12 +337,15 @@ func TestPublishWithRetry_ExhaustedRetries(t *testing.T) {
 	if result.Succeeded != 1 {
 		t.Errorf("expected 1 succeeded, got %d", result.Succeeded)
 	}
-	if result.Failed != 1 {
-		t.Errorf("expected 1 failed, got %d", result.Failed)
+	if result.Failed != 2 {
+		t.Errorf("expected 2 failed, got %d", result.Failed)
 	}
-	// Should have maxRetries + 1 attempts
-	if mock.publishBatchCalls.Load() != int32(maxRetries+1) {
-		t.Errorf("expected %d publish calls, got %d", maxRetries+1, mock.publishBatchCalls.Load())
+	if mock.publishBatchCalls.Load() != 3 {
+		t.Errorf("expected 3 publish calls, got %d", mock.publishBatchCalls.Load())
+	}
+	wantBatches := [][]string{{"0"}, {"1"}, {"1"}}
+	if !equalStringBatches(mock.publishedBatches, wantBatches) {
+		t.Errorf("expected no tail publish after failed item %v, got %v", wantBatches, mock.publishedBatches)
 	}
 }
 
@@ -411,7 +479,7 @@ func TestBuildFinalResult(t *testing.T) {
 
 func TestFlushWithBatchPublish_PartialFailureDoesNotCheckpoint(t *testing.T) {
 	mock := newMockBatchPublisher()
-	mock.failuresPerAttempt = [][]int{{1}}
+	mock.failuresPerAttempt = [][]int{{}, {0}}
 
 	reader := &mockAcknowledgerReader{}
 	store := &mockStore{}

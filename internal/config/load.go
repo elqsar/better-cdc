@@ -50,6 +50,13 @@ func Load() (Config, error) {
 		}
 		cfg.MaxPublishRetries = i
 	}
+	if v := os.Getenv("UNSAFE_UNORDERED_ASYNC_PUBLISH"); v != "" {
+		enabled, err := parseEnvBool("UNSAFE_UNORDERED_ASYNC_PUBLISH", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.UnsafeUnorderedAsyncPublish = enabled
+	}
 	if v := os.Getenv("BATCH_TIMEOUT"); v != "" {
 		d, err := parseEnvDuration("BATCH_TIMEOUT", v)
 		if err != nil {

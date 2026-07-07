@@ -24,16 +24,17 @@ func marshalCDCEvent(evt *model.CDCEvent) ([]byte, error) {
 
 // Engine coordinates the end-to-end CDC flow.
 type Engine struct {
-	reader            wal.Reader
-	parser            parser.Parser
-	transformer       transformer.Transformer
-	publisher         publisher.Publisher
-	checkpointer      *checkpoint.Manager
-	database          string
-	batchSize         int
-	batchTimeout      time.Duration
-	maxPublishRetries int
-	logger            *zap.Logger
+	reader                      wal.Reader
+	parser                      parser.Parser
+	transformer                 transformer.Transformer
+	publisher                   publisher.Publisher
+	checkpointer                *checkpoint.Manager
+	database                    string
+	batchSize                   int
+	batchTimeout                time.Duration
+	maxPublishRetries           int
+	unsafeUnorderedAsyncPublish bool
+	logger                      *zap.Logger
 
 	// Throughput metrics (legacy, kept for backward compatibility)
 	eventsProcessed  *metrics.RateCounter
@@ -45,21 +46,22 @@ type Engine struct {
 	promMetrics *metrics.Metrics
 }
 
-func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, maxPublishRetries int, logger *zap.Logger) *Engine {
+func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, maxPublishRetries int, unsafeUnorderedAsyncPublish bool, logger *zap.Logger) *Engine {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	return &Engine{
-		reader:            reader,
-		parser:            parser,
-		transformer:       transformer,
-		publisher:         publisher,
-		checkpointer:      checkpointer,
-		database:          database,
-		batchSize:         batchSize,
-		batchTimeout:      batchTimeout,
-		maxPublishRetries: maxPublishRetries,
-		logger:            logger,
+		reader:                      reader,
+		parser:                      parser,
+		transformer:                 transformer,
+		publisher:                   publisher,
+		checkpointer:                checkpointer,
+		database:                    database,
+		batchSize:                   batchSize,
+		batchTimeout:                batchTimeout,
+		maxPublishRetries:           maxPublishRetries,
+		unsafeUnorderedAsyncPublish: unsafeUnorderedAsyncPublish,
+		logger:                      logger,
 		// Initialize throughput metrics (legacy)
 		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
 		batchesPublished: metrics.NewCounter("batches_published"),
@@ -108,7 +110,11 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 	// Check if publisher supports batch operations for high throughput
 	batchPub, hasBatch := e.publisher.(publisher.BatchPublisher)
 	if hasBatch {
-		e.logger.Info("batch publisher detected, using async batch publishing")
+		if e.unsafeUnorderedAsyncPublish {
+			e.logger.Warn("batch publisher detected, using unsafe unordered async batch publishing")
+		} else {
+			e.logger.Info("batch publisher detected, using ordered batch publishing")
+		}
 	}
 
 	flush := func(flushCtx context.Context) error {
@@ -325,8 +331,90 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 }
 
 // publishWithRetry attempts to publish items with retry logic for transient failures.
-// It retries only the failed items with exponential backoff.
 func (e *Engine) publishWithRetry(ctx context.Context, batchPub publisher.BatchPublisher, items []publisher.PublishItem) (*publisher.BatchResult, error) {
+	if e.unsafeUnorderedAsyncPublish {
+		return e.publishUnorderedWithRetry(ctx, batchPub, items)
+	}
+	return e.publishOrderedWithRetry(ctx, batchPub, items)
+}
+
+// publishOrderedWithRetry publishes one item at a time and waits for its ack
+// before advancing. This preserves CDC ordering because later items are never
+// committed to JetStream before earlier items have been acknowledged.
+func (e *Engine) publishOrderedWithRetry(ctx context.Context, batchPub publisher.BatchPublisher, items []publisher.PublishItem) (*publisher.BatchResult, error) {
+	timeout := e.publishTimeout()
+	succeeded := make([]bool, len(items))
+
+	for idx, item := range items {
+		var lastError error
+		pubItems := []publisher.PublishItem{item}
+
+		for attempt := 0; attempt <= e.maxPublishRetries; attempt++ {
+			if attempt > 0 {
+				backoff := e.calculateBackoff(attempt)
+				e.promMetrics.PublishRetries.Inc()
+				e.logger.Warn("retrying failed publish",
+					zap.Int("attempt", attempt),
+					zap.Int("item_index", idx),
+					zap.String("subject", item.Subject),
+					zap.Duration("backoff", backoff))
+
+				select {
+				case <-ctx.Done():
+					return e.buildFinalResult(items, succeeded, lastError), ctx.Err()
+				case <-time.After(backoff):
+				}
+			}
+
+			pending, err := batchPub.PublishBatchAsync(ctx, pubItems)
+			if err != nil {
+				if ctx.Err() != nil {
+					return e.buildFinalResult(items, succeeded, err), ctx.Err()
+				}
+				lastError = err
+				continue
+			}
+
+			result, _ := batchPub.WaitForAcks(ctx, pending, pubItems, timeout)
+
+			if ctx.Err() != nil {
+				if len(pending) > 0 && pending[0].IsAcked() {
+					succeeded[idx] = true
+				}
+				return e.buildFinalResult(items, succeeded, ctx.Err()), ctx.Err()
+			}
+
+			if len(pending) > 0 && pending[0].IsAcked() {
+				succeeded[idx] = true
+				lastError = nil
+				break
+			}
+
+			if len(pending) > 0 {
+				if pErr := pending[0].GetErr(); pErr != nil {
+					lastError = pErr
+				}
+			}
+			if lastError == nil && result.FirstError != nil {
+				lastError = result.FirstError
+			}
+			if lastError == nil {
+				lastError = fmt.Errorf("publish item %d was not acknowledged", idx)
+			}
+		}
+
+		if !succeeded[idx] {
+			return e.buildFinalResult(items, succeeded, lastError), lastError
+		}
+	}
+
+	return e.buildFinalResult(items, succeeded, nil), nil
+}
+
+// publishUnorderedWithRetry retries only failed items with exponential backoff.
+// It is unsafe for CDC ordering because later items can be committed before
+// earlier failed items are retried.
+func (e *Engine) publishUnorderedWithRetry(ctx context.Context, batchPub publisher.BatchPublisher, items []publisher.PublishItem) (*publisher.BatchResult, error) {
 	timeout := e.publishTimeout()
 
 	// Track original indices for proper position tracking across retries
@@ -510,7 +598,7 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 		// Release event after marshaling
 		model.ReleaseCDCEvent(cdcEvt)
 
-		if err := e.publisher.PublishWithRetries(ctx, subject, payload, 3, eventID); err != nil {
+		if err := e.publisher.PublishWithRetries(ctx, subject, payload, e.maxPublishRetries, eventID); err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}
 		eventCount++

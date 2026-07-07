@@ -83,6 +83,16 @@ func TestLoad_PublishAsyncMaxPendingOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_UnsafeUnorderedAsyncPublish(t *testing.T) {
+	t.Setenv("UNSAFE_UNORDERED_ASYNC_PUBLISH", "true")
+
+	cfg := loadConfig(t)
+
+	if !cfg.UnsafeUnorderedAsyncPublish {
+		t.Fatal("expected UnsafeUnorderedAsyncPublish to be true")
+	}
+}
+
 func TestConfigEffectivePublishAsyncMaxPending_UsesBatchSizeWhenLarger(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.BatchSize = 500
@@ -160,6 +170,14 @@ func TestLoad_RejectsInvalidDuration(t *testing.T) {
 
 func TestLoad_RejectsInvalidBool(t *testing.T) {
 	t.Setenv("DEBUG", "sure")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid bool error")
+	}
+}
+
+func TestLoad_RejectsInvalidUnsafeUnorderedAsyncPublish(t *testing.T) {
+	t.Setenv("UNSAFE_UNORDERED_ASYNC_PUBLISH", "sure")
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected invalid bool error")

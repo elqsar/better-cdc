@@ -7,24 +7,25 @@ import (
 
 // Config captures minimal settings for initial wiring.
 type Config struct {
-	Database               string
-	SlotName               string
-	Plugin                 string
-	DatabaseURL            string
-	BatchSize              int
-	PublishAsyncMaxPending int
-	MaxPublishRetries      int
-	BatchTimeout           time.Duration
-	CheckpointFreq         time.Duration
-	NATSURLs               []string
-	NATSUsername           string
-	NATSPassword           string
-	NATSTimeout            time.Duration
-	AllowNoopPublisher     bool
-	HealthAddr             string
-	TableFilters           []string
-	Publications           []string
-	Debug                  bool
+	Database                    string
+	SlotName                    string
+	Plugin                      string
+	DatabaseURL                 string
+	BatchSize                   int
+	PublishAsyncMaxPending      int
+	MaxPublishRetries           int
+	UnsafeUnorderedAsyncPublish bool
+	BatchTimeout                time.Duration
+	CheckpointFreq              time.Duration
+	NATSURLs                    []string
+	NATSUsername                string
+	NATSPassword                string
+	NATSTimeout                 time.Duration
+	AllowNoopPublisher          bool
+	HealthAddr                  string
+	TableFilters                []string
+	Publications                []string
+	Debug                       bool
 
 	// Pipeline buffer sizes for throughput optimization
 	RawMessageBufferSize  int // Buffer between WAL reader and parser (default: 5000)
@@ -58,28 +59,29 @@ const defaultPublishAsyncMaxPendingFloor = 256
 // DefaultConfig provides safe defaults for local prototyping.
 func DefaultConfig() Config {
 	return Config{
-		Database:               "postgres",
-		SlotName:               "better_cdc_slot",
-		Plugin:                 "wal2json",
-		DatabaseURL:            "postgres://postgres:postgres@localhost:5432/postgres",
-		BatchSize:              500,
-		PublishAsyncMaxPending: 0,
-		MaxPublishRetries:      3,
-		BatchTimeout:           100 * time.Millisecond,
-		CheckpointFreq:         1 * time.Second,
-		NATSURLs:               []string{"nats://localhost:4222"},
-		NATSTimeout:            5 * time.Second,
-		HealthAddr:             ":8080",
-		Publications:           []string{"better_cdc_pub"},
-		RawMessageBufferSize:   5000,
-		ParsedEventBufferSize:  5000,
-		MaxTxBufferSize:        100000, // 100k events max per transaction before streaming
-		StreamName:             "CDC",
-		StreamSubjects:         []string{"cdc.>"},
-		StreamStorage:          "file",
-		StreamReplicas:         1,
-		StreamMaxAge:           72 * time.Hour,
-		DuplicateWindow:        2 * time.Minute,
+		Database:                    "postgres",
+		SlotName:                    "better_cdc_slot",
+		Plugin:                      "wal2json",
+		DatabaseURL:                 "postgres://postgres:postgres@localhost:5432/postgres",
+		BatchSize:                   500,
+		PublishAsyncMaxPending:      0,
+		MaxPublishRetries:           3,
+		UnsafeUnorderedAsyncPublish: false,
+		BatchTimeout:                100 * time.Millisecond,
+		CheckpointFreq:              1 * time.Second,
+		NATSURLs:                    []string{"nats://localhost:4222"},
+		NATSTimeout:                 5 * time.Second,
+		HealthAddr:                  ":8080",
+		Publications:                []string{"better_cdc_pub"},
+		RawMessageBufferSize:        5000,
+		ParsedEventBufferSize:       5000,
+		MaxTxBufferSize:             100000, // 100k events max per transaction before streaming
+		StreamName:                  "CDC",
+		StreamSubjects:              []string{"cdc.>"},
+		StreamStorage:               "file",
+		StreamReplicas:              1,
+		StreamMaxAge:                72 * time.Hour,
+		DuplicateWindow:             2 * time.Minute,
 	}
 }
 

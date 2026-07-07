@@ -53,6 +53,7 @@ Environment variables (defaults in `internal/config`):
 - `BATCH_SIZE` (default `500`) - events per batch before flush; must be `>= 0`
 - `BATCH_TIMEOUT` (default `100ms`) - max time before flush
 - `PUBLISH_ASYNC_MAX_PENDING` (default `max(256, BATCH_SIZE)`) - JetStream async publishes allowed in flight before `PublishAsync` stalls/errors; set this to at least your effective batch size for safer defaults under higher RTT
+- `UNSAFE_UNORDERED_ASYNC_PUBLISH` (default `false`) - restores failed-item-only async batch retries for throughput, but can publish later CDC events before earlier failed events and break per-subject/per-key ordering
 - `RAW_MESSAGE_BUFFER_SIZE` (default `5000`) - buffer between WAL reader and parser
 - `PARSED_EVENT_BUFFER_SIZE` (default `5000`) - buffer between parser and engine
 
@@ -90,8 +91,8 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - **WAL Reader** (`internal/wal`): replication connection, `pgoutput`/`wal2json`, emits begin/commit markers and row changes; configurable output buffer for backpressure handling.
 - **Parser** (`internal/parser`): decodes WAL messages into structured events; buffered output channel.
 - **Transformer** (`internal/transformer`): builds normalized CDC events with deterministic IDs.
-- **Publisher** (`internal/publisher`): connects to NATS JetStream, ensures stream exists (defaults: name `CDC`, subjects `cdc.>`). Supports batch async publishing for high throughput.
-- **Engine** (`internal/engine`): orchestrates the pipeline; batches events by size/timeout/commit boundaries; uses async batch publishing when available.
+- **Publisher** (`internal/publisher`): connects to NATS JetStream, ensures stream exists (defaults: name `CDC`, subjects `cdc.>`). Supports async publish APIs.
+- **Engine** (`internal/engine`): orchestrates the pipeline; batches events by size/timeout/commit boundaries; publishes batch items in acked order by default and offers an unsafe unordered async mode for throughput-focused deployments.
 - **Checkpoint Manager** (`internal/checkpoint`): on startup, reads `confirmed_flush_lsn` from the PostgreSQL replication slot. During operation, the `StandbyStatusUpdate` heartbeat advances the slot position in Postgres; the checkpoint `Save` is a no-op since Postgres already tracks the position durably.
 - **Health/Metrics**: `/health` for liveness, `/ready` for dependency readiness, `/metrics` for Prometheus.
 
@@ -100,6 +101,7 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - On a graceful shutdown, the engine flushes any pending durable checkpoint and sends a final `StandbyStatusUpdate` before closing the replication connection. If the slot was already current, `confirmed_flush_lsn` may not visibly move during shutdown; either way, restarting the same slot resumes from the last flushed checkpoint so already-acknowledged commits should not be replayed on a clean stop/start cycle.
 - Unclean exits can still replay already-published commits: process crashes, host loss, network failures before feedback reaches PostgreSQL, and partial batch failures all fall back to **at-least-once** behavior.
 - JetStream de-duplication is enabled by default: each message is published with `Nats-Msg-Id` set to the deterministic `event_id`. Duplicate publishes within the configured `DUPLICATE_WINDOW` (default 2 minutes) are silently discarded by JetStream, providing **effectively-once** delivery only within that window.
+- Publish retries preserve CDC order by default: the engine does not publish a later batch item until the current item is acknowledged. Setting `UNSAFE_UNORDERED_ASYNC_PUBLISH=true` disables this protection and can expose out-of-order events to consumers.
 - Consumers that need exactly-once processing beyond the de-dup window must de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
 
 ## Known limitations
@@ -110,7 +112,7 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 
 ## Throughput Tuning
 
-The pipeline uses buffered channels and batch async publishing to achieve high throughput (target: 1-2k TPS).
+The pipeline uses buffered channels and batching for throughput. Publish retries are ordered by default for CDC correctness; `UNSAFE_UNORDERED_ASYNC_PUBLISH=true` restores the older failed-item-only async retry behavior if a deployment explicitly accepts out-of-order delivery risk.
 
 **Buffer sizes** control backpressure between pipeline stages:
 ```bash
@@ -122,7 +124,7 @@ PARSED_EVENT_BUFFER_SIZE=5000   # Increase if parser is faster than publisher
 ```bash
 BATCH_SIZE=500       # Larger = higher throughput, more latency
 BATCH_TIMEOUT=100ms  # Lower = less latency, more flushes
-PUBLISH_ASYNC_MAX_PENDING=500  # Keep >= effective batch size for async JetStream publishes
+PUBLISH_ASYNC_MAX_PENDING=500  # Async JetStream pending limit; most relevant with unsafe unordered mode
 ```
 
 Set buffer sizes to `0` to revert to unbuffered (sequential) behavior for debugging.
