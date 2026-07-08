@@ -31,6 +31,10 @@ type PublishItem struct {
 	EventID  string
 	TxID     uint64
 	Position model.WALPosition
+	// Schema/Table/Operation identify the source row for dead-letter records.
+	Schema    string
+	Table     string
+	Operation string
 }
 
 // PendingAck represents an in-flight publish awaiting acknowledgment.

@@ -22,6 +22,21 @@ func marshalCDCEvent(evt *model.CDCEvent) ([]byte, error) {
 	return json.Marshal(evt)
 }
 
+// FailurePolicy controls how the engine handles events that fail to publish
+// with a permanent (non-retryable) error. Transient failures always stop the
+// engine after retries regardless of policy, so an outage never skips data.
+type FailurePolicy string
+
+const (
+	// FailurePolicyCrash stops the engine (default). The process exits and
+	// replays the same events on restart.
+	FailurePolicyCrash FailurePolicy = "crash"
+	// FailurePolicyDLQ publishes a dead-letter record and continues.
+	FailurePolicyDLQ FailurePolicy = "dlq"
+	// FailurePolicySkip logs, counts, and continues.
+	FailurePolicySkip FailurePolicy = "skip"
+)
+
 // Engine coordinates the end-to-end CDC flow.
 type Engine struct {
 	reader                      wal.Reader
@@ -34,6 +49,8 @@ type Engine struct {
 	batchTimeout                time.Duration
 	maxPublishRetries           int
 	unsafeUnorderedAsyncPublish bool
+	failurePolicy               FailurePolicy
+	dlqSubjectPrefix            string
 	logger                      *zap.Logger
 
 	// Throughput metrics (legacy, kept for backward compatibility)
@@ -46,7 +63,7 @@ type Engine struct {
 	promMetrics *metrics.Metrics
 }
 
-func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, maxPublishRetries int, unsafeUnorderedAsyncPublish bool, logger *zap.Logger) *Engine {
+func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, maxPublishRetries int, unsafeUnorderedAsyncPublish bool, failurePolicy FailurePolicy, dlqSubjectPrefix string, logger *zap.Logger) *Engine {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -61,6 +78,8 @@ func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.
 		batchTimeout:                batchTimeout,
 		maxPublishRetries:           maxPublishRetries,
 		unsafeUnorderedAsyncPublish: unsafeUnorderedAsyncPublish,
+		failurePolicy:               failurePolicy,
+		dlqSubjectPrefix:            dlqSubjectPrefix,
 		logger:                      logger,
 		// Initialize throughput metrics (legacy)
 		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
@@ -206,6 +225,70 @@ const (
 	maxRetryBackoff  = 8 * time.Second
 )
 
+// quarantinesPoison reports whether the engine continues past permanently
+// failing events instead of stopping.
+func (e *Engine) quarantinesPoison() bool {
+	return e.failurePolicy == FailurePolicyDLQ || e.failurePolicy == FailurePolicySkip
+}
+
+// quarantine handles a permanently failing event under the dlq/skip policy:
+// it dead-letters the record (dlq mode), logs, and counts. The event is then
+// treated as handled so the checkpoint can advance past it. A failed
+// dead-letter publish is returned as an error so the caller falls back to
+// crashing rather than dropping the event silently.
+func (e *Engine) quarantine(ctx context.Context, rec *publisher.DeadLetterRecord) error {
+	rec.Database = e.database
+	rec.QuarantinedAt = time.Now()
+	if e.failurePolicy == FailurePolicyDLQ {
+		if err := publisher.PublishDeadLetter(ctx, e.publisher, e.dlqSubjectPrefix, rec); err != nil {
+			return err
+		}
+	}
+	e.promMetrics.EventsQuarantined.Inc()
+	e.logger.Error("event quarantined due to permanent publish failure",
+		zap.String("policy", string(e.failurePolicy)),
+		zap.String("event_id", rec.EventID),
+		zap.String("subject", rec.Subject),
+		zap.String("schema", rec.Schema),
+		zap.String("table", rec.Table),
+		zap.String("operation", rec.Operation),
+		zap.String("lsn", rec.LSN),
+		zap.Uint64("txid", rec.TxID),
+		zap.Int("payload_size", rec.PayloadSize),
+		zap.String("error", rec.Error))
+	return nil
+}
+
+// deadLetterRecordFromItem builds a dead-letter record for an item that
+// permanently failed to publish.
+func deadLetterRecordFromItem(item publisher.PublishItem, cause error) *publisher.DeadLetterRecord {
+	rec := &publisher.DeadLetterRecord{
+		EventID:   item.EventID,
+		Subject:   item.Subject,
+		Schema:    item.Schema,
+		Table:     item.Table,
+		Operation: item.Operation,
+		LSN:       item.Position.LSN,
+		TxID:      item.TxID,
+		Error:     cause.Error(),
+	}
+	rec.SetPayload(item.Data)
+	return rec
+}
+
+// deadLetterRecordFromWALEvent builds a dead-letter record for an event that
+// failed before a publishable payload existed (transform/subject/marshal).
+func deadLetterRecordFromWALEvent(evt *model.WALEvent, cause error) *publisher.DeadLetterRecord {
+	return &publisher.DeadLetterRecord{
+		Schema:    evt.Schema,
+		Table:     evt.Table,
+		Operation: string(evt.Operation),
+		LSN:       evt.Position.LSN,
+		TxID:      evt.TxID,
+		Error:     cause.Error(),
+	}
+}
+
 // flushWithBatchPublish uses async batch publishing with collected acks for high throughput.
 // Includes retry logic with exponential backoff for transient failures.
 func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent, batchPub publisher.BatchPublisher) error {
@@ -226,6 +309,13 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		e.transformLatency.Observe(transformLatencyNs)
 		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
 		if err != nil {
+			// Transform failures are deterministic, so retrying or crashing
+			// replays the same failure; quarantine when the policy allows it.
+			if e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("transform event: %w", err))); qErr == nil {
+					continue
+				}
+			}
 			// Release any already-transformed events on error
 			for _, event := range cdcEvents {
 				model.ReleaseCDCEvent(event)
@@ -236,6 +326,11 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
 		if err != nil {
+			if e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("build subject: %w", err))); qErr == nil {
+					continue
+				}
+			}
 			for _, event := range cdcEvents {
 				model.ReleaseCDCEvent(event)
 			}
@@ -244,6 +339,11 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 		payload, err := marshalCDCEvent(cdcEvt)
 		if err != nil {
+			if e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("marshal event: %w", err))); qErr == nil {
+					continue
+				}
+			}
 			for _, event := range cdcEvents {
 				model.ReleaseCDCEvent(event)
 			}
@@ -251,11 +351,14 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		}
 
 		items = append(items, publisher.PublishItem{
-			Subject:  subject,
-			Data:     payload,
-			EventID:  cdcEvt.EventID,
-			TxID:     evt.TxID,
-			Position: evt.Position,
+			Subject:   subject,
+			Data:      payload,
+			EventID:   cdcEvt.EventID,
+			TxID:      evt.TxID,
+			Position:  evt.Position,
+			Schema:    cdcEvt.Schema,
+			Table:     cdcEvt.Table,
+			Operation: cdcEvt.Operation,
 		})
 	}
 
@@ -347,6 +450,7 @@ func (e *Engine) publishOrderedWithRetry(ctx context.Context, batchPub publisher
 
 	for idx, item := range items {
 		var lastError error
+		var permanent bool
 		pubItems := []publisher.PublishItem{item}
 
 		for attempt := 0; attempt <= e.maxPublishRetries; attempt++ {
@@ -372,6 +476,10 @@ func (e *Engine) publishOrderedWithRetry(ctx context.Context, batchPub publisher
 					return e.buildFinalResult(items, succeeded, err), ctx.Err()
 				}
 				lastError = err
+				if publisher.IsPermanentPublishError(lastError) {
+					permanent = true
+					break
+				}
 				continue
 			}
 
@@ -401,9 +509,23 @@ func (e *Engine) publishOrderedWithRetry(ctx context.Context, batchPub publisher
 			if lastError == nil {
 				lastError = fmt.Errorf("publish item %d was not acknowledged", idx)
 			}
+			if publisher.IsPermanentPublishError(lastError) {
+				// Retrying a poison message cannot succeed; stop burning
+				// retries and let the failure policy decide.
+				permanent = true
+				break
+			}
 		}
 
 		if !succeeded[idx] {
+			if permanent && e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromItem(item, lastError)); qErr == nil {
+					succeeded[idx] = true
+					continue
+				} else {
+					lastError = fmt.Errorf("quarantine after permanent failure %v: %w", lastError, qErr)
+				}
+			}
 			return e.buildFinalResult(items, succeeded, lastError), lastError
 		}
 	}
@@ -490,13 +612,28 @@ func (e *Engine) publishUnorderedWithRetry(ctx context.Context, batchPub publish
 		for i, indexed := range itemsToPublish {
 			if i < len(pending) && pending[i].IsAcked() {
 				succeeded[indexed.originalIdx] = true
-			} else {
-				failedItems = append(failedItems, indexed)
-				if i < len(pending) && lastError == nil {
-					if pErr := pending[i].GetErr(); pErr != nil {
-						lastError = pErr
+				continue
+			}
+			var pErr error
+			if i < len(pending) {
+				pErr = pending[i].GetErr()
+			}
+			if publisher.IsPermanentPublishError(pErr) {
+				// Retrying a poison message cannot succeed; quarantine it or
+				// stop immediately depending on the failure policy.
+				if e.quarantinesPoison() {
+					if qErr := e.quarantine(ctx, deadLetterRecordFromItem(indexed.item, pErr)); qErr != nil {
+						qErr = fmt.Errorf("quarantine after permanent failure %v: %w", pErr, qErr)
+						return e.buildFinalResult(items, succeeded, qErr), qErr
 					}
+					succeeded[indexed.originalIdx] = true
+					continue
 				}
+				return e.buildFinalResult(items, succeeded, pErr), pErr
+			}
+			failedItems = append(failedItems, indexed)
+			if pErr != nil && lastError == nil {
+				lastError = pErr
 			}
 		}
 
@@ -582,16 +719,31 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 		e.transformLatency.Observe(transformLatencyNs)
 		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
 		if err != nil {
+			if e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("transform event: %w", err))); qErr == nil {
+					continue
+				}
+			}
 			return fmt.Errorf("transform event: %w", err)
 		}
 		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
 		if err != nil {
 			model.ReleaseCDCEvent(cdcEvt)
+			if e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("build subject: %w", err))); qErr == nil {
+					continue
+				}
+			}
 			return fmt.Errorf("build subject: %w", err)
 		}
 		payload, err := marshalCDCEvent(cdcEvt)
 		if err != nil {
 			model.ReleaseCDCEvent(cdcEvt)
+			if e.quarantinesPoison() {
+				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("marshal event: %w", err))); qErr == nil {
+					continue
+				}
+			}
 			return fmt.Errorf("marshal event: %w", err)
 		}
 		eventID := cdcEvt.EventID
@@ -599,6 +751,17 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 		model.ReleaseCDCEvent(cdcEvt)
 
 		if err := e.publisher.PublishWithRetries(ctx, subject, payload, e.maxPublishRetries, eventID); err != nil {
+			if publisher.IsPermanentPublishError(err) && e.quarantinesPoison() {
+				rec := deadLetterRecordFromWALEvent(evt, err)
+				rec.EventID = eventID
+				rec.Subject = subject
+				rec.SetPayload(payload)
+				if qErr := e.quarantine(ctx, rec); qErr == nil {
+					continue
+				} else {
+					return fmt.Errorf("quarantine after permanent failure %v: %w", err, qErr)
+				}
+			}
 			return fmt.Errorf("publish: %w", err)
 		}
 		eventCount++

@@ -129,6 +129,9 @@ func (p *JetStreamPublisher) PublishWithRetries(ctx context.Context, subject str
 	for i := 0; i <= maxRetries; i++ {
 		if err := p.Publish(ctx, subject, data, eventID); err != nil {
 			lastErr = err
+			if IsPermanentPublishError(err) {
+				return fmt.Errorf("permanent publish failure: %w", err)
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()

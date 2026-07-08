@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,21 @@ type Config struct {
 	StreamMaxAge    time.Duration // Max age for messages (default: 72h)
 	DuplicateWindow time.Duration // De-duplication window (default: 2m)
 
+	// PublishFailurePolicy controls what happens when an event fails to
+	// publish with a permanent (non-retryable) error such as an oversized
+	// payload or invalid subject:
+	//   "crash" - stop the engine (default; the process exits and replays on restart)
+	//   "dlq"   - publish a dead-letter record to DLQSubjectPrefix and continue
+	//   "skip"  - log, count, and continue
+	// Transient failures (timeouts, disconnects) always crash after retries
+	// regardless of this policy, so an outage never causes data to be skipped.
+	PublishFailurePolicy string
+
+	// DLQSubjectPrefix is the subject prefix for dead-letter records when
+	// PublishFailurePolicy is "dlq" (default: "cdc.dlq", covered by the
+	// default stream filter "cdc.>").
+	DLQSubjectPrefix string
+
 	// EnableProfiling enables block and mutex profiling (pprof).
 	// Disabled by default because SetBlockProfileRate(1) captures every blocking
 	// event and adds non-trivial overhead to channel/mutex operations.
@@ -82,6 +98,8 @@ func DefaultConfig() Config {
 		StreamReplicas:              1,
 		StreamMaxAge:                72 * time.Hour,
 		DuplicateWindow:             2 * time.Minute,
+		PublishFailurePolicy:        "crash",
+		DLQSubjectPrefix:            "cdc.dlq",
 	}
 }
 
@@ -132,6 +150,14 @@ func (c Config) Validate() error {
 	}
 	if c.DuplicateWindow <= 0 {
 		return fmt.Errorf("DUPLICATE_WINDOW must be > 0")
+	}
+	switch c.PublishFailurePolicy {
+	case "", "crash", "dlq", "skip":
+	default:
+		return fmt.Errorf("PUBLISH_FAILURE_POLICY must be crash, dlq, or skip")
+	}
+	if c.PublishFailurePolicy == "dlq" && strings.TrimSpace(c.DLQSubjectPrefix) == "" {
+		return fmt.Errorf("DLQ_SUBJECT_PREFIX must not be empty when PUBLISH_FAILURE_POLICY=dlq")
 	}
 	return nil
 }

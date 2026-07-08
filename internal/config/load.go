@@ -165,6 +165,12 @@ func Load() (Config, error) {
 		}
 		cfg.DuplicateWindow = d
 	}
+	if v := os.Getenv("PUBLISH_FAILURE_POLICY"); v != "" {
+		cfg.PublishFailurePolicy = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := os.Getenv("DLQ_SUBJECT_PREFIX"); v != "" {
+		cfg.DLQSubjectPrefix = strings.TrimSpace(v)
+	}
 	if v := os.Getenv("ENABLE_PROFILING"); v != "" {
 		enabled, err := parseEnvBool("ENABLE_PROFILING", v)
 		if err != nil {

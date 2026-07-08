@@ -103,6 +103,7 @@ type Metrics struct {
 	BatchLatency         *PrometheusHistogram
 	TransformLatency     *PrometheusHistogram
 	PartialBatchFailures *PrometheusCounter // Batches with partial success (some items failed)
+	EventsQuarantined    *PrometheusCounter // Events dead-lettered or skipped after a permanent publish failure
 
 	// Publisher metrics
 	JetstreamPublished  *PrometheusCounter
@@ -138,6 +139,8 @@ func NewMetrics() *Metrics {
 			[]float64{100, 500, 1000, 5000, 10000, 50000}),
 		PartialBatchFailures: NewPrometheusCounter("engine", "partial_batch_failures_total",
 			"Total number of batches with partial success (some items failed and checkpoint was not advanced)"),
+		EventsQuarantined: NewPrometheusCounter("engine", "events_quarantined_total",
+			"Total number of events dead-lettered or skipped after a permanent publish failure"),
 
 		// Publisher metrics
 		JetstreamPublished: NewPrometheusCounter("publisher", "jetstream_published_total",

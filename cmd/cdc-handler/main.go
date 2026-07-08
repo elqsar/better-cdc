@@ -126,11 +126,13 @@ func main() {
 		zap.Int("batch_size", cfg.BatchSize),
 		zap.Int("publish_async_max_pending", cfg.EffectivePublishAsyncMaxPending()),
 		zap.Bool("unsafe_unordered_async_publish", cfg.UnsafeUnorderedAsyncPublish),
+		zap.String("publish_failure_policy", cfg.PublishFailurePolicy),
+		zap.String("dlq_subject_prefix", cfg.DLQSubjectPrefix),
 		zap.Int("raw_buffer", cfg.RawMessageBufferSize),
 		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize),
 		zap.Int("max_tx_buffer", cfg.MaxTxBufferSize))
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, cfg.MaxPublishRetries, cfg.UnsafeUnorderedAsyncPublish, logger)
+	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, cfg.MaxPublishRetries, cfg.UnsafeUnorderedAsyncPublish, engine.FailurePolicy(cfg.PublishFailurePolicy), cfg.DLQSubjectPrefix, logger)
 
 	startPos, err := store.Load(ctx)
 	if err != nil {

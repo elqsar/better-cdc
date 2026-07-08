@@ -86,6 +86,12 @@ type mockBatchPublisher struct {
 	// Configure behavior per attempt
 	failuresPerAttempt [][]int // indices of items to fail per attempt
 	publishBatchErrors []error // error to return from PublishBatchAsync per attempt
+	failureErr         error   // error attached to failed items (default: transient "mock failure")
+
+	// Synchronous Publish captures (used for dead-letter records)
+	publishSubjects []string
+	publishPayloads [][]byte
+	publishMsgIDs   []string
 }
 
 func newMockBatchPublisher() *mockBatchPublisher {
@@ -95,9 +101,19 @@ func newMockBatchPublisher() *mockBatchPublisher {
 	}
 }
 
+func (m *mockBatchPublisher) itemFailureErr() error {
+	if m.failureErr != nil {
+		return m.failureErr
+	}
+	return errors.New("mock failure")
+}
+
 func (m *mockBatchPublisher) Connect() error { return nil }
 func (m *mockBatchPublisher) Close() error   { return nil }
 func (m *mockBatchPublisher) Publish(ctx context.Context, subject string, data []byte, eventID string) error {
+	m.publishSubjects = append(m.publishSubjects, subject)
+	m.publishPayloads = append(m.publishPayloads, append([]byte(nil), data...))
+	m.publishMsgIDs = append(m.publishMsgIDs, eventID)
 	return nil
 }
 func (m *mockBatchPublisher) PublishWithRetries(ctx context.Context, subject string, data []byte, maxRetries int, eventID string) error {
@@ -146,9 +162,9 @@ func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publish
 		if failSet[i] {
 			result.Failed++
 			result.FailedItems = append(result.FailedItems, i)
-			pend.SetError(errors.New("mock failure"))
+			pend.SetError(m.itemFailureErr())
 			if result.FirstError == nil {
-				result.FirstError = errors.New("mock failure")
+				result.FirstError = m.itemFailureErr()
 			}
 			contiguousBroken = true
 		} else {
