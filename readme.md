@@ -85,6 +85,10 @@ Environment variables (defaults in `internal/config`):
 - `STREAM_MAX_AGE` (default `72h`) - max retention age for messages
 - `DUPLICATE_WINDOW` (default `2m`) - JetStream de-duplication window; publishes with the same `event_id` within this window are idempotent
 
+**Publish failure handling:**
+- `PUBLISH_FAILURE_POLICY` (`dlq` | `crash` | `skip`; default `dlq`) - permanent publish failures are dead-lettered by default; transient failures still stop the engine after retries
+- `DLQ_SUBJECT_PREFIX` (default `cdc.dlq`) - prefix for dead-letter records; startup requires the resulting DLQ subject shape to be covered by `STREAM_SUBJECTS`
+
 **Other:**
 - `HEALTH_ADDR` (default `:8080`)
 - `DEBUG` (set `true` for verbose logging)
@@ -113,6 +117,7 @@ PostgreSQL WAL ──► [buffer] ──► Parser ──► [buffer] ──► 
 - Unclean exits can still replay already-published commits: process crashes, host loss, network failures before feedback reaches PostgreSQL, and partial batch failures all fall back to **at-least-once** behavior.
 - JetStream de-duplication is enabled by default: each message is published with `Nats-Msg-Id` set to the deterministic `event_id`. Duplicate publishes within the configured `DUPLICATE_WINDOW` (default 2 minutes) are silently discarded by JetStream, providing **effectively-once** delivery only within that window.
 - Publish retries preserve CDC order by default: the engine does not publish a later batch item until the current item is acknowledged. Setting `UNSAFE_UNORDERED_ASYNC_PUBLISH=true` disables this protection and can expose out-of-order events to consumers.
+- Permanent publish failures, such as invalid subjects or oversized payloads, use `PUBLISH_FAILURE_POLICY=dlq` by default: the engine publishes a dead-letter record under `DLQ_SUBJECT_PREFIX` and advances the checkpoint only after that record is acknowledged. Set `PUBLISH_FAILURE_POLICY=crash` to preserve strict replay-on-failure behavior, or `skip` only as a lossy emergency option.
 - Consumers that need exactly-once processing beyond the de-dup window must de-duplicate using the deterministic `event_id` (or an equivalent idempotency key).
 
 ## Known limitations

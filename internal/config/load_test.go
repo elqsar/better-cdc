@@ -93,6 +93,31 @@ func TestLoad_UnsafeUnorderedAsyncPublish(t *testing.T) {
 	}
 }
 
+func TestLoad_DefaultPublishFailurePolicyUsesDLQ(t *testing.T) {
+	cfg := loadConfig(t)
+
+	if cfg.PublishFailurePolicy != "dlq" {
+		t.Fatalf("expected default PublishFailurePolicy %q, got %q", "dlq", cfg.PublishFailurePolicy)
+	}
+	if cfg.DLQSubjectPrefix != "cdc.dlq" {
+		t.Fatalf("expected default DLQSubjectPrefix %q, got %q", "cdc.dlq", cfg.DLQSubjectPrefix)
+	}
+}
+
+func TestLoad_PublishFailurePolicyOverride(t *testing.T) {
+	t.Setenv("PUBLISH_FAILURE_POLICY", " CRASH ")
+	t.Setenv("DLQ_SUBJECT_PREFIX", "cdc.poison")
+
+	cfg := loadConfig(t)
+
+	if cfg.PublishFailurePolicy != "crash" {
+		t.Fatalf("expected PublishFailurePolicy %q, got %q", "crash", cfg.PublishFailurePolicy)
+	}
+	if cfg.DLQSubjectPrefix != "cdc.poison" {
+		t.Fatalf("expected DLQSubjectPrefix %q, got %q", "cdc.poison", cfg.DLQSubjectPrefix)
+	}
+}
+
 func TestConfigEffectivePublishAsyncMaxPending_UsesBatchSizeWhenLarger(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.BatchSize = 500
@@ -149,6 +174,62 @@ func TestConfigValidate_RejectsNegativePublishAsyncMaxPending(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("expected validation error for negative publish async max pending")
+	}
+}
+
+func TestConfigValidate_AcceptsDLQSubjectCoveredByStreamSubjects(t *testing.T) {
+	tests := []struct {
+		name           string
+		streamSubjects []string
+	}{
+		{name: "tail wildcard", streamSubjects: []string{"cdc.dlq.postgres.>"}},
+		{name: "exact dlq shape", streamSubjects: []string{"cdc.dlq.postgres.*.*"}},
+		{name: "broad default shape", streamSubjects: []string{"cdc.>"}},
+		{name: "middle wildcard", streamSubjects: []string{"cdc.*.postgres.*.*"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.StreamSubjects = tt.streamSubjects
+
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("expected covered DLQ subject to validate, got %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigValidate_RejectsDLQSubjectOutsideStreamSubjects(t *testing.T) {
+	tests := []struct {
+		name           string
+		streamSubjects []string
+		dlqPrefix      string
+	}{
+		{name: "original cdc stream only", streamSubjects: []string{"cdc.postgres.>"}, dlqPrefix: "cdc.dlq"},
+		{name: "different root", streamSubjects: []string{"cdc.>"}, dlqPrefix: "dead.cdc"},
+		{name: "too narrow schema", streamSubjects: []string{"cdc.dlq.postgres.public.*"}, dlqPrefix: "cdc.dlq"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.StreamSubjects = tt.streamSubjects
+			cfg.DLQSubjectPrefix = tt.dlqPrefix
+
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected validation error for uncovered DLQ subject")
+			}
+		})
+	}
+}
+
+func TestConfigValidate_DoesNotRequireDLQSubjectCoverageWhenPolicyCrashes(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PublishFailurePolicy = "crash"
+	cfg.StreamSubjects = []string{"cdc.postgres.>"}
+	cfg.DLQSubjectPrefix = "dead.cdc"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected crash policy to ignore DLQ coverage, got %v", err)
 	}
 }
 

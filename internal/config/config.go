@@ -48,7 +48,7 @@ type Config struct {
 	// PublishFailurePolicy controls what happens when an event fails to
 	// publish with a permanent (non-retryable) error such as an oversized
 	// payload or invalid subject:
-	//   "crash" - stop the engine (default; the process exits and replays on restart)
+	//   "crash" - stop the engine (the process exits and replays on restart)
 	//   "dlq"   - publish a dead-letter record to DLQSubjectPrefix and continue
 	//   "skip"  - log, count, and continue
 	// Transient failures (timeouts, disconnects) always crash after retries
@@ -98,7 +98,7 @@ func DefaultConfig() Config {
 		StreamReplicas:              1,
 		StreamMaxAge:                72 * time.Hour,
 		DuplicateWindow:             2 * time.Minute,
-		PublishFailurePolicy:        "crash",
+		PublishFailurePolicy:        "dlq",
 		DLQSubjectPrefix:            "cdc.dlq",
 	}
 }
@@ -159,6 +159,9 @@ func (c Config) Validate() error {
 	if c.PublishFailurePolicy == "dlq" && strings.TrimSpace(c.DLQSubjectPrefix) == "" {
 		return fmt.Errorf("DLQ_SUBJECT_PREFIX must not be empty when PUBLISH_FAILURE_POLICY=dlq")
 	}
+	if c.PublishFailurePolicy == "dlq" && !dlqSubjectCovered(c.DLQSubjectPrefix, c.Database, c.StreamSubjects) {
+		return fmt.Errorf("DLQ subject pattern %q is not covered by STREAM_SUBJECTS %v", dlqSubjectPattern(c.DLQSubjectPrefix, c.Database), effectiveStreamSubjects(c.StreamSubjects))
+	}
 	return nil
 }
 
@@ -170,4 +173,62 @@ func (c Config) EffectivePublishAsyncMaxPending() int {
 		return c.BatchSize
 	}
 	return defaultPublishAsyncMaxPendingFloor
+}
+
+func dlqSubjectCovered(prefix, database string, streamSubjects []string) bool {
+	pattern := dlqSubjectPattern(prefix, database)
+	for _, filter := range effectiveStreamSubjects(streamSubjects) {
+		if subjectFilterCovers(filter, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func dlqSubjectPattern(prefix, database string) string {
+	return strings.Join([]string{subjectToken(prefix), subjectToken(database), "*", "*"}, ".")
+}
+
+func effectiveStreamSubjects(subjects []string) []string {
+	if len(subjects) == 0 {
+		return []string{"cdc.>"}
+	}
+	return subjects
+}
+
+func subjectToken(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "_"
+	}
+	return strings.NewReplacer(" ", "_", "*", "_", ">", "_").Replace(s)
+}
+
+func subjectFilterCovers(filter, pattern string) bool {
+	return subjectFilterTokensCover(strings.Split(filter, "."), strings.Split(pattern, "."))
+}
+
+func subjectFilterTokensCover(filterTokens, patternTokens []string) bool {
+	if len(filterTokens) == 0 {
+		return len(patternTokens) == 0
+	}
+	if filterTokens[0] == ">" {
+		return len(filterTokens) == 1
+	}
+	if len(patternTokens) == 0 {
+		return false
+	}
+	switch patternTokens[0] {
+	case ">":
+		return filterTokens[0] == ">" && len(filterTokens) == 1
+	case "*":
+		if filterTokens[0] != "*" {
+			return false
+		}
+	default:
+		if filterTokens[0] != "*" && filterTokens[0] != patternTokens[0] {
+			return false
+		}
+	}
+	return subjectFilterTokensCover(filterTokens[1:], patternTokens[1:])
 }
