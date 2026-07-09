@@ -3,6 +3,7 @@ package wal
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,79 @@ func TestPGReader_Stop_SendsFinalStandbyStatusWithCanceledContext(t *testing.T) 
 	}
 	if !got.ReplyRequested {
 		t.Fatal("expected final standby status to request reply")
+	}
+}
+
+func TestPGReader_Stop_JoinsReplicationLoopBeforeClosingConn(t *testing.T) {
+	restoreReceive, restoreSend, restoreTimeoutCheck, restoreTimeout := stubReplicationTimeoutHooks(t, time.Second)
+	defer restoreReceive()
+	defer restoreSend()
+	defer restoreTimeoutCheck()
+	defer restoreTimeout()
+
+	origStart := startReplication
+	startReplication = func(ctx context.Context, conn *pgconn.PgConn, slotName string, startLSN pglogrepl.LSN, opts pglogrepl.StartReplicationOptions) error {
+		return nil
+	}
+	defer func() { startReplication = origStart }()
+
+	var closeCalls atomic.Int32
+	origClose := closeReplicationConn
+	closeReplicationConn = func(ctx context.Context, conn *pgconn.PgConn) error {
+		closeCalls.Add(1)
+		return nil
+	}
+	defer func() { closeReplicationConn = origClose }()
+
+	var finalStatus atomic.Int32
+	sendStandbyStatusUpdate = func(ctx context.Context, conn *pgconn.PgConn, s pglogrepl.StandbyStatusUpdate) error {
+		if s.ReplyRequested {
+			finalStatus.Add(1)
+		}
+		return nil
+	}
+
+	receiveReplicationMessage = func(ctx context.Context, conn *pgconn.PgConn) (pgproto3.BackendMessage, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	r := NewPGReader(SlotConfig{Plugin: "pgoutput"}, 0, zap.NewNop())
+	r.conn = &pgconn.PgConn{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream, err := r.ReadWAL(ctx, model.WALPosition{LSN: "0/42"})
+	if err != nil {
+		t.Fatalf("ReadWAL: %v", err)
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := r.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if _, ok := <-stream; ok {
+		t.Fatal("expected stream to be closed after Stop")
+	}
+	if got := closeCalls.Load(); got != 1 {
+		t.Fatalf("expected connection closed exactly once, got %d", got)
+	}
+	if got := finalStatus.Load(); got != 1 {
+		t.Fatalf("expected 1 final standby status update, got %d", got)
+	}
+	if r.conn != nil {
+		t.Fatal("expected conn to be nil after Stop")
+	}
+
+	// A second Stop must return immediately without touching the closed conn.
+	if err := r.Stop(stopCtx); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	if got := closeCalls.Load(); got != 1 {
+		t.Fatalf("expected no additional close on second Stop, got %d", got)
 	}
 }
 

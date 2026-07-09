@@ -56,6 +56,7 @@ type ErrorReporter interface {
 }
 
 var sendStandbyStatusUpdate = pglogrepl.SendStandbyStatusUpdate
+var startReplication = pglogrepl.StartReplication
 var receiveReplicationMessage = func(ctx context.Context, conn *pgconn.PgConn) (pgproto3.BackendMessage, error) {
 	return conn.ReceiveMessage(ctx)
 }
@@ -95,6 +96,13 @@ type PGReader struct {
 	promMetrics *metrics.Metrics
 
 	ackedLSN atomic.Uint64
+
+	// After ReadWAL spawns the replication goroutine, that goroutine is the
+	// sole owner of conn: it reconnects, sends the final standby status, and
+	// closes the connection on exit. Stop cancels loopCancel and waits on
+	// loopDone instead of touching conn.
+	loopCancel context.CancelFunc
+	loopDone   chan struct{}
 
 	mu       sync.Mutex
 	fatalErr error
@@ -158,10 +166,21 @@ func (r *PGReader) ReadWAL(ctx context.Context, position model.WALPosition) (<-c
 		zap.Int("buffer_size", r.bufferSize))
 
 	out := make(chan *parser.RawMessage, r.bufferSize)
-	go r.runReplicationLoop(ctx, startLSN, pluginName, startFn, loopFn, out)
+	loopCtx, cancel := context.WithCancel(ctx)
+	r.loopCancel = cancel
+	r.loopDone = make(chan struct{})
+	go func() {
+		defer close(r.loopDone)
+		defer cancel()
+		r.runReplicationLoop(loopCtx, startLSN, pluginName, startFn, loopFn, out)
+	}()
 	return out, nil
 }
 
+// GetCurrentPosition reports the server's current WAL position. It must only
+// be called before ReadWAL: once streaming starts, the replication goroutine
+// owns the connection and it is in CopyBoth mode, where IdentifySystem is
+// not valid.
 func (r *PGReader) GetCurrentPosition(ctx context.Context) (model.WALPosition, error) {
 	if r.conn == nil {
 		return model.WALPosition{}, fmt.Errorf("replication connection not started")
@@ -180,6 +199,18 @@ func (r *PGReader) Stop(ctx context.Context) error {
 		finalCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 	}
+	if r.loopDone != nil {
+		// The replication goroutine owns the connection: cancel it and wait
+		// for its exit path to send the final standby status and close.
+		r.loopCancel()
+		select {
+		case <-r.loopDone:
+			return nil
+		case <-finalCtx.Done():
+			return fmt.Errorf("wait for replication loop to stop: %w", finalCtx.Err())
+		}
+	}
+	// ReadWAL was never called, so no other goroutine touches conn.
 	if r.conn != nil {
 		r.logger.Info("stopping replication connection")
 		if err := r.sendStandbyStatus(finalCtx, true); err != nil {
@@ -201,6 +232,7 @@ func (r *PGReader) replicationHandlers() (replicationStartFunc, replicationLoopF
 
 func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LSN, plugin string, startFn replicationStartFunc, loopFn replicationLoopFunc, out chan<- *parser.RawMessage) {
 	defer close(out)
+	defer r.cleanupConnection()
 
 	resumeLSN := startLSN
 	backoff := time.Second
@@ -268,7 +300,7 @@ func (r *PGReader) startWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) er
 		"\"format-version\" '2'",
 	}
 
-	if err := pglogrepl.StartReplication(ctx, r.conn, r.slot.SlotName, startLSN, pglogrepl.StartReplicationOptions{
+	if err := startReplication(ctx, r.conn, r.slot.SlotName, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArgs,
 	}); err != nil {
 		return fmt.Errorf("start replication: %w", err)
@@ -365,7 +397,7 @@ func (r *PGReader) startPGOutput(ctx context.Context, startLSN pglogrepl.LSN) er
 	if len(r.slot.Publications) > 0 {
 		args = append(args, fmt.Sprintf("publication_names '%s'", joinPublications(r.slot.Publications)))
 	}
-	if err := pglogrepl.StartReplication(ctx, r.conn, r.slot.SlotName, startLSN, pglogrepl.StartReplicationOptions{
+	if err := startReplication(ctx, r.conn, r.slot.SlotName, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: args,
 	}); err != nil {
 		return fmt.Errorf("start replication pgoutput: %w", err)
@@ -454,6 +486,23 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 			r.logger.Warn("unexpected replication message", zap.String("type", fmt.Sprintf("%T", m)))
 		}
 	}
+}
+
+// cleanupConnection sends a final standby status and closes the connection.
+// It runs on the replication goroutine's exit path so that goroutine stays
+// the sole owner of conn; the context is fresh because the loop usually
+// exits precisely because its own context was canceled.
+func (r *PGReader) cleanupConnection() {
+	if r.conn == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r.logger.Info("stopping replication connection")
+	if err := r.sendStandbyStatus(ctx, true); err != nil {
+		r.logger.Warn("final standby status failed", zap.Error(err))
+	}
+	_ = r.resetConnection(ctx)
 }
 
 func (r *PGReader) resetConnection(ctx context.Context) error {
