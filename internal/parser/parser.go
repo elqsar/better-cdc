@@ -19,9 +19,11 @@ const (
 // RawMessage is a single logical decoding message emitted by the WAL reader.
 // It carries the plugin identifier, WAL start LSN, and the raw payload bytes.
 type RawMessage struct {
-	Plugin   Plugin
-	WALStart pglogrepl.LSN
-	Data     []byte
+	Reset        bool // A new replication session; discard incomplete transaction state.
+	ReleaseBytes func()
+	Plugin       Plugin
+	WALStart     pglogrepl.LSN
+	Data         []byte
 }
 
 // Parser converts raw logical decoding messages into structured WALEvents.

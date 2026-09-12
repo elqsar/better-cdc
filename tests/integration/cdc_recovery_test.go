@@ -9,12 +9,12 @@ import (
 	"time"
 )
 
-func TestRecoveryAtLeastOnce(t *testing.T) {
+func TestRecoveryAcrossCancellation(t *testing.T) {
 	connString, slotName := startPostgres(t, "pgoutput")
 	natsURL := startNATS(t)
 	streamName := fmt.Sprintf("CDC_recovery_%d", rand.Int64N(100000))
 
-	// Phase 1: Start engine, insert 20 rows concurrently, hard-kill after ~10
+	// Phase 1: Start engine, insert 20 rows concurrently, cancel after ~10
 	cancel1, doneCh1 := startEngine(t, engineConfig{
 		ConnString: connString,
 		SlotName:   slotName,
@@ -45,7 +45,7 @@ func TestRecoveryAtLeastOnce(t *testing.T) {
 		}
 	}()
 
-	// Hard-cancel after ~500ms (roughly 10 rows)
+	// Cancel after ~500ms (roughly 10 rows)
 	time.Sleep(500 * time.Millisecond)
 	cancel1()
 

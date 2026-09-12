@@ -41,7 +41,11 @@ func randomSlotName() string {
 
 // startPostgres boots a Postgres 17 container with wal2json, logical replication,
 // init SQL, and creates a test-specific replication slot.
-func startPostgres(t *testing.T, plugin string) (connString string, slotName string) {
+func startPostgres(t *testing.T, plugin string) (string, string) {
+	db, slot, _ := startPostgresContainer(t, plugin)
+	return db, slot
+}
+func startPostgresContainer(t *testing.T, plugin string) (connString string, slotName string, pgContainer testcontainers.Container) {
 	t.Helper()
 	ctx := context.Background()
 	root := projectRoot()
@@ -102,7 +106,7 @@ func startPostgres(t *testing.T, plugin string) (connString string, slotName str
 	slotName = randomSlotName()
 	createSlot(t, connString, slotName, plugin)
 
-	return connString, slotName
+	return connString, slotName, container
 }
 
 func buildConnString(ctx context.Context, container testcontainers.Container) (string, error) {
@@ -150,7 +154,8 @@ func dropSlot(ctx context.Context, connString, slotName string) {
 }
 
 // startNATS boots a NATS container with JetStream enabled.
-func startNATS(t *testing.T) string {
+func startNATS(t *testing.T) string { url, _ := startNATSContainer(t); return url }
+func startNATSContainer(t *testing.T) (string, testcontainers.Container) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -178,7 +183,7 @@ func startNATS(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("nats port: %v", err)
 	}
-	return fmt.Sprintf("nats://%s:%s", host, port.Port())
+	return fmt.Sprintf("nats://%s:%s", host, port.Port()), container
 }
 
 // execSQL runs SQL statements against Postgres using a standard (non-replication) connection.

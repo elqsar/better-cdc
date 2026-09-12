@@ -919,3 +919,37 @@ func TestCheckpointPositionForCommit(t *testing.T) {
 		})
 	}
 }
+
+// Idle timeouts must not permanently disable later timer-driven flushes.
+func TestRunBatchedTimerRearmsAfterIdle(t *testing.T) {
+	pub := &notifyingPublisher{published: make(chan struct{}, 2)}
+	e := NewEngine(nil, nil, &mockTransformer{}, pub, nil, "db", 100, 15*time.Millisecond, 0, false, FailurePolicyCrash, "", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input := make(chan *model.WALEvent)
+	done := make(chan error, 1)
+	go func() { done <- e.runBatched(ctx, input) }()
+	for i := 0; i < 2; i++ {
+		time.Sleep(50 * time.Millisecond)
+		input <- &model.WALEvent{Operation: model.OperationInsert}
+		select {
+		case <-pub.published:
+		case <-time.After(time.Second):
+			t.Fatal("timer failed to flush after idle")
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type notifyingPublisher struct {
+	shutdownPublisher
+	published chan struct{}
+}
+
+func (p *notifyingPublisher) PublishWithRetries(context.Context, string, []byte, int, string) error {
+	p.published <- struct{}{}
+	return nil
+}

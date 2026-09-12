@@ -2,11 +2,14 @@ package publisher
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"better-cdc/internal/metrics"
@@ -19,16 +22,25 @@ import (
 // JetStreamPublisher publishes messages to NATS JetStream with ack handling.
 // Implements both Publisher and BatchPublisher interfaces.
 type JetStreamPublisher struct {
-	opts         JetStreamOptions
-	nc           *nats.Conn
-	js           nats.JetStreamContext
-	logger       *zap.Logger
-	publishedCnt *metrics.Counter
-	ackFailCnt   *metrics.Counter
-	promMetrics  *metrics.Metrics
+	metricsCancel context.CancelFunc
+	metricsDone   chan struct{}
+	connected     atomic.Bool
+	objects       nats.ObjectStore
+	opts          JetStreamOptions
+	nc            *nats.Conn
+	js            nats.JetStreamContext
+	logger        *zap.Logger
+	publishedCnt  *metrics.Counter
+	ackFailCnt    *metrics.Counter
+	promMetrics   *metrics.Metrics
 }
 
 type JetStreamOptions struct {
+	EnableDLQ                               bool
+	DLQStream, DLQBucket, DLQSubjectPrefix  string
+	DLQMaxBytes, DLQIndexMaxBytes           int64
+	CredentialsFile, TLSCA, TLSCert, TLSKey string
+
 	URLs                   []string
 	Username               string
 	Password               string
@@ -46,6 +58,30 @@ type JetStreamOptions struct {
 func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStreamPublisher {
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	if opts.StreamName == "" {
+		opts.StreamName = "CDC"
+	}
+	if opts.StreamReplicas <= 0 {
+		opts.StreamReplicas = 1
+	}
+	if opts.DuplicateWindow <= 0 {
+		opts.DuplicateWindow = 2 * time.Minute
+	}
+	if opts.DLQStream == "" {
+		opts.DLQStream = opts.StreamName + "_DLQ"
+	}
+	if opts.DLQBucket == "" {
+		opts.DLQBucket = opts.StreamName + "_RECOVERY"
+	}
+	if opts.DLQSubjectPrefix == "" {
+		opts.DLQSubjectPrefix = "cdc_dlq"
+	}
+	if opts.DLQMaxBytes <= 0 {
+		opts.DLQMaxBytes = 1 << 30
+	}
+	if opts.DLQIndexMaxBytes <= 0 {
+		opts.DLQIndexMaxBytes = 64 << 20
 	}
 	return &JetStreamPublisher{
 		opts:         opts,
@@ -69,8 +105,20 @@ func (p *JetStreamPublisher) Connect() error {
 			p.logger.Warn("NATS disconnected", zap.Error(err))
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			p.logger.Info("NATS reconnected", zap.String("url", nc.ConnectedUrl()))
+			p.logger.Info("NATS reconnected", zap.String("url", redactURL(nc.ConnectedUrl())))
 		}),
+	}
+	if p.opts.CredentialsFile != "" {
+		natsOpts = append(natsOpts, nats.UserCredentials(p.opts.CredentialsFile))
+	}
+	if p.opts.TLSCA != "" || p.opts.TLSCert != "" {
+		natsOpts = append(natsOpts, nats.Secure(&tls.Config{MinVersion: tls.VersionTLS12}))
+	}
+	if p.opts.TLSCA != "" {
+		natsOpts = append(natsOpts, nats.RootCAs(p.opts.TLSCA))
+	}
+	if p.opts.TLSCert != "" {
+		natsOpts = append(natsOpts, nats.ClientCert(p.opts.TLSCert, p.opts.TLSKey))
 	}
 	if p.opts.Username != "" {
 		natsOpts = append(natsOpts, nats.UserInfo(p.opts.Username, p.opts.Password))
@@ -92,7 +140,32 @@ func (p *JetStreamPublisher) Connect() error {
 		_ = p.nc.Drain()
 		return err
 	}
-	p.logger.Info("connected to nats jetstream", zap.Strings("urls", p.opts.URLs), zap.String("stream", p.streamName()))
+	if err := p.ensureQuarantine(); err != nil {
+		_ = p.nc.Drain()
+		return err
+	}
+	p.connected.Store(true)
+	if p.opts.EnableDLQ {
+		metricsCtx, cancel := context.WithCancel(context.Background())
+		p.metricsCancel = cancel
+		p.metricsDone = make(chan struct{})
+		go func() {
+			defer close(p.metricsDone)
+			tick := time.NewTicker(5 * time.Second)
+			defer tick.Stop()
+			for {
+				pollCtx, done := context.WithTimeout(metricsCtx, p.publishTimeout())
+				_ = p.Ready(pollCtx)
+				done()
+				select {
+				case <-metricsCtx.Done():
+					return
+				case <-tick.C:
+				}
+			}
+		}()
+	}
+	p.logger.Info("connected to nats jetstream", zap.String("stream", p.streamName()))
 	return nil
 }
 
@@ -100,7 +173,7 @@ func (p *JetStreamPublisher) Publish(ctx context.Context, subject string, data [
 	if p.js == nil {
 		return fmt.Errorf("jetstream not connected")
 	}
-	var opts []nats.PubOpt
+	opts := []nats.PubOpt{nats.ExpectStream(p.streamName())}
 	if eventID != "" {
 		opts = append(opts, nats.MsgId(eventID))
 	}
@@ -145,6 +218,11 @@ func (p *JetStreamPublisher) PublishWithRetries(ctx context.Context, subject str
 }
 
 func (p *JetStreamPublisher) Close() error {
+	p.connected.Store(false)
+	if p.metricsCancel != nil {
+		p.metricsCancel()
+		<-p.metricsDone
+	}
 	if p.nc != nil {
 		p.logger.Info("closing nats connection")
 		return p.nc.Drain()
@@ -152,14 +230,43 @@ func (p *JetStreamPublisher) Close() error {
 	return nil
 }
 
-func (p *JetStreamPublisher) Ready(context.Context) error {
+func (p *JetStreamPublisher) Ready(ctx context.Context) error {
+	if !p.connected.Load() {
+		return fmt.Errorf("publisher is not active")
+	}
 	if p.nc == nil || p.js == nil {
 		return fmt.Errorf("jetstream not connected")
 	}
 	if !p.nc.IsConnected() {
 		return fmt.Errorf("nats connection status is %s", p.nc.Status().String())
 	}
-	return p.validateStream()
+	if _, err := p.js.StreamInfo(p.streamName(), nats.Context(ctx)); err != nil {
+		return err
+	}
+	if p.opts.EnableDLQ {
+		index, err := p.js.StreamInfo(p.opts.DLQStream, nats.Context(ctx))
+		if err != nil {
+			return err
+		}
+		metrics.Pilot.DLQRecords.Set(int64(index.State.Msgs))
+		if index.State.Msgs > 0 {
+			metrics.Pilot.DLQOldest.Set(index.State.FirstTime.Unix())
+		} else {
+			metrics.Pilot.DLQOldest.Set(0)
+		}
+		if int64(index.State.Bytes) >= p.opts.DLQIndexMaxBytes {
+			return fmt.Errorf("DLQ index capacity exhausted")
+		}
+		bucket, err := p.js.StreamInfo("OBJ_"+p.opts.DLQBucket, nats.Context(ctx))
+		if err != nil {
+			return err
+		}
+		metrics.Pilot.DLQBytes.Set(int64(bucket.State.Bytes))
+		if int64(bucket.State.Bytes) >= p.opts.DLQMaxBytes {
+			return fmt.Errorf("DLQ bucket capacity exhausted")
+		}
+	}
+	return nil
 }
 
 func backoff(attempt int) time.Duration {
@@ -222,20 +329,6 @@ func (p *JetStreamPublisher) streamName() string {
 		return p.opts.StreamName
 	}
 	return "CDC"
-}
-
-func (p *JetStreamPublisher) validateStream() error {
-	info, err := p.js.StreamInfo(p.streamName())
-	if err != nil {
-		if errors.Is(err, nats.ErrStreamNotFound) {
-			return fmt.Errorf("stream %q not found", p.streamName())
-		}
-		return fmt.Errorf("lookup stream: %w", err)
-	}
-	if err := validateStreamConfig(&info.Config, p.expectedStreamConfig()); err != nil {
-		return fmt.Errorf("stream validation failed: %w", err)
-	}
-	return nil
 }
 
 func (p *JetStreamPublisher) expectedStreamConfig() *nats.StreamConfig {
@@ -334,7 +427,7 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 			done:    make(chan struct{}),
 		}
 
-		var opts []nats.PubOpt
+		opts := []nats.PubOpt{nats.ExpectStream(p.streamName())}
 		if item.EventID != "" {
 			opts = append(opts, nats.MsgId(item.EventID))
 		}
@@ -471,4 +564,15 @@ func (p *JetStreamPublisher) findLastSuccessPosition(pending []*PendingAck, item
 	}
 
 	return lastPos
+}
+
+func (p *JetStreamPublisher) AckTimeout() time.Duration { return p.publishTimeout() }
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[invalid URL]"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	return u.String()
 }

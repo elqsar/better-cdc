@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"better-cdc/internal/model"
+	"better-cdc/internal/subject"
 
 	"go.uber.org/zap"
 )
@@ -201,10 +202,10 @@ func SubjectForEvent(database string, evt *model.CDCEvent) (string, error) {
 	var sb strings.Builder
 	sb.Grow(len("cdc.") + len(database) + 1 + len(evt.Schema) + 1 + len(evt.Table))
 	sb.WriteString("cdc.")
-	sb.WriteString(database)
+	sb.WriteString(subject.Token(database))
 	sb.WriteByte('.')
-	sb.WriteString(evt.Schema)
+	sb.WriteString(subject.Token(evt.Schema))
 	sb.WriteByte('.')
-	sb.WriteString(evt.Table)
+	sb.WriteString(subject.Token(evt.Table))
 	return sb.String(), nil
 }

@@ -46,10 +46,33 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	if len(os.Args) > 1 {
+		if os.Args[1] != "dlq" {
+			logger.Error("usage: cdc-handler [dlq list|inspect|redrive]")
+			os.Exit(1)
+		}
+		if err := runDLQ(ctx, cfg, logger, os.Args[2:], os.Stdout); err != nil {
+			logger.Error("dlq command failed", zap.Error(err))
+			os.Exit(1)
+		}
+		return
+	}
+	if err := wal.Preflight(ctx, wal.SlotConfig{SlotName: cfg.SlotName, Plugin: cfg.Plugin, DatabaseURL: cfg.DatabaseURL, Publications: cfg.Publications}); err != nil {
+		logger.Error("replication preflight failed", zap.Error(err))
+		os.Exit(1)
+	}
+	spillDir, releaseSpill, err := parser.PrepareSpillDir(cfg.SpillDir, cfg.SlotName)
+	if err != nil {
+		logger.Error("spill storage unavailable", zap.Error(err))
+		os.Exit(1)
+	}
+	defer releaseSpill()
+	cfg.SpillDir = spillDir
 	tableFilter := buildTableFilter(cfg.TableFilters)
 
 	reader := wal.NewPGReader(wal.SlotConfig{
-		SlotName:     cfg.SlotName,
+		SlotName:         cfg.SlotName,
+		FeedbackInterval: cfg.CheckpointFreq, MaxBufferBytes: cfg.RawBufferBytes,
 		Plugin:       cfg.Plugin,
 		DatabaseURL:  cfg.DatabaseURL,
 		Publications: cfg.Publications,
@@ -58,18 +81,20 @@ func main() {
 
 	var parse parser.Parser
 	switch cfg.Plugin {
-	case "pgoutput":
+	case "", "pgoutput":
 		parse = parser.NewPGOutputParser(parser.PGOutputConfig{
 			TableFilter:     tableFilter,
 			Logger:          logger,
 			BufferSize:      cfg.ParsedEventBufferSize,
 			MaxTxBufferSize: cfg.MaxTxBufferSize,
+			MaxBufferBytes:  cfg.ParsedBufferBytes, MaxTxBytes: cfg.MaxTxBytes, MaxSpillBytes: cfg.MaxSpillBytes, SpillDir: cfg.SpillDir,
 		})
 	default:
 		parse = parser.NewWal2JSONParser(parser.Wal2JSONConfig{
-			TableFilter: tableFilter,
-			Logger:      logger,
-			BufferSize:  cfg.ParsedEventBufferSize,
+			TableFilter:    tableFilter,
+			Logger:         logger,
+			BufferSize:     cfg.ParsedEventBufferSize,
+			MaxBufferBytes: cfg.ParsedBufferBytes,
 		})
 	}
 	trans := transformer.NewSimpleTransformer(cfg.Database)
@@ -79,6 +104,8 @@ func main() {
 		os.Exit(1)
 	}
 	store := checkpoint.NewSlotStore(cfg.DatabaseURL, cfg.SlotName)
+	monitor := wal.NewMonitor(cfg.DatabaseURL, cfg.SlotName, reader)
+	go monitor.Run(ctx)
 	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
 	if err := health.Start(ctx, health.Options{
 		Addr:        cfg.HealthAddr,
@@ -88,8 +115,10 @@ func main() {
 			{
 				Name: "postgres",
 				Func: func(ctx context.Context) error {
-					_, err := store.Load(ctx)
-					return err
+					if err := reader.Ready(ctx); err != nil {
+						return err
+					}
+					return monitor.Ready(ctx)
 				},
 			},
 			{
@@ -136,7 +165,8 @@ func main() {
 
 	startPos, err := store.Load(ctx)
 	if err != nil {
-		logger.Warn("failed to load checkpoint, starting from earliest", zap.Error(err))
+		logger.Error("failed to load checkpoint", zap.Error(err))
+		os.Exit(1)
 	}
 	ckpt.Init(startPos, time.Now())
 
@@ -156,7 +186,10 @@ func buildPublisher(cfg config.Config, logger *zap.Logger) (publisher.Publisher,
 		return publisher.NewNoopPublisher(), nil
 	}
 	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
-		URLs:                   urls,
+		URLs:      urls,
+		EnableDLQ: cfg.PublishFailurePolicy == "dlq", DLQStream: cfg.DLQStream, DLQBucket: cfg.DLQBucket, DLQSubjectPrefix: cfg.DLQSubjectPrefix,
+		DLQMaxBytes: cfg.DLQMaxBytes, DLQIndexMaxBytes: cfg.DLQIndexMaxBytes,
+		CredentialsFile: cfg.NATSCredentialsFile, TLSCA: cfg.NATSTLSCA, TLSCert: cfg.NATSTLSCert, TLSKey: cfg.NATSTLSKey,
 		Username:               cfg.NATSUsername,
 		Password:               cfg.NATSPassword,
 		ConnectTimeout:         cfg.NATSTimeout,

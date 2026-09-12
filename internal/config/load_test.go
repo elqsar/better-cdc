@@ -99,8 +99,8 @@ func TestLoad_DefaultPublishFailurePolicyUsesDLQ(t *testing.T) {
 	if cfg.PublishFailurePolicy != "dlq" {
 		t.Fatalf("expected default PublishFailurePolicy %q, got %q", "dlq", cfg.PublishFailurePolicy)
 	}
-	if cfg.DLQSubjectPrefix != "cdc.dlq" {
-		t.Fatalf("expected default DLQSubjectPrefix %q, got %q", "cdc.dlq", cfg.DLQSubjectPrefix)
+	if cfg.DLQSubjectPrefix != "cdc_dlq" {
+		t.Fatalf("expected default DLQSubjectPrefix %q, got %q", "cdc_dlq", cfg.DLQSubjectPrefix)
 	}
 }
 
@@ -177,7 +177,7 @@ func TestConfigValidate_RejectsNegativePublishAsyncMaxPending(t *testing.T) {
 	}
 }
 
-func TestConfigValidate_AcceptsDLQSubjectCoveredByStreamSubjects(t *testing.T) {
+func TestConfigValidate_AcceptsSeparateDLQSubjects(t *testing.T) {
 	tests := []struct {
 		name           string
 		streamSubjects []string
@@ -199,26 +199,13 @@ func TestConfigValidate_AcceptsDLQSubjectCoveredByStreamSubjects(t *testing.T) {
 	}
 }
 
-func TestConfigValidate_RejectsDLQSubjectOutsideStreamSubjects(t *testing.T) {
-	tests := []struct {
-		name           string
-		streamSubjects []string
-		dlqPrefix      string
-	}{
-		{name: "original cdc stream only", streamSubjects: []string{"cdc.postgres.>"}, dlqPrefix: "cdc.dlq"},
-		{name: "different root", streamSubjects: []string{"cdc.>"}, dlqPrefix: "dead.cdc"},
-		{name: "too narrow schema", streamSubjects: []string{"cdc.dlq.postgres.public.*"}, dlqPrefix: "cdc.dlq"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			cfg.StreamSubjects = tt.streamSubjects
-			cfg.DLQSubjectPrefix = tt.dlqPrefix
-
-			if err := cfg.Validate(); err == nil {
-				t.Fatal("expected validation error for uncovered DLQ subject")
-			}
-		})
+func TestConfigValidate_RejectsOverlappingDLQSubjects(t *testing.T) {
+	for _, filter := range []string{"cdc_dlq.>", ">", "*.>", "cdc_dlq.postgres.public.*"} {
+		cfg := DefaultConfig()
+		cfg.StreamSubjects = []string{filter}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("accepted overlap %s", filter)
+		}
 	}
 }
 

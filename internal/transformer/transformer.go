@@ -41,6 +41,14 @@ func (t *SimpleTransformer) Transform(ctx context.Context, evt *model.WALEvent) 
 
 	// Build EventID with strings.Builder for efficiency
 	cdcEvt.EventID = buildEventID(evt)
+	cdcEvt.SchemaVersion = 1
+	cdcEvt.SeqInTx = evt.SeqInTx
+	if len(evt.UnavailableBefore) > 0 {
+		cdcEvt.Metadata["unavailable_before"] = evt.UnavailableBefore
+	}
+	if len(evt.UnavailableAfter) > 0 {
+		cdcEvt.Metadata["unavailable_after"] = evt.UnavailableAfter
+	}
 	cdcEvt.EventType = eventType(evt.Operation)
 	cdcEvt.Source = t.source
 	cdcEvt.Timestamp = evt.Timestamp
@@ -104,3 +112,6 @@ func buildEventID(evt *model.WALEvent) string {
 
 	return sb.String()
 }
+
+// EventID returns the identity used for publication and recovery.
+func EventID(evt *model.WALEvent) string { return buildEventID(evt) }

@@ -93,6 +93,8 @@ func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.
 
 // Run starts streaming from the provided WAL position.
 func (e *Engine) Run(ctx context.Context, start model.WALPosition) error {
+	sessionCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
 	e.logger.Info("engine starting", zap.String("start_lsn", start.LSN), zap.Int("batch_size", e.batchSize), zap.Duration("batch_timeout", e.batchTimeout))
 	if err := e.reader.Start(ctx); err != nil {
 		return fmt.Errorf("start reader: %w", err)
@@ -103,12 +105,12 @@ func (e *Engine) Run(ctx context.Context, start model.WALPosition) error {
 		_ = e.reader.Stop(stopCtx)
 	}()
 
-	rawStream, err := e.reader.ReadWAL(ctx, start)
+	rawStream, err := e.reader.ReadWAL(sessionCtx, start)
 	if err != nil {
 		return fmt.Errorf("read wal: %w", err)
 	}
 
-	parsedStream, err := e.parser.Parse(ctx, rawStream)
+	parsedStream, err := e.parser.Parse(sessionCtx, rawStream)
 	if err != nil {
 		return fmt.Errorf("parse wal: %w", err)
 	}
@@ -138,6 +140,7 @@ func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) 
 
 	flush := func(flushCtx context.Context) error {
 		if len(batch) == 0 {
+			timer.Reset(e.batchTimeout)
 			return nil
 		}
 		e.logger.Debug("flushing batch", zap.Int("count", len(batch)))
@@ -280,6 +283,8 @@ func deadLetterRecordFromItem(item publisher.PublishItem, cause error) *publishe
 // failed before a publishable payload existed (transform/subject/marshal).
 func deadLetterRecordFromWALEvent(evt *model.WALEvent, cause error) *publisher.DeadLetterRecord {
 	return &publisher.DeadLetterRecord{
+		Recovery:  evt.Recovery,
+		EventID:   transformer.EventID(evt),
 		Schema:    evt.Schema,
 		Table:     evt.Table,
 		Operation: string(evt.Operation),
@@ -836,7 +841,10 @@ func (e *Engine) flushPendingCheckpoint(ctx context.Context) error {
 
 // publishTimeout returns the timeout for waiting on batch acks.
 func (e *Engine) publishTimeout() time.Duration {
-	timeout := max(e.batchTimeout*3, 5*time.Second)
+	timeout := 5 * time.Second
+	if p, ok := e.publisher.(interface{ AckTimeout() time.Duration }); ok {
+		timeout = p.AckTimeout()
+	}
 	return timeout
 }
 

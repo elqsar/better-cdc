@@ -1,9 +1,11 @@
 package parser
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -11,23 +13,26 @@ import (
 	"github.com/jackc/pglogrepl"
 	"go.uber.org/zap"
 
+	"better-cdc/internal/budget"
 	"better-cdc/internal/metrics"
 	"better-cdc/internal/model"
 )
 
 // Wal2JSONConfig configures wal2json parsing.
 type Wal2JSONConfig struct {
-	TableFilter map[string]struct{} // schema.table allowlist; empty means all
-	Logger      *zap.Logger
-	BufferSize  int // Output channel buffer size for throughput optimization
+	TableFilter    map[string]struct{} // schema.table allowlist; empty means all
+	Logger         *zap.Logger
+	MaxBufferBytes int64
+	BufferSize     int // Output channel buffer size for throughput optimization
 }
 
 // Wal2JSONParser decodes wal2json plugin output into WALEvents.
 type Wal2JSONParser struct {
-	tableFilter map[string]struct{}
-	logger      *zap.Logger
-	bufferSize  int
-	promMetrics *metrics.Metrics
+	tableFilter    map[string]struct{}
+	logger         *zap.Logger
+	maxBufferBytes int64
+	bufferSize     int
+	promMetrics    *metrics.Metrics
 
 	mu       sync.Mutex
 	fatalErr error
@@ -39,10 +44,11 @@ func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
 		logger = zap.NewNop()
 	}
 	return &Wal2JSONParser{
-		tableFilter: cfg.TableFilter,
-		logger:      logger,
-		bufferSize:  cfg.BufferSize,
-		promMetrics: metrics.GlobalMetrics,
+		tableFilter:    cfg.TableFilter,
+		logger:         logger,
+		bufferSize:     cfg.BufferSize,
+		maxBufferBytes: cfg.MaxBufferBytes,
+		promMetrics:    metrics.GlobalMetrics,
 	}
 }
 
@@ -50,6 +56,13 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 	out := make(chan *model.WALEvent, p.bufferSize)
 	go func() {
 		defer close(out)
+		limit := p.maxBufferBytes
+		if limit <= 0 {
+			limit = 64 << 20
+		}
+		bytesBudget := budget.New(limit)
+		var inTx bool
+		var seq uint32
 		for {
 			select {
 			case <-ctx.Done():
@@ -61,10 +74,41 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 				if msg == nil {
 					continue
 				}
+				if msg.Reset {
+					inTx = false
+					seq = 0
+					continue
+				}
 				if msg.Plugin != PluginWal2JSON && msg.Plugin != "" {
 					continue
 				}
 				events, err := decodeWal2JSON(uint64(msg.WALStart), msg.Data, p.tableFilter)
+				if msg.ReleaseBytes != nil {
+					msg.ReleaseBytes()
+				}
+				if err == nil {
+					for _, evt := range events {
+						if evt.Begin {
+							if inTx {
+								err = fmt.Errorf("nested begin")
+							}
+							inTx = true
+							seq = 0
+						} else if evt.Commit {
+							if !inTx {
+								err = fmt.Errorf("commit without begin")
+							}
+							inTx = false
+						} else if !inTx {
+							err = fmt.Errorf("change outside transaction")
+						}
+						if !evt.Begin && !evt.Commit {
+							evt.SeqInTx = seq
+							seq++
+							evt.Recovery.SeqInTx = evt.SeqInTx
+						}
+					}
+				}
 				if err != nil {
 					p.promMetrics.DecodeErrors.Inc()
 					fatal := fmt.Errorf("decode wal2json failed: %w", err)
@@ -80,8 +124,16 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 					if p.logger != nil {
 						p.logger.Debug("wal2json event", zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
 					}
+					release, err := bytesBudget.Acquire(ctx, int64(len(msg.Data))*4+512)
+					if err != nil {
+						model.ReleaseWALEvent(evt)
+						p.setFatalError(err)
+						return
+					}
+					evt.ReleaseBytes = release
 					select {
 					case <-ctx.Done():
+						model.ReleaseWALEvent(evt)
 						return
 					case out <- evt:
 					}
@@ -111,10 +163,16 @@ func (p *Wal2JSONParser) Err() error {
 // Format v2 sends separate messages per action (B=Begin, C=Commit, I=Insert, U=Update, D=Delete).
 func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{}) ([]*model.WALEvent, error) {
 	var msg wal2JSONMessageV2
-	if err := json.Unmarshal(data, &msg); err != nil {
+	if err := decodeExactJSON(data, &msg); err != nil {
 		return nil, fmt.Errorf("unmarshal wal2json: %w", err)
 	}
 
+	switch msg.Action {
+	case "I", "U", "D", "T":
+		if msg.Schema == "" || msg.Table == "" {
+			return nil, fmt.Errorf("row action requires schema and table")
+		}
+	}
 	position := model.WALPosition{LSN: pglogrepl.LSN(walStart).String()}
 	txID := strconv.FormatInt(msg.XID, 10)
 
@@ -163,9 +221,12 @@ func decodeWal2JSON(walStart uint64, data []byte, tableFilter map[string]struct{
 		evt.Operation = model.OperationDDL
 	default:
 		model.ReleaseWALEvent(evt)
-		return nil, nil // Unknown action, skip
+		return nil, fmt.Errorf("unsupported wal2json action %q", msg.Action)
 	}
 
+	if !evt.Begin && !evt.Commit {
+		evt.Recovery = &model.RecoveryChange{Version: 1, Plugin: string(PluginWal2JSON), Data: append([]byte(nil), data...), WALStart: walStart, LSN: evt.LSN, Position: evt.Position, TxID: evt.TxID, CommitTime: evt.CommitTime}
+	}
 	return []*model.WALEvent{evt}, nil
 }
 
@@ -249,4 +310,18 @@ func populateMapFromColumns(m map[string]interface{}, cols []wal2JSONColumn) map
 		m[col.Name] = col.Value
 	}
 	return m
+}
+
+// decodeExactJSON preserves numbers at every nesting level and rejects trailing input.
+func decodeExactJSON(data []byte, out any) error {
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
+	if err := d.Decode(out); err != nil {
+		return err
+	}
+	var extra any
+	if err := d.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("unexpected trailing JSON: %v", err)
+	}
+	return nil
 }

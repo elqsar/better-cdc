@@ -39,7 +39,7 @@ func NewHandler(opts Options) http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, request *http.Request) {
 		if len(opts.Readiness) == 0 {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ready"))
@@ -51,7 +51,7 @@ func NewHandler(opts Options) http.Handler {
 			if check.Func == nil {
 				continue
 			}
-			checkCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			checkCtx, cancel := context.WithTimeout(request.Context(), timeout)
 			err := check.Func(checkCtx)
 			cancel()
 			if err != nil {
@@ -106,13 +106,17 @@ func Start(ctx context.Context, opts Options) error {
 	}
 
 	srv := &http.Server{
-		Addr:    ln.Addr().String(),
-		Handler: NewHandler(opts),
+		Addr:              ln.Addr().String(),
+		Handler:           NewHandler(opts),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	go func() {
 		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
 	}()
 
 	go func() {

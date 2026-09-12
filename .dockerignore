@@ -1,0 +1,17 @@
+.git
+.env
+.env.*
+!.env.example
+certs
+bin
+build
+.better-cdc
+findings.md
+*.out
+*.log
+deploy/pilot.env
+deploy/secrets
+**/*.creds
+**/*.key
+.codex
+.agents
