@@ -161,7 +161,21 @@ func main() {
 		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize),
 		zap.Int("max_tx_buffer", cfg.MaxTxBufferSize))
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, cfg.Database, cfg.BatchSize, cfg.BatchTimeout, cfg.MaxPublishRetries, cfg.UnsafeUnorderedAsyncPublish, engine.FailurePolicy(cfg.PublishFailurePolicy), cfg.DLQSubjectPrefix, logger)
+	eng := engine.NewEngine(engine.Options{
+		Reader:                      reader,
+		Parser:                      parse,
+		Transformer:                 trans,
+		Publisher:                   pub,
+		Checkpointer:                ckpt,
+		Database:                    cfg.Database,
+		BatchSize:                   cfg.BatchSize,
+		BatchTimeout:                cfg.BatchTimeout,
+		MaxPublishRetries:           cfg.MaxPublishRetries,
+		UnsafeUnorderedAsyncPublish: cfg.UnsafeUnorderedAsyncPublish,
+		FailurePolicy:               engine.FailurePolicy(cfg.PublishFailurePolicy),
+		DLQSubjectPrefix:            cfg.DLQSubjectPrefix,
+		Logger:                      logger,
+	})
 
 	startPos, err := store.Load(ctx)
 	if err != nil {

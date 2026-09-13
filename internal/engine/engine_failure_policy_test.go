@@ -110,9 +110,6 @@ func TestPublishWithRetry_PermanentErrorDLQPolicyQuarantinesAndContinues(t *test
 	if !bytes.Equal(captured.Payload, poisonItems()[1].Data) {
 		t.Fatal("quarantine payload changed")
 	}
-	if result.LastSuccessPosition == nil || result.LastSuccessPosition.LSN != "0/2" {
-		t.Errorf("expected last success position 0/2, got %v", result.LastSuccessPosition)
-	}
 }
 
 func TestPublishWithRetry_PermanentErrorSkipPolicyContinuesWithoutDLQ(t *testing.T) {
@@ -202,9 +199,6 @@ func TestFlushWithBatchPublish_PermanentFailureDLQAdvancesCheckpoint(t *testing.
 	e.transformer = &mockTransformer{}
 	e.checkpointer = ckpt
 	e.eventsProcessed = metrics.NewRateCounter("events_per_second")
-	e.batchesPublished = metrics.NewCounter("batches_published")
-	e.batchLatency = metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000})
-	e.transformLatency = metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000})
 
 	commitPos := model.WALPosition{LSN: "0/30"}
 	batch := []*model.WALEvent{
@@ -255,9 +249,6 @@ func TestFlushWithBatchPublish_TransformFailureQuarantinedUnderDLQ(t *testing.T)
 	e.transformer = failingTransformer{}
 	e.checkpointer = ckpt
 	e.eventsProcessed = metrics.NewRateCounter("events_per_second")
-	e.batchesPublished = metrics.NewCounter("batches_published")
-	e.batchLatency = metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000})
-	e.transformLatency = metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000})
 
 	commitPos := model.WALPosition{LSN: "0/40"}
 	batch := []*model.WALEvent{
@@ -297,7 +288,6 @@ func TestFlushWithBatchPublish_TransformFailureQuarantinedUnderDLQ(t *testing.T)
 	crashEngine := newFailurePolicyEngine(newMockBatchPublisher(), FailurePolicyCrash)
 	crashEngine.transformer = failingTransformer{}
 	crashEngine.checkpointer = ckpt
-	crashEngine.transformLatency = metrics.NewHistogram("transform_latency_ns", []uint64{100})
 	if err := crashEngine.flushWithBatchPublish(context.Background(), batch[:1], batch[0], newMockBatchPublisher()); err == nil {
 		t.Fatal("expected transform failure to be fatal under crash policy")
 	}

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
 
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
@@ -498,11 +497,11 @@ func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*Pending
 		case <-ctx.Done():
 			// Context cancelled - count what we have so far
 			result.FirstError = ctx.Err()
-			p.countResults(pending, items, completed, result)
+			p.countResults(pending, completed, result)
 			return result, ctx.Err()
 		case <-deadline.C:
 			// Timeout - tally actual results, then build error with accurate counts
-			p.countResults(pending, items, completed, result)
+			p.countResults(pending, completed, result)
 			result.FirstError = fmt.Errorf("timeout waiting for acks: %d/%d resolved", result.Succeeded, len(pending))
 			return result, result.FirstError
 		case <-pend.done:
@@ -519,14 +518,12 @@ func (p *JetStreamPublisher) WaitForAcks(ctx context.Context, pending []*Pending
 		}
 	}
 
-	// All completed - find the last successful position
-	result.LastSuccessPosition = p.findLastSuccessPosition(pending, items)
-
+	// All completed
 	return result, result.FirstError
 }
 
 // countResults tallies the final results after timeout/cancellation.
-func (p *JetStreamPublisher) countResults(pending []*PendingAck, items []PublishItem, completed []bool, result *BatchResult) {
+func (p *JetStreamPublisher) countResults(pending []*PendingAck, completed []bool, result *BatchResult) {
 	result.Succeeded = 0
 	result.Failed = 0
 	result.FailedItems = result.FailedItems[:0]
@@ -545,25 +542,6 @@ func (p *JetStreamPublisher) countResults(pending []*PendingAck, items []Publish
 			}
 		}
 	}
-
-	result.LastSuccessPosition = p.findLastSuccessPosition(pending, items)
-}
-
-// findLastSuccessPosition finds the WAL position of the last contiguously
-// successful item from the start. Only checkpoint up to the last position
-// where all preceding items also succeeded, to avoid skipping failed events.
-func (p *JetStreamPublisher) findLastSuccessPosition(pending []*PendingAck, items []PublishItem) *model.WALPosition {
-	var lastPos *model.WALPosition
-
-	for i, pend := range pending {
-		if !pend.IsAcked() || i >= len(items) {
-			break
-		}
-		pos := items[i].Position
-		lastPos = &pos
-	}
-
-	return lastPos
 }
 
 func (p *JetStreamPublisher) AckTimeout() time.Duration { return p.publishTimeout() }

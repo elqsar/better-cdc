@@ -53,41 +53,51 @@ type Engine struct {
 	dlqSubjectPrefix            string
 	logger                      *zap.Logger
 
-	// Throughput metrics (legacy, kept for backward compatibility)
-	eventsProcessed  *metrics.RateCounter
-	batchesPublished *metrics.Counter
-	batchLatency     *metrics.Histogram
-	transformLatency *metrics.Histogram
+	// eventsProcessed drives the Prometheus events-per-second gauge.
+	eventsProcessed *metrics.RateCounter
 
 	// Prometheus metrics
 	promMetrics *metrics.Metrics
 }
 
-func NewEngine(reader wal.Reader, parser parser.Parser, transformer transformer.Transformer, publisher publisher.Publisher, checkpointer *checkpoint.Manager, database string, batchSize int, batchTimeout time.Duration, maxPublishRetries int, unsafeUnorderedAsyncPublish bool, failurePolicy FailurePolicy, dlqSubjectPrefix string, logger *zap.Logger) *Engine {
+// Options configures an Engine. Every field is required except Logger.
+type Options struct {
+	Reader                      wal.Reader
+	Parser                      parser.Parser
+	Transformer                 transformer.Transformer
+	Publisher                   publisher.Publisher
+	Checkpointer                *checkpoint.Manager
+	Database                    string
+	BatchSize                   int
+	BatchTimeout                time.Duration
+	MaxPublishRetries           int
+	UnsafeUnorderedAsyncPublish bool
+	FailurePolicy               FailurePolicy
+	DLQSubjectPrefix            string
+	Logger                      *zap.Logger
+}
+
+func NewEngine(opts Options) *Engine {
+	logger := opts.Logger
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	return &Engine{
-		reader:                      reader,
-		parser:                      parser,
-		transformer:                 transformer,
-		publisher:                   publisher,
-		checkpointer:                checkpointer,
-		database:                    database,
-		batchSize:                   batchSize,
-		batchTimeout:                batchTimeout,
-		maxPublishRetries:           maxPublishRetries,
-		unsafeUnorderedAsyncPublish: unsafeUnorderedAsyncPublish,
-		failurePolicy:               failurePolicy,
-		dlqSubjectPrefix:            dlqSubjectPrefix,
+		reader:                      opts.Reader,
+		parser:                      opts.Parser,
+		transformer:                 opts.Transformer,
+		publisher:                   opts.Publisher,
+		checkpointer:                opts.Checkpointer,
+		database:                    opts.Database,
+		batchSize:                   opts.BatchSize,
+		batchTimeout:                opts.BatchTimeout,
+		maxPublishRetries:           opts.MaxPublishRetries,
+		unsafeUnorderedAsyncPublish: opts.UnsafeUnorderedAsyncPublish,
+		failurePolicy:               opts.FailurePolicy,
+		dlqSubjectPrefix:            opts.DLQSubjectPrefix,
 		logger:                      logger,
-		// Initialize throughput metrics (legacy)
-		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
-		batchesPublished: metrics.NewCounter("batches_published"),
-		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000, 5000, 10000, 50000}),
-		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000, 5000, 10000}),
-		// Use global Prometheus metrics
-		promMetrics: metrics.GlobalMetrics,
+		eventsProcessed:             metrics.NewRateCounter("events_per_second"),
+		promMetrics:                 metrics.GlobalMetrics,
 	}
 }
 
@@ -294,6 +304,56 @@ func deadLetterRecordFromWALEvent(evt *model.WALEvent, cause error) *publisher.D
 	}
 }
 
+// prepareFailure applies the failure policy to an event that cannot be turned
+// into a publishable item (transform/subject/marshal). It reports skip=true
+// when the event was quarantined and the caller should continue, or returns
+// cause when the engine must stop.
+func (e *Engine) prepareFailure(ctx context.Context, evt *model.WALEvent, cause error) (bool, error) {
+	if e.quarantinesPoison() {
+		if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, cause)); qErr == nil {
+			return true, nil
+		}
+	}
+	return false, cause
+}
+
+// prepareItem transforms a WAL event into a publish item. skip=true means a
+// preparation failure was quarantined and the caller should move on; a non-nil
+// error means the engine must stop.
+func (e *Engine) prepareItem(ctx context.Context, evt *model.WALEvent) (item publisher.PublishItem, skip bool, err error) {
+	transformStart := time.Now()
+	cdcEvt, err := e.transformer.Transform(ctx, evt)
+	e.promMetrics.TransformLatency.Observe(uint64(time.Since(transformStart).Nanoseconds()))
+	if err != nil {
+		skip, err = e.prepareFailure(ctx, evt, fmt.Errorf("transform event: %w", err))
+		return publisher.PublishItem{}, skip, err
+	}
+	defer model.ReleaseCDCEvent(cdcEvt)
+
+	subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
+	if err != nil {
+		skip, err = e.prepareFailure(ctx, evt, fmt.Errorf("build subject: %w", err))
+		return publisher.PublishItem{}, skip, err
+	}
+
+	payload, err := marshalCDCEvent(cdcEvt)
+	if err != nil {
+		skip, err = e.prepareFailure(ctx, evt, fmt.Errorf("marshal event: %w", err))
+		return publisher.PublishItem{}, skip, err
+	}
+
+	return publisher.PublishItem{
+		Subject:   subject,
+		Data:      payload,
+		EventID:   cdcEvt.EventID,
+		TxID:      evt.TxID,
+		Position:  evt.Position,
+		Schema:    cdcEvt.Schema,
+		Table:     cdcEvt.Table,
+		Operation: cdcEvt.Operation,
+	}, false, nil
+}
+
 // flushWithBatchPublish uses async batch publishing with collected acks for high throughput.
 // Includes retry logic with exponential backoff for transient failures.
 func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEvent, last *model.WALEvent, batchPub publisher.BatchPublisher) error {
@@ -301,75 +361,18 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 
 	// Phase 1: Transform and prepare all items
 	items := make([]publisher.PublishItem, 0, len(batch))
-	cdcEvents := make([]*model.CDCEvent, 0, len(batch)) // Track for pool release
-
 	for _, evt := range batch {
 		if evt.Begin || evt.Commit {
 			continue
 		}
-
-		transformStart := time.Now()
-		cdcEvt, err := e.transformer.Transform(ctx, evt)
-		transformLatencyNs := uint64(time.Since(transformStart).Nanoseconds())
-		e.transformLatency.Observe(transformLatencyNs)
-		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
+		item, skip, err := e.prepareItem(ctx, evt)
 		if err != nil {
-			// Transform failures are deterministic, so retrying or crashing
-			// replays the same failure; quarantine when the policy allows it.
-			if e.quarantinesPoison() {
-				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("transform event: %w", err))); qErr == nil {
-					continue
-				}
-			}
-			// Release any already-transformed events on error
-			for _, event := range cdcEvents {
-				model.ReleaseCDCEvent(event)
-			}
-			return fmt.Errorf("transform event: %w", err)
+			return err
 		}
-		cdcEvents = append(cdcEvents, cdcEvt)
-
-		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
-		if err != nil {
-			if e.quarantinesPoison() {
-				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("build subject: %w", err))); qErr == nil {
-					continue
-				}
-			}
-			for _, event := range cdcEvents {
-				model.ReleaseCDCEvent(event)
-			}
-			return fmt.Errorf("build subject: %w", err)
+		if skip {
+			continue
 		}
-
-		payload, err := marshalCDCEvent(cdcEvt)
-		if err != nil {
-			if e.quarantinesPoison() {
-				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("marshal event: %w", err))); qErr == nil {
-					continue
-				}
-			}
-			for _, event := range cdcEvents {
-				model.ReleaseCDCEvent(event)
-			}
-			return fmt.Errorf("marshal event: %w", err)
-		}
-
-		items = append(items, publisher.PublishItem{
-			Subject:   subject,
-			Data:      payload,
-			EventID:   cdcEvt.EventID,
-			TxID:      evt.TxID,
-			Position:  evt.Position,
-			Schema:    cdcEvt.Schema,
-			Table:     cdcEvt.Table,
-			Operation: cdcEvt.Operation,
-		})
-	}
-
-	// Release CDCEvents back to pool after marshaling (data is copied)
-	for _, evt := range cdcEvents {
-		model.ReleaseCDCEvent(evt)
+		items = append(items, item)
 	}
 
 	if len(items) == 0 {
@@ -393,9 +396,7 @@ func (e *Engine) flushWithBatchPublish(ctx context.Context, batch []*model.WALEv
 		e.eventsProcessed.Add(uint64(result.Succeeded))
 		e.promMetrics.EventsTotal.Add(uint64(result.Succeeded))
 	}
-	e.batchesPublished.Inc()
 	batchLatencyUs := uint64(time.Since(batchStart).Microseconds())
-	e.batchLatency.Observe(batchLatencyUs)
 	e.promMetrics.BatchesPublished.Inc()
 	e.promMetrics.BatchLatency.Observe(batchLatencyUs)
 	e.promMetrics.EventsPerSecond.Set(int64(e.eventsProcessed.Rate()))
@@ -673,27 +674,13 @@ func (e *Engine) buildFinalResult(items []publisher.PublishItem, succeeded []boo
 		FirstError:  lastError,
 	}
 
-	var lastContiguousIdx = -1
-	var contiguousBroken bool
 	for i, ok := range succeeded {
 		if ok {
 			result.Succeeded++
-			if !contiguousBroken {
-				lastContiguousIdx = i
-			}
 		} else {
 			result.Failed++
 			result.FailedItems = append(result.FailedItems, i)
-			contiguousBroken = true
 		}
-	}
-
-	// Set last successful position for partial checkpointing.
-	// Only checkpoint up to the last contiguous success from the start
-	// to avoid skipping failed events that precede later successes.
-	if lastContiguousIdx >= 0 && items[lastContiguousIdx].Position.LSN != "" {
-		pos := items[lastContiguousIdx].Position
-		result.LastSuccessPosition = &pos
 	}
 
 	return result
@@ -718,49 +705,18 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 			continue
 		}
 
-		transformStart := time.Now()
-		cdcEvt, err := e.transformer.Transform(ctx, evt)
-		transformLatencyNs := uint64(time.Since(transformStart).Nanoseconds())
-		e.transformLatency.Observe(transformLatencyNs)
-		e.promMetrics.TransformLatency.Observe(transformLatencyNs)
+		item, skip, err := e.prepareItem(ctx, evt)
 		if err != nil {
-			if e.quarantinesPoison() {
-				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("transform event: %w", err))); qErr == nil {
-					continue
-				}
-			}
-			return fmt.Errorf("transform event: %w", err)
+			return err
 		}
-		subject, err := publisher.SubjectForEvent(e.database, cdcEvt)
-		if err != nil {
-			model.ReleaseCDCEvent(cdcEvt)
-			if e.quarantinesPoison() {
-				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("build subject: %w", err))); qErr == nil {
-					continue
-				}
-			}
-			return fmt.Errorf("build subject: %w", err)
+		if skip {
+			continue
 		}
-		payload, err := marshalCDCEvent(cdcEvt)
-		if err != nil {
-			model.ReleaseCDCEvent(cdcEvt)
-			if e.quarantinesPoison() {
-				if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, fmt.Errorf("marshal event: %w", err))); qErr == nil {
-					continue
-				}
-			}
-			return fmt.Errorf("marshal event: %w", err)
-		}
-		eventID := cdcEvt.EventID
-		// Release event after marshaling
-		model.ReleaseCDCEvent(cdcEvt)
 
-		if err := e.publisher.PublishWithRetries(ctx, subject, payload, e.maxPublishRetries, eventID); err != nil {
+		if err := e.publisher.PublishWithRetries(ctx, item.Subject, item.Data, e.maxPublishRetries, item.EventID); err != nil {
 			if publisher.IsPermanentPublishError(err) && e.quarantinesPoison() {
-				rec := deadLetterRecordFromWALEvent(evt, err)
-				rec.EventID = eventID
-				rec.Subject = subject
-				rec.SetPayload(payload)
+				rec := deadLetterRecordFromItem(item, err)
+				rec.Recovery = evt.Recovery
 				if qErr := e.quarantine(ctx, rec); qErr == nil {
 					continue
 				} else {
@@ -770,15 +726,13 @@ func (e *Engine) flushSequential(ctx context.Context, batch []*model.WALEvent, l
 			return fmt.Errorf("publish: %w", err)
 		}
 		eventCount++
-		e.logger.Debug("published event", zap.String("subject", subject), zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
+		e.logger.Debug("published event", zap.String("subject", item.Subject), zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
 	}
 
 	// Record metrics
 	if eventCount > 0 {
 		e.eventsProcessed.Add(uint64(eventCount))
-		e.batchesPublished.Inc()
 		batchLatencyUs := uint64(time.Since(batchStart).Microseconds())
-		e.batchLatency.Observe(batchLatencyUs)
 
 		e.promMetrics.EventsTotal.Add(uint64(eventCount))
 		e.promMetrics.BatchesPublished.Inc()
@@ -850,24 +804,4 @@ func (e *Engine) publishTimeout() time.Duration {
 
 func (e *Engine) shutdownTimeout() time.Duration {
 	return max(e.publishTimeout()*2, 10*time.Second)
-}
-
-// EngineMetrics contains throughput metrics for external access.
-type EngineMetrics struct {
-	EventsPerSecond        float64
-	EventsTotal            uint64
-	BatchesPublished       uint64
-	BatchLatencyMeanUs     float64
-	TransformLatencyMeanNs float64
-}
-
-// Metrics returns current throughput metrics.
-func (e *Engine) Metrics() EngineMetrics {
-	return EngineMetrics{
-		EventsPerSecond:        e.eventsProcessed.Rate(),
-		EventsTotal:            e.eventsProcessed.Total(),
-		BatchesPublished:       e.batchesPublished.Value(),
-		BatchLatencyMeanUs:     e.batchLatency.Mean(),
-		TransformLatencyMeanNs: e.transformLatency.Mean(),
-	}
 }

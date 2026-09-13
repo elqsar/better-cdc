@@ -143,9 +143,6 @@ type BatchResult struct {
 	Succeeded int
 	// Number of failed items
 	Failed int
-	// LastSuccessPosition is the WAL position of the last successfully acked item (in order).
-	// It is diagnostic only; checkpoint advancement is owned by the engine's commit-boundary logic.
-	LastSuccessPosition *model.WALPosition
 	// FirstError is the first error encountered, if any
 	FirstError error
 	// FailedItems contains indices of failed items for potential retry
