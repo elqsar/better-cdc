@@ -1,4 +1,4 @@
-module better-cdc
+module github.com/elqsar/better-cdc
 
 go 1.26.8
 

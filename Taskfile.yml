@@ -68,6 +68,7 @@ tasks:
     desc: Run the CDC handler with local defaults
     cmds:
       - |
+        CDC_SOURCE_ID="${CDC_SOURCE_ID:-local-postgres}" \
         DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/postgres}" \
         CDC_SLOT_NAME="${CDC_SLOT_NAME:-better_cdc_slot}" \
         CDC_PLUGIN="${CDC_PLUGIN:-pgoutput}" \

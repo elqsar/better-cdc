@@ -1,9 +1,9 @@
 package wal
 
 import (
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
 	"context"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"testing"

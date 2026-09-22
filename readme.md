@@ -1,8 +1,38 @@
 # Better CDC
 
-A focused PostgreSQL logical-replication producer for NATS JetStream. One process
-owns one existing replication slot. `pgoutput` is the default; `wal2json` remains
+A focused Go library and CLI for PostgreSQL logical replication to NATS JetStream.
+Each producer owns one existing replication slot. `pgoutput` is the default; `wal2json` remains
 supported. This project does not implement other source or destination connectors.
+
+## Embed in Go
+
+```go
+import cdc "github.com/elqsar/better-cdc"
+
+cfg := cdc.DefaultConfig()
+cfg.Source.SourceID = "production-orders-postgres" // stable across restarts
+cfg.Source.DatabaseURL = databaseURL
+cfg.Source.Database = "orders" // existing source label and subject token
+cfg.JetStream.NATSURLs = []string{natsURL}
+runner, err := cdc.New(cfg)
+if err != nil {
+    return err
+}
+return runner.Run(ctx)
+```
+
+`New` validates and copies configuration without connecting or creating files.
+`Run` is single-use and blocks until failure or cancellation; successful requested
+shutdown returns nil after cleanup. Create another runner to start again. Each
+instance has its own metrics registry and source/slot spill lock. The caller owns
+signals and HTTP serving: use `Ready(ctx)` and `MetricsHandler()` on its own server.
+See the [embedding example](examples/embedded/main.go). Optional structured logging
+uses `WithLogger(*zap.Logger)`; the default logger is silent.
+
+Configuration is grouped into `Source`, `JetStream`, `Pipeline`, and `Recovery`.
+Start from `DefaultConfig`, then set an explicit source ID and deployment settings.
+Both decoders and all existing publication policies remain available. Pipeline
+interfaces and DLQ administration remain internal; the CLI provides DLQ commands.
 
 ## Local quickstart
 
@@ -31,8 +61,9 @@ invalid relation state, unknown actions, and unrecoverable storage errors stop C
 
 `Nats-Msg-Id` is the deterministic `event_id`. JetStream deduplicates within
 `DUPLICATE_WINDOW`, not indefinitely. Consumers must deduplicate for recovery beyond
-that window. Event IDs are stable for the same source, decoder, slot and table
-selection. Changing decoder or capture configuration requires a migration decision.
+that window. Version-2 IDs are `v2:` plus a SHA-256 digest of a canonical JSON array containing
+source ID, slot, decoder, LSN, transaction ID, operation, schema, table, and ordinal.
+They are stable for the same source, decoder, slot and table selection. Changing decoder or capture configuration requires a migration decision.
 
 Live publication waits for each acknowledgement before submitting the next event.
 Replay can revisit older events. Source transactions are not applied atomically to
@@ -53,7 +84,10 @@ go run ./cmd/cdc-handler dlq inspect '<event_id>'
 go run ./cmd/cdc-handler dlq redrive
 ```
 
-Redrive uses a persistent consumer and the original event identity. It stops on the
+Redrive uses a persistent consumer and the original event identity. After a worker
+crash, it waits for outstanding deliveries to become available again (up to the
+consumer acknowledgement wait, five minutes by default). A fetch timeout alone
+does not indicate completion; both pending counts must reach zero. It stops on the
 first unsuccessful replay and acknowledges work only after a publish acknowledgement.
 Fix destination payload limits before replaying oversized events. Input capsules
 for serialization/transform failures can be replayed after the underlying code fix.
@@ -68,7 +102,7 @@ testing and always reports unready when the noop publisher is actually selected.
 
 ## Consumer contract
 
-Envelope version 1 adds `schema_version` and `seq_in_tx` to the existing fields:
+Envelope version 2 includes `schema_version`, `source_id`, and `seq_in_tx` alongside:
 `event_id`, `event_type`, `source`, `timestamp`, `commit_time`, `lsn`, `txid`,
 `schema`, `table`, `operation`, `before`, `after`, and `metadata`.
 
@@ -97,6 +131,7 @@ All settings are environment variables. Defaults favor a local stack; use the
 
 | Setting | Default / meaning |
 |---|---|
+| `CDC_SOURCE_ID` | Required stable identity, unique to the source; never derived from the connection URL |
 | `DATABASE_URL` | Local postgres/postgres connection; production should verify TLS |
 | `CDC_DATABASE_NAME` | Derived from URL; stable source name and subject token |
 | `CDC_SLOT_NAME` | `better_cdc_slot`; must already exist |
@@ -137,6 +172,14 @@ For quoted identifiers containing commas or dots, use PostgreSQL publication
 selection instead of the simple CSV table-filter syntax. A slot and its plugin
 cannot be switched transparently. No automatic slot creation, deletion, skipping,
 snapshotting or leader election is implemented.
+
+## Upgrade from envelope version 1
+
+The module path is now `github.com/elqsar/better-cdc`, `CDC_SOURCE_ID` is required,
+and new events use envelope/identity version 2. Existing subjects are unchanged.
+Stored version-1 recovery records can still be inspected and redriven with their
+original IDs and envelope semantics. See the [cutover procedure](docs/operations.md#version-2-cutover)
+for replay and consumer compatibility requirements.
 
 ## Development and pilot
 

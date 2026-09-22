@@ -1,22 +1,26 @@
 package parser
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"better-cdc/internal/subject"
 	"golang.org/x/sys/unix"
 )
 
 // PrepareSpillDir locks a source-specific directory and removes only this
 // program's orphaned transaction files. WAL remains the recovery source.
-func PrepareSpillDir(base, slot string) (string, func(), error) {
+func PrepareSpillDir(base, sourceID, slot string) (string, func(), error) {
 	if base == "" {
 		base = filepath.Join(os.TempDir(), "better-cdc-spill")
 	}
-	dir := filepath.Join(base, subject.Token(slot))
+	identity, _ := json.Marshal([]string{sourceID, slot})
+	sum := sha256.Sum256(identity)
+	dir := filepath.Join(base, hex.EncodeToString(sum[:]))
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", nil, err
 	}

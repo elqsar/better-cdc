@@ -14,9 +14,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 
-	"better-cdc/internal/budget"
-	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/budget"
+	"github.com/elqsar/better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/model"
 )
 
 type relationInfo struct {
@@ -40,6 +40,7 @@ type txBuffer struct {
 }
 
 type txSpill struct {
+	metrics        *metrics.Metrics
 	file           *os.File
 	path           string
 	written, limit int64
@@ -65,7 +66,9 @@ func (s *txSpill) Write(raw []byte) error {
 		return fmt.Errorf("transaction spill byte limit exceeded")
 	}
 	s.written += int64(len(raw)) + 8
-	metrics.Pilot.SpillBytes.Set(s.written)
+	if s.metrics != nil {
+		s.metrics.Pilot.SpillBytes.Set(s.written)
+	}
 	var size [8]byte
 	binary.LittleEndian.PutUint64(size[:], uint64(len(raw)))
 	if _, err := s.file.Write(size[:]); err != nil {
@@ -127,6 +130,7 @@ func (s *txSpill) CloseAndRemove() error {
 
 // PGOutputConfig configures parsing for pgoutput.
 type PGOutputConfig struct {
+	Metrics         *metrics.Metrics
 	MaxBufferBytes  int64
 	MaxTxBytes      int64
 	MaxSpillBytes   int64
@@ -181,7 +185,7 @@ func NewPGOutputParser(cfg PGOutputConfig) *PGOutputParser {
 		errs:            metrics.NewCounter("decode_errors"),
 		bufferSize:      cfg.BufferSize,
 		maxTxBufferSize: cfg.MaxTxBufferSize,
-		promMetrics:     metrics.GlobalMetrics,
+		promMetrics:     metrics.OrNew(cfg.Metrics),
 	}
 }
 
@@ -335,8 +339,8 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, rawData []by
 		}
 		// Reset buffer size gauge
 		p.promMetrics.TxBufferSize.Set(0)
-		metrics.Pilot.SpillBytes.Set(0)
-		metrics.Pilot.TxBytes.Set(0)
+		p.promMetrics.Pilot.SpillBytes.Set(0)
+		p.promMetrics.Pilot.TxBytes.Set(0)
 
 		commitEvt := &model.WALEvent{
 			Commit:     true,
@@ -392,8 +396,8 @@ func (p *PGOutputParser) cleanupTx() {
 		p.tx.spill = nil
 	}
 	p.promMetrics.TxBufferSize.Set(0)
-	metrics.Pilot.SpillBytes.Set(0)
-	metrics.Pilot.TxBytes.Set(0)
+	p.promMetrics.Pilot.SpillBytes.Set(0)
+	p.promMetrics.Pilot.TxBytes.Set(0)
 	p.tx = nil
 }
 
@@ -410,8 +414,8 @@ func (p *PGOutputParser) finishTx() error {
 		p.tx.spill = nil
 	}
 	p.promMetrics.TxBufferSize.Set(0)
-	metrics.Pilot.SpillBytes.Set(0)
-	metrics.Pilot.TxBytes.Set(0)
+	p.promMetrics.Pilot.SpillBytes.Set(0)
+	p.promMetrics.Pilot.TxBytes.Set(0)
 	p.tx = nil
 	return nil
 }
@@ -554,6 +558,7 @@ func (p *PGOutputParser) bufferOrSpillEvents(ctx context.Context, _ []byte, even
 		if err != nil {
 			return err
 		}
+		spill.metrics = p.promMetrics
 		p.tx.spill = spill
 		p.promMetrics.TxBufferOverflows.Inc()
 		for _, raw := range p.tx.rawMsgs {
@@ -582,7 +587,7 @@ func (p *PGOutputParser) bufferOrSpillEvents(ctx context.Context, _ []byte, even
 	p.tx.events = append(p.tx.events, events...)
 	p.tx.rawMsgs = append(p.tx.rawMsgs, records...)
 	p.tx.memoryBytes += bytes
-	metrics.Pilot.TxBytes.Set(p.tx.memoryBytes)
+	p.promMetrics.Pilot.TxBytes.Set(p.tx.memoryBytes)
 	retained = true
 	p.promMetrics.TxBufferSize.Set(int64(len(p.tx.events)))
 	return nil

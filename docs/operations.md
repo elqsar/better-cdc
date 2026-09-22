@@ -2,6 +2,8 @@
 
 ## Provision and validate
 
+Set `CDC_SOURCE_ID` to a permanent logical source name, independent of hostnames,
+credentials, and database failover endpoints. Never reuse it for unrelated sources.
 Run one producer per source slot and use a dedicated live stream, DLQ index stream,
 and Object Store bucket. PostgreSQL enforces slot ownership; this service does not
 provide leader election. A second instance is unready while waiting for the slot.
@@ -35,7 +37,7 @@ Copy `deploy/pilot.env.example` to an untracked `deploy/pilot.env`, supply real
 endpoints and mounted secrets, then use `deploy/compose.pilot.yml`. The image runs
 as UID/GID 65532 with a read-only root. Its persistent spill directory must be
 writable by that user and private (0700); the image initializes this for a new
-named volume. One process holds an exclusive advisory lock for its slot directory.
+named volume. Each runner holds an exclusive advisory lock for its source-ID/slot directory.
 
 The sample container has 768 MiB memory headroom and a 1 GiB spill cap. Set broker
 storage and PostgreSQL WAL limits against measured event sizes, transaction sizes,
@@ -131,3 +133,44 @@ provided for that old contract. Existing `wal2json` slots need an explicit decod
 override. Before rollback, stop the producer and preserve exact slot and stream
 state; an old binary cannot read the new recovery format and must not resume with
 its lossy DLQ default. Prefer a forward fix or keep capture stopped with WAL retained.
+
+## Version-2 cutover
+
+1. Stop the old producer and wait for its process to exit. Preserve the existing
+   slot, live stream, DLQ index, and Object Store; do not advance or replace the slot.
+2. Upgrade consumers to accept envelope version 2 and its `source_id`. Keep support
+   for version 1 while historical live or quarantined events remain. Subjects and
+   the existing database-based `source` field are unchanged.
+3. Choose and record `CDC_SOURCE_ID`. Keep it stable across restarts, upgrades, and
+   endpoint changes. Changing the slot, decoder, source ID, or table selection
+   requires a new migration decision.
+4. Deploy the new CLI or import `github.com/elqsar/better-cdc`. Resume from the
+   existing slot. New IDs use version 2; replay across the cutover can expose one
+   logical change under both old and new IDs. JetStream cannot deduplicate across
+   those identities. Reconcile downstream state or use application-level
+   idempotency when replaying across the boundary.
+5. Verify readiness, advancing confirmed flush position, stream delivery, and DLQ
+   counts. Version-1 recovery records are still replayed with their original IDs;
+   never rewrite retained records to version 2.
+
+Spill directories now use a digest of source ID and slot. Old slot-only directories
+are not automatically removed. After the old producer is stopped and recovery is
+verified, operators may remove its orphaned spill files. WAL remains the recovery
+source; no spill file is a checkpoint.
+
+Rollback requires the previous binary and configuration plus consumers that still
+accept both envelope versions. Stop the new producer first. Keep its recovery
+storage: an old binary cannot redrive version-2 objects. No rollback promises
+cross-version event deduplication.
+
+## Embedding and backpressure
+
+Library runners do not register process-global metrics, install signal handlers,
+change profiling settings, or bind HTTP listeners. Mount each runner's metrics
+handler separately when running multiple sources in one application. Use a distinct
+source ID for each independent source; PostgreSQL still enforces one owner per slot.
+
+Feedback continues while the raw channel or byte budget is blocked. It reports only
+handled transaction positions, never received-but-unpublished WAL. Heartbeats keep
+the session alive; they do not make a stalled pipeline ready or reduce its retained
+WAL. Monitor lag, retained WAL, and recovery capacity throughout an outage.

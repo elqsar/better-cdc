@@ -14,10 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
-	"better-cdc/internal/budget"
-	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
+	"github.com/elqsar/better-cdc/internal/budget"
+	"github.com/elqsar/better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
 
 	"go.uber.org/zap"
 )
@@ -80,6 +80,7 @@ type Reader interface {
 
 // SlotConfig captures replication slot settings to align with Postgres 15 logical decoding.
 type SlotConfig struct {
+	Metrics          *metrics.Metrics
 	FeedbackInterval time.Duration
 	MaxBufferBytes   int64
 	SlotName         string
@@ -130,7 +131,7 @@ func NewPGReader(slot SlotConfig, bufferSize int, logger *zap.Logger) *PGReader 
 		errs:        metrics.NewCounter("replication_errors"),
 		logger:      logger,
 		bufferSize:  bufferSize,
-		promMetrics: metrics.GlobalMetrics,
+		promMetrics: metrics.OrNew(slot.Metrics),
 	}
 }
 
@@ -370,7 +371,10 @@ func (r *PGReader) loopMessages(ctx context.Context, plugin parser.Plugin, out c
 				if ctx.Err() != nil {
 					return r.currentAckedLSN(), ctx.Err()
 				}
-				standbyDeadline = r.handleStandbyTimeout(ctx, standbyTimeout)
+				standbyDeadline, err = r.handleStandbyTimeout(ctx, standbyTimeout)
+				if err != nil {
+					return r.currentAckedLSN(), err
+				}
 				continue
 			}
 			if ctx.Err() != nil {
@@ -396,9 +400,9 @@ func (r *PGReader) loopMessages(ctx context.Context, plugin parser.Plugin, out c
 				}
 				r.receivedLSN.Store(uint64(xld.WALStart))
 				r.lastReceived.Store(time.Now().Unix())
-				release, err := r.rawBudget.Acquire(ctx, int64(len(xld.WALData))+128)
+				release, err := r.acquireRaw(ctx, int64(len(xld.WALData))+128, standbyTimeout, &standbyDeadline)
 				if err != nil {
-					return r.currentAckedLSN(), fatalReplicationError{err}
+					return r.currentAckedLSN(), err
 				}
 				// Copy data to avoid race condition - pglogrepl reuses the buffer
 				dataCopy := make([]byte, len(xld.WALData))
@@ -409,18 +413,16 @@ func (r *PGReader) loopMessages(ctx context.Context, plugin parser.Plugin, out c
 					WALStart:     xld.WALStart,
 					Data:         dataCopy,
 				}
-				select {
-				case <-ctx.Done():
+				if err := r.deliverRaw(ctx, out, raw, standbyTimeout, &standbyDeadline); err != nil {
 					release()
-					return r.currentAckedLSN(), ctx.Err()
-				case out <- raw:
+					return r.currentAckedLSN(), err
 				}
 				if time.Now().After(standbyDeadline) {
 					standbyDeadline = time.Now().Add(standbyTimeout)
 					if err := r.sendStandbyStatus(ctx, false); err != nil {
 						r.errs.Inc()
 						r.promMetrics.ReplicationErrors.Inc()
-						r.logger.Warn("send standby status failed", zap.Error(err))
+						return r.currentAckedLSN(), fmt.Errorf("standby feedback: %w", err)
 					}
 				}
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
@@ -436,7 +438,7 @@ func (r *PGReader) loopMessages(ctx context.Context, plugin parser.Plugin, out c
 					if err := r.sendStandbyStatus(ctx, pkm.ReplyRequested); err != nil {
 						r.errs.Inc()
 						r.promMetrics.ReplicationErrors.Inc()
-						r.logger.Warn("send standby status failed", zap.Error(err))
+						return r.currentAckedLSN(), fmt.Errorf("standby feedback: %w", err)
 					}
 				}
 			default:
@@ -487,13 +489,13 @@ func (r *PGReader) standbyTimeout() time.Duration {
 	return time.Duration(replicationStandbyTimeoutNanos.Load())
 }
 
-func (r *PGReader) handleStandbyTimeout(ctx context.Context, standbyTimeout time.Duration) time.Time {
+func (r *PGReader) handleStandbyTimeout(ctx context.Context, standbyTimeout time.Duration) (time.Time, error) {
 	if err := r.sendStandbyStatus(ctx, false); err != nil {
 		r.errs.Inc()
 		r.promMetrics.ReplicationErrors.Inc()
-		r.logger.Warn("send standby status failed", zap.Error(err))
+		return time.Time{}, fmt.Errorf("standby feedback: %w", err)
 	}
-	return time.Now().Add(standbyTimeout)
+	return time.Now().Add(standbyTimeout), nil
 }
 
 func (r *PGReader) sleepWithBackoff(ctx context.Context, backoff, max time.Duration) time.Duration {
@@ -560,6 +562,8 @@ func withJitter(base time.Duration) time.Duration {
 }
 
 func (r *PGReader) sendStandbyStatus(ctx context.Context, requestReply bool) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	lsn := r.currentAckedLSN()
 	if lsn == 0 && !requestReply {
 		return nil
@@ -635,4 +639,44 @@ func (r *PGReader) Ready(context.Context) error {
 }
 func (r *PGReader) Progress() (uint64, uint64, int64, int64) {
 	return r.receivedLSN.Load(), r.ackedLSN.Load(), r.lastReceived.Load(), r.lastAcked.Load()
+}
+
+// These waits run on the connection owner, so feedback never races ReceiveMessage.
+func (r *PGReader) acquireRaw(ctx context.Context, n int64, interval time.Duration, deadline *time.Time) (func(), error) {
+	for {
+		waitCtx, cancel := context.WithDeadline(ctx, *deadline)
+		release, err := r.rawBudget.Acquire(waitCtx, n)
+		cancel()
+		if err == nil {
+			return release, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return nil, fatalReplicationError{err}
+		}
+		if err := r.sendStandbyStatus(ctx, true); err != nil {
+			return nil, fmt.Errorf("feedback while waiting for raw budget: %w", err)
+		}
+		*deadline = time.Now().Add(interval)
+	}
+}
+func (r *PGReader) deliverRaw(ctx context.Context, out chan<- *parser.RawMessage, raw *parser.RawMessage, interval time.Duration, deadline *time.Time) error {
+	timer := time.NewTimer(time.Until(*deadline))
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- raw:
+			return nil
+		case <-timer.C:
+			if err := r.sendStandbyStatus(ctx, true); err != nil {
+				return fmt.Errorf("feedback while waiting for raw channel: %w", err)
+			}
+			*deadline = time.Now().Add(interval)
+			timer.Reset(time.Until(*deadline))
+		}
+	}
 }

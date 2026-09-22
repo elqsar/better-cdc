@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/checkpoint"
-	"better-cdc/internal/config"
-	"better-cdc/internal/engine"
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
-	"better-cdc/internal/publisher"
-	"better-cdc/internal/transformer"
-	"better-cdc/internal/wal"
+	"github.com/elqsar/better-cdc/internal/checkpoint"
+	"github.com/elqsar/better-cdc/internal/config"
+	"github.com/elqsar/better-cdc/internal/engine"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
+	"github.com/elqsar/better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/transformer"
+	"github.com/elqsar/better-cdc/internal/wal"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
@@ -334,7 +334,8 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 		})
 	}
 
-	trans := transformer.NewSimpleTransformer("postgres")
+	identity := model.Identity{SourceID: "integration", Slot: cfg.SlotName, Decoder: cfg.Plugin}
+	trans := transformer.NewSimpleTransformer("postgres", identity)
 
 	streamName := cfg.StreamName
 	if streamName == "" {
@@ -366,6 +367,7 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 	ckpt := checkpoint.NewManager(store, 1*time.Second, logger)
 
 	eng := engine.NewEngine(engine.Options{
+		Identity:          identity,
 		Reader:            reader,
 		Parser:            parse,
 		Transformer:       trans,

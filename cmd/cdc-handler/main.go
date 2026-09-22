@@ -3,23 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	cdc "github.com/elqsar/better-cdc"
+	"github.com/elqsar/better-cdc/internal/app"
+	"github.com/elqsar/better-cdc/internal/config"
+	"github.com/elqsar/better-cdc/internal/health"
+	"github.com/elqsar/better-cdc/internal/logging"
+	"github.com/elqsar/better-cdc/internal/publisher"
+	"go.uber.org/zap"
 	"os"
 	"os/signal"
 	"runtime"
-	"strings"
 	"syscall"
-	"time"
-
-	"better-cdc/internal/checkpoint"
-	"better-cdc/internal/config"
-	"better-cdc/internal/engine"
-	"better-cdc/internal/health"
-	"better-cdc/internal/logging"
-	"better-cdc/internal/parser"
-	"better-cdc/internal/publisher"
-	"better-cdc/internal/transformer"
-	"better-cdc/internal/wal"
-	"go.uber.org/zap"
 )
 
 func main() {
@@ -57,187 +51,24 @@ func main() {
 		}
 		return
 	}
-	if err := wal.Preflight(ctx, wal.SlotConfig{SlotName: cfg.SlotName, Plugin: cfg.Plugin, DatabaseURL: cfg.DatabaseURL, Publications: cfg.Publications}); err != nil {
-		logger.Error("replication preflight failed", zap.Error(err))
-		os.Exit(1)
-	}
-	spillDir, releaseSpill, err := parser.PrepareSpillDir(cfg.SpillDir, cfg.SlotName)
-	if err != nil {
-		logger.Error("spill storage unavailable", zap.Error(err))
-		os.Exit(1)
-	}
-	defer releaseSpill()
-	cfg.SpillDir = spillDir
-	tableFilter := buildTableFilter(cfg.TableFilters)
 
-	reader := wal.NewPGReader(wal.SlotConfig{
-		SlotName:         cfg.SlotName,
-		FeedbackInterval: cfg.CheckpointFreq, MaxBufferBytes: cfg.RawBufferBytes,
-		Plugin:       cfg.Plugin,
-		DatabaseURL:  cfg.DatabaseURL,
-		Publications: cfg.Publications,
-		TableFilter:  tableFilter,
-	}, cfg.RawMessageBufferSize, logger)
-
-	var parse parser.Parser
-	switch cfg.Plugin {
-	case "", "pgoutput":
-		parse = parser.NewPGOutputParser(parser.PGOutputConfig{
-			TableFilter:     tableFilter,
-			Logger:          logger,
-			BufferSize:      cfg.ParsedEventBufferSize,
-			MaxTxBufferSize: cfg.MaxTxBufferSize,
-			MaxBufferBytes:  cfg.ParsedBufferBytes, MaxTxBytes: cfg.MaxTxBytes, MaxSpillBytes: cfg.MaxSpillBytes, SpillDir: cfg.SpillDir,
-		})
-	default:
-		parse = parser.NewWal2JSONParser(parser.Wal2JSONConfig{
-			TableFilter:    tableFilter,
-			Logger:         logger,
-			BufferSize:     cfg.ParsedEventBufferSize,
-			MaxBufferBytes: cfg.ParsedBufferBytes,
-		})
-	}
-	trans := transformer.NewSimpleTransformer(cfg.Database)
-	pub, err := buildPublisher(cfg, logger)
+	runner, err := cdc.New(config.Group(cfg), cdc.WithLogger(logger))
 	if err != nil {
-		logger.Error("invalid publisher configuration", zap.Error(err))
+		logger.Error("invalid producer configuration", zap.Error(err))
 		os.Exit(1)
 	}
-	store := checkpoint.NewSlotStore(cfg.DatabaseURL, cfg.SlotName)
-	monitor := wal.NewMonitor(cfg.DatabaseURL, cfg.SlotName, reader)
-	go monitor.Run(ctx)
-	ckpt := checkpoint.NewManager(store, cfg.CheckpointFreq, logger)
-	if err := health.Start(ctx, health.Options{
-		Addr:        cfg.HealthAddr,
-		EnablePprof: cfg.EnablePprof,
-		Logger:      logger,
-		Readiness: []health.Check{
-			{
-				Name: "postgres",
-				Func: func(ctx context.Context) error {
-					if err := reader.Ready(ctx); err != nil {
-						return err
-					}
-					return monitor.Ready(ctx)
-				},
-			},
-			{
-				Name: "publisher",
-				Func: func(ctx context.Context) error {
-					ready, ok := pub.(interface {
-						Ready(context.Context) error
-					})
-					if !ok {
-						return nil
-					}
-					return ready.Ready(ctx)
-				},
-			},
-		},
+	if err := health.Start(ctx, health.Options{Addr: cfg.HealthAddr, EnablePprof: cfg.EnablePprof, Logger: logger,
+		MetricsHandler: runner.MetricsHandler(), Readiness: []health.Check{{Name: "producer", Func: runner.Ready}},
 	}); err != nil {
-		logger.Error("failed to start health server", zap.Error(err), zap.String("addr", cfg.HealthAddr))
+		logger.Error("health server failed", zap.Error(err))
 		os.Exit(1)
 	}
-	logger.Info("health server configured",
-		zap.String("health_endpoint", cfg.HealthAddr+"/health"),
-		zap.String("ready_endpoint", cfg.HealthAddr+"/ready"),
-		zap.String("metrics_endpoint", cfg.HealthAddr+"/metrics"),
-		zap.Bool("pprof_enabled", cfg.EnablePprof))
-
-	logger.Info("starting better-cdc",
-		zap.Bool("debug", cfg.Debug),
-		zap.Bool("profiling", cfg.EnableProfiling),
-		zap.Bool("allow_noop_publisher", cfg.AllowNoopPublisher),
-		zap.String("slot", cfg.SlotName),
-		zap.Strings("publications", cfg.Publications),
-		zap.String("db", cfg.Database),
-		zap.String("plugin", cfg.Plugin),
-		zap.Int("batch_size", cfg.BatchSize),
-		zap.Int("publish_async_max_pending", cfg.EffectivePublishAsyncMaxPending()),
-		zap.Bool("unsafe_unordered_async_publish", cfg.UnsafeUnorderedAsyncPublish),
-		zap.String("publish_failure_policy", cfg.PublishFailurePolicy),
-		zap.String("dlq_subject_prefix", cfg.DLQSubjectPrefix),
-		zap.Int("raw_buffer", cfg.RawMessageBufferSize),
-		zap.Int("parsed_buffer", cfg.ParsedEventBufferSize),
-		zap.Int("max_tx_buffer", cfg.MaxTxBufferSize))
-
-	eng := engine.NewEngine(engine.Options{
-		Reader:                      reader,
-		Parser:                      parse,
-		Transformer:                 trans,
-		Publisher:                   pub,
-		Checkpointer:                ckpt,
-		Database:                    cfg.Database,
-		BatchSize:                   cfg.BatchSize,
-		BatchTimeout:                cfg.BatchTimeout,
-		MaxPublishRetries:           cfg.MaxPublishRetries,
-		UnsafeUnorderedAsyncPublish: cfg.UnsafeUnorderedAsyncPublish,
-		FailurePolicy:               engine.FailurePolicy(cfg.PublishFailurePolicy),
-		DLQSubjectPrefix:            cfg.DLQSubjectPrefix,
-		Logger:                      logger,
-	})
-
-	startPos, err := store.Load(ctx)
-	if err != nil {
-		logger.Error("failed to load checkpoint", zap.Error(err))
-		os.Exit(1)
-	}
-	ckpt.Init(startPos, time.Now())
-
-	if err := eng.Run(ctx, startPos); err != nil {
+	if err := runner.Run(ctx); err != nil {
 		logger.Error("cdc engine stopped", zap.Error(err))
 		os.Exit(1)
 	}
 }
 
 func buildPublisher(cfg config.Config, logger *zap.Logger) (publisher.Publisher, error) {
-	urls := compactStrings(cfg.NATSURLs)
-	if len(urls) == 0 {
-		if !cfg.AllowNoopPublisher {
-			return nil, fmt.Errorf("NATS_URL is required unless ALLOW_NOOP_PUBLISHER=true")
-		}
-		logger.Warn("NATS URLs missing, using noop publisher because ALLOW_NOOP_PUBLISHER is enabled; all publishes will be dropped and readiness will fail")
-		return publisher.NewNoopPublisher(), nil
-	}
-	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
-		URLs:      urls,
-		EnableDLQ: cfg.PublishFailurePolicy == "dlq", DLQStream: cfg.DLQStream, DLQBucket: cfg.DLQBucket, DLQSubjectPrefix: cfg.DLQSubjectPrefix,
-		DLQMaxBytes: cfg.DLQMaxBytes, DLQIndexMaxBytes: cfg.DLQIndexMaxBytes,
-		CredentialsFile: cfg.NATSCredentialsFile, TLSCA: cfg.NATSTLSCA, TLSCert: cfg.NATSTLSCert, TLSKey: cfg.NATSTLSKey,
-		Username:               cfg.NATSUsername,
-		Password:               cfg.NATSPassword,
-		ConnectTimeout:         cfg.NATSTimeout,
-		PublishTimeout:         cfg.NATSTimeout,
-		PublishAsyncMaxPending: cfg.EffectivePublishAsyncMaxPending(),
-		StreamName:             cfg.StreamName,
-		StreamSubjects:         cfg.StreamSubjects,
-		StreamStorage:          cfg.StreamStorage,
-		StreamReplicas:         cfg.StreamReplicas,
-		StreamMaxAge:           cfg.StreamMaxAge,
-		DuplicateWindow:        cfg.DuplicateWindow,
-	}, logger), nil
-}
-
-func buildTableFilter(filters []string) map[string]struct{} {
-	if len(filters) == 0 {
-		return nil
-	}
-	out := make(map[string]struct{}, len(filters))
-	for _, f := range filters {
-		out[f] = struct{}{}
-	}
-	return out
-}
-
-func compactStrings(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
+	return app.BuildPublisher(cfg, logger, nil)
 }

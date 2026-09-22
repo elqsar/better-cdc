@@ -8,6 +8,7 @@ import (
 
 // Config captures minimal settings for initial wiring.
 type Config struct {
+	SourceID                                                     string
 	RawBufferBytes, ParsedBufferBytes, MaxTxBytes, MaxSpillBytes int64
 	SpillDir                                                     string
 	DLQStream, DLQBucket                                         string
@@ -112,6 +113,9 @@ func DefaultConfig() Config {
 
 // Validate rejects configuration values that would crash or degrade the engine.
 func (c Config) Validate() error {
+	if strings.TrimSpace(c.SourceID) == "" {
+		return fmt.Errorf("CDC_SOURCE_ID is required and must remain stable across restarts")
+	}
 	switch c.Plugin {
 	case "", "wal2json", "pgoutput":
 	default:

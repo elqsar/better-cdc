@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/publisher"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )

@@ -19,11 +19,12 @@ type Check struct {
 }
 
 type Options struct {
-	Addr         string
-	EnablePprof  bool
-	CheckTimeout time.Duration
-	Readiness    []Check
-	Logger       *zap.Logger
+	MetricsHandler http.Handler
+	Addr           string
+	EnablePprof    bool
+	CheckTimeout   time.Duration
+	Readiness      []Check
+	Logger         *zap.Logger
 }
 
 // NewHandler builds the health HTTP handler.
@@ -86,7 +87,11 @@ func NewHandler(opts Options) http.Handler {
 		mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
 	}
 
-	mux.Handle("/metrics", promhttp.Handler())
+	handler := opts.MetricsHandler
+	if handler == nil {
+		handler = promhttp.Handler()
+	}
+	mux.Handle("/metrics", handler)
 	return mux
 }
 

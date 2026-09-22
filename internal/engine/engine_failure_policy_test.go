@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/checkpoint"
-	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
-	"better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/checkpoint"
+	"github.com/elqsar/better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/publisher"
 
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"

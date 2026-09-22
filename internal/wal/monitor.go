@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"better-cdc/internal/metrics"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -94,10 +93,10 @@ func (m *Monitor) Run(ctx context.Context) {
 			var status string
 			err = conn.QueryRow(pollCtx, `SELECT coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(),restart_lsn),0)::bigint, coalesce(safe_wal_size,-1), active, coalesce(wal_status,'') FROM pg_replication_slots WHERE slot_name=$1`, m.slot).Scan(&retained, &safe, &active, &status)
 			if err == nil {
-				metrics.Pilot.RetainedWAL.Set(retained)
-				metrics.Pilot.SafeWAL.Set(safe)
-				metrics.Pilot.SlotActive.Set(boolInt(active))
-				metrics.Pilot.SlotLost.Set(boolInt(status == "lost" || status == "unreserved"))
+				m.reader.promMetrics.Pilot.RetainedWAL.Set(retained)
+				m.reader.promMetrics.Pilot.SafeWAL.Set(safe)
+				m.reader.promMetrics.Pilot.SlotActive.Set(boolInt(active))
+				m.reader.promMetrics.Pilot.SlotLost.Set(boolInt(status == "lost" || status == "unreserved"))
 				if status == "lost" {
 					err = fmt.Errorf("slot lost required WAL; operator recovery required")
 				}
@@ -109,10 +108,10 @@ func (m *Monitor) Run(ctx context.Context) {
 		}
 		cancel()
 		received, acked, lastReceive, lastAck := m.reader.Progress()
-		metrics.Pilot.ReceivedLSN.Set(int64(received))
-		metrics.Pilot.AckedLSN.Set(int64(acked))
-		metrics.Pilot.LastReceive.Set(lastReceive)
-		metrics.Pilot.LastAck.Set(lastAck)
+		m.reader.promMetrics.Pilot.ReceivedLSN.Set(int64(received))
+		m.reader.promMetrics.Pilot.AckedLSN.Set(int64(acked))
+		m.reader.promMetrics.Pilot.LastReceive.Set(lastReceive)
+		m.reader.promMetrics.Pilot.LastAck.Set(lastAck)
 		m.mu.Lock()
 		m.err = err
 		m.checked = time.Now()

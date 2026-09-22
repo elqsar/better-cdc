@@ -9,10 +9,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/metrics"
 
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
@@ -21,6 +22,10 @@ import (
 // JetStreamPublisher publishes messages to NATS JetStream with ack handling.
 // Implements both Publisher and BatchPublisher interfaces.
 type JetStreamPublisher struct {
+	closed        chan struct{}
+	closeOnce     sync.Once
+	ackWorkers    sync.WaitGroup
+	closing       chan struct{}
 	metricsCancel context.CancelFunc
 	metricsDone   chan struct{}
 	connected     atomic.Bool
@@ -35,6 +40,7 @@ type JetStreamPublisher struct {
 }
 
 type JetStreamOptions struct {
+	Metrics                                 *metrics.Metrics
 	EnableDLQ                               bool
 	DLQStream, DLQBucket, DLQSubjectPrefix  string
 	DLQMaxBytes, DLQIndexMaxBytes           int64
@@ -83,11 +89,12 @@ func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStream
 		opts.DLQIndexMaxBytes = 64 << 20
 	}
 	return &JetStreamPublisher{
+		closing: make(chan struct{}), closed: make(chan struct{}),
 		opts:         opts,
 		logger:       logger,
 		publishedCnt: metrics.NewCounter("jetstream_published"),
 		ackFailCnt:   metrics.NewCounter("jetstream_ack_failures"),
-		promMetrics:  metrics.GlobalMetrics,
+		promMetrics:  metrics.OrNew(opts.Metrics),
 	}
 }
 
@@ -97,6 +104,8 @@ func (p *JetStreamPublisher) Connect() error {
 	}
 	natsOpts := []nats.Option{
 		nats.Timeout(p.opts.ConnectTimeout),
+		nats.DrainTimeout(5 * time.Second),
+		nats.ClosedHandler(func(*nats.Conn) { close(p.closed) }),
 		nats.Name("better-cdc-publisher"),
 		nats.MaxReconnects(-1), // Retry forever
 		nats.ReconnectWait(2 * time.Second),
@@ -130,17 +139,17 @@ func (p *JetStreamPublisher) Connect() error {
 	}
 	js, err := nc.JetStream(nats.PublishAsyncMaxPending(p.publishAsyncMaxPending()))
 	if err != nil {
-		_ = nc.Drain()
+		nc.Close()
 		return fmt.Errorf("jetstream: %w", err)
 	}
 	p.nc = nc
 	p.js = js
 	if err := p.ensureStream(); err != nil {
-		_ = p.nc.Drain()
+		p.nc.Close()
 		return err
 	}
 	if err := p.ensureQuarantine(); err != nil {
-		_ = p.nc.Drain()
+		p.nc.Close()
 		return err
 	}
 	p.connected.Store(true)
@@ -222,11 +231,28 @@ func (p *JetStreamPublisher) Close() error {
 		p.metricsCancel()
 		<-p.metricsDone
 	}
-	if p.nc != nil {
-		p.logger.Info("closing nats connection")
-		return p.nc.Drain()
+	p.closeOnce.Do(func() {
+		if p.closing != nil {
+			close(p.closing)
+		}
+	})
+	p.ackWorkers.Wait()
+	if p.nc == nil || p.nc.IsClosed() {
+		return nil
 	}
-	return nil
+	if err := p.nc.Drain(); err != nil {
+		p.nc.Close()
+		return err
+	}
+	timer := time.NewTimer(6 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-p.closed:
+		return nil
+	case <-timer.C:
+		p.nc.Close()
+		return fmt.Errorf("publisher drain timed out")
+	}
 }
 
 func (p *JetStreamPublisher) Ready(ctx context.Context) error {
@@ -247,11 +273,11 @@ func (p *JetStreamPublisher) Ready(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		metrics.Pilot.DLQRecords.Set(int64(index.State.Msgs))
+		p.promMetrics.Pilot.DLQRecords.Set(int64(index.State.Msgs))
 		if index.State.Msgs > 0 {
-			metrics.Pilot.DLQOldest.Set(index.State.FirstTime.Unix())
+			p.promMetrics.Pilot.DLQOldest.Set(index.State.FirstTime.Unix())
 		} else {
-			metrics.Pilot.DLQOldest.Set(0)
+			p.promMetrics.Pilot.DLQOldest.Set(0)
 		}
 		if int64(index.State.Bytes) >= p.opts.DLQIndexMaxBytes {
 			return fmt.Errorf("DLQ index capacity exhausted")
@@ -260,7 +286,7 @@ func (p *JetStreamPublisher) Ready(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		metrics.Pilot.DLQBytes.Set(int64(bucket.State.Bytes))
+		p.promMetrics.Pilot.DLQBytes.Set(int64(bucket.State.Bytes))
 		if int64(bucket.State.Bytes) >= p.opts.DLQMaxBytes {
 			return fmt.Errorf("DLQ bucket capacity exhausted")
 		}
@@ -442,7 +468,8 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 		pending = append(pending, pend)
 
 		// Launch goroutine to await this specific ack
-		go p.awaitPendingAck(pend, pa, item.Subject)
+		p.ackWorkers.Add(1)
+		go func() { defer p.ackWorkers.Done(); p.awaitPendingAck(pend, pa, item.Subject) }()
 	}
 
 	return pending, nil
@@ -450,6 +477,8 @@ func (p *JetStreamPublisher) PublishBatchAsync(ctx context.Context, items []Publ
 
 func (p *JetStreamPublisher) awaitPendingAck(pend *PendingAck, pa nats.PubAckFuture, subject string) {
 	select {
+	case <-p.closing:
+		pend.complete(false, fmt.Errorf("publisher closed"))
 	case ack := <-pa.Ok():
 		if ack != nil {
 			pend.complete(true, nil)

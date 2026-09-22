@@ -13,13 +13,14 @@ import (
 	"github.com/jackc/pglogrepl"
 	"go.uber.org/zap"
 
-	"better-cdc/internal/budget"
-	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/budget"
+	"github.com/elqsar/better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/model"
 )
 
 // Wal2JSONConfig configures wal2json parsing.
 type Wal2JSONConfig struct {
+	Metrics        *metrics.Metrics
 	TableFilter    map[string]struct{} // schema.table allowlist; empty means all
 	Logger         *zap.Logger
 	MaxBufferBytes int64
@@ -48,7 +49,7 @@ func NewWal2JSONParser(cfg Wal2JSONConfig) *Wal2JSONParser {
 		logger:         logger,
 		bufferSize:     cfg.BufferSize,
 		maxBufferBytes: cfg.MaxBufferBytes,
-		promMetrics:    metrics.GlobalMetrics,
+		promMetrics:    metrics.OrNew(cfg.Metrics),
 	}
 }
 

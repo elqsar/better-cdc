@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/publisher"
 	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
 )
@@ -41,7 +41,7 @@ func pilotEnvironment(t *testing.T, db, slot, url, stream, plugin string) []stri
 	}
 	addr := listener.Addr().String()
 	_ = listener.Close()
-	return append(os.Environ(), "DATABASE_URL="+db, "CDC_SLOT_NAME="+slot, "CDC_PLUGIN="+plugin, "NATS_URL="+url, "STREAM_NAME="+stream,
+	return append(os.Environ(), "CDC_SOURCE_ID=integration", "DATABASE_URL="+db, "CDC_SLOT_NAME="+slot, "CDC_PLUGIN="+plugin, "NATS_URL="+url, "STREAM_NAME="+stream,
 		"HEALTH_ADDR="+addr, "SPILL_DIR="+t.TempDir(), "DEBUG=false", "PUBLISH_FAILURE_POLICY=dlq", "CDC_DATABASE_NAME=postgres",
 		"DLQ_STREAM_NAME="+stream+"_DLQ", "DLQ_BUCKET="+stream+"_RECOVERY", "DLQ_SUBJECT_PREFIX=cdc_dlq", "STREAM_SUBJECTS=cdc.>",
 		"CDC_PUBLICATIONS=better_cdc_pub", "DUPLICATE_WINDOW=1s", "STREAM_STORAGE=file", "STREAM_REPLICAS=1", "STREAM_MAX_AGE=72h",
@@ -55,13 +55,13 @@ type pilotProcess struct {
 	log    string
 }
 
-func startPilot(t *testing.T, binary string, env []string) *pilotProcess {
+func startPilot(t *testing.T, binary string, env []string, args ...string) *pilotProcess {
 	t.Helper()
 	log, err := os.CreateTemp(t.TempDir(), "process-*.log")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(binary)
+	cmd := exec.Command(binary, args...)
 	cmd.Env = env
 	cmd.Stdout = log
 	cmd.Stderr = log

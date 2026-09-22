@@ -3,16 +3,17 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
-	"better-cdc/internal/checkpoint"
-	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
-	"better-cdc/internal/publisher"
-	"better-cdc/internal/transformer"
-	"better-cdc/internal/wal"
+	"github.com/elqsar/better-cdc/internal/checkpoint"
+	"github.com/elqsar/better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
+	"github.com/elqsar/better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/transformer"
+	"github.com/elqsar/better-cdc/internal/wal"
 
 	"go.uber.org/zap"
 )
@@ -39,6 +40,7 @@ const (
 
 // Engine coordinates the end-to-end CDC flow.
 type Engine struct {
+	identity                    model.Identity
 	reader                      wal.Reader
 	parser                      parser.Parser
 	transformer                 transformer.Transformer
@@ -62,6 +64,8 @@ type Engine struct {
 
 // Options configures an Engine. Every field is required except Logger.
 type Options struct {
+	Metrics                     *metrics.Metrics
+	Identity                    model.Identity
 	Reader                      wal.Reader
 	Parser                      parser.Parser
 	Transformer                 transformer.Transformer
@@ -83,6 +87,7 @@ func NewEngine(opts Options) *Engine {
 		logger = zap.NewNop()
 	}
 	return &Engine{
+		identity:                    opts.Identity,
 		reader:                      opts.Reader,
 		parser:                      opts.Parser,
 		transformer:                 opts.Transformer,
@@ -97,40 +102,80 @@ func NewEngine(opts Options) *Engine {
 		dlqSubjectPrefix:            opts.DLQSubjectPrefix,
 		logger:                      logger,
 		eventsProcessed:             metrics.NewRateCounter("events_per_second"),
-		promMetrics:                 metrics.GlobalMetrics,
+		promMetrics:                 metrics.OrNew(opts.Metrics),
 	}
 }
 
 // Run starts streaming from the provided WAL position.
-func (e *Engine) Run(ctx context.Context, start model.WALPosition) error {
+func (e *Engine) Run(ctx context.Context, start model.WALPosition) (runErr error) {
 	sessionCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
-	e.logger.Info("engine starting", zap.String("start_lsn", start.LSN), zap.Int("batch_size", e.batchSize), zap.Duration("batch_timeout", e.batchTimeout))
 	if err := e.reader.Start(ctx); err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return nil
+		}
 		return fmt.Errorf("start reader: %w", err)
 	}
+	var rawStream <-chan *parser.RawMessage
+	var parsedStream <-chan *model.WALEvent
+	var connected bool
 	defer func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), e.shutdownTimeout())
-		defer cancel()
-		_ = e.reader.Stop(stopCtx)
+		cancel()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), e.shutdownTimeout())
+		defer stopCancel()
+		runErr = errors.Join(runErr, e.reader.Stop(stopCtx))
+		// Waiting for the parser's output to close joins its worker; then the raw
+		// stream is no longer consumed by anyone else and its reservations can drain.
+		for parsedStream != nil {
+			select {
+			case evt, ok := <-parsedStream:
+				if !ok {
+					parsedStream = nil
+				} else {
+					model.ReleaseWALEvent(evt)
+				}
+			case <-stopCtx.Done():
+				runErr = errors.Join(runErr, fmt.Errorf("parser shutdown: %w", stopCtx.Err()))
+				parsedStream = nil
+				// A live parser still owns rawStream; don't race its drain.
+				rawStream = nil
+			}
+		}
+		for rawStream != nil {
+			select {
+			case msg, ok := <-rawStream:
+				if !ok {
+					rawStream = nil
+				} else if msg != nil && msg.ReleaseBytes != nil {
+					msg.ReleaseBytes()
+				}
+			case <-stopCtx.Done():
+				runErr = errors.Join(runErr, fmt.Errorf("reader shutdown: %w", stopCtx.Err()))
+				rawStream = nil
+			}
+		}
+		if connected {
+			runErr = errors.Join(runErr, e.publisher.Close())
+		}
 	}()
-
-	rawStream, err := e.reader.ReadWAL(sessionCtx, start)
+	var err error
+	rawStream, err = e.reader.ReadWAL(sessionCtx, start)
 	if err != nil {
 		return fmt.Errorf("read wal: %w", err)
 	}
-
-	parsedStream, err := e.parser.Parse(sessionCtx, rawStream)
+	parsedStream, err = e.parser.Parse(sessionCtx, rawStream)
 	if err != nil {
 		return fmt.Errorf("parse wal: %w", err)
 	}
-
 	if err := e.publisher.Connect(); err != nil {
 		return fmt.Errorf("publisher connect: %w", err)
 	}
-	defer e.publisher.Close() //nolint:errcheck
-
-	return e.runBatched(ctx, parsedStream)
+	connected = true
+	err = e.runBatched(ctx, parsedStream)
+	if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return nil
+	}
+	return err
 }
 
 func (e *Engine) runBatched(ctx context.Context, stream <-chan *model.WALEvent) error {
@@ -251,6 +296,7 @@ func (e *Engine) quarantinesPoison() bool {
 // crashing rather than dropping the event silently.
 func (e *Engine) quarantine(ctx context.Context, rec *publisher.DeadLetterRecord) error {
 	rec.Database = e.database
+	rec.Identity = e.identity
 	rec.QuarantinedAt = time.Now()
 	if e.failurePolicy == FailurePolicyDLQ {
 		if err := publisher.PublishDeadLetter(ctx, e.publisher, e.dlqSubjectPrefix, rec); err != nil {
@@ -321,6 +367,7 @@ func (e *Engine) prepareFailure(ctx context.Context, evt *model.WALEvent, cause 
 // preparation failure was quarantined and the caller should move on; a non-nil
 // error means the engine must stop.
 func (e *Engine) prepareItem(ctx context.Context, evt *model.WALEvent) (item publisher.PublishItem, skip bool, err error) {
+	evt.Identity = e.identity
 	transformStart := time.Now()
 	cdcEvt, err := e.transformer.Transform(ctx, evt)
 	e.promMetrics.TransformLatency.Observe(uint64(time.Since(transformStart).Nanoseconds()))

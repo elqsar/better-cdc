@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
 )
 
 // BenchmarkSubjectForEvent benchmarks subject string construction

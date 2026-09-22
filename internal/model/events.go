@@ -38,7 +38,14 @@ type RecoveryChange struct {
 	SeqInTx    uint32          `json:"seq_in_tx"`
 }
 
+type Identity struct {
+	SourceID string `json:"source_id"`
+	Slot     string `json:"slot"`
+	Decoder  string `json:"decoder"`
+}
+
 type WALEvent struct {
+	Identity          Identity
 	Recovery          *RecoveryChange
 	UnavailableBefore []string
 	UnavailableAfter  []string
@@ -92,6 +99,7 @@ func ReleaseWALEvent(evt *WALEvent) {
 		evt.ReleaseBytes()
 		evt.ReleaseBytes = nil
 	}
+	evt.Identity = Identity{}
 	evt.Recovery = nil
 	evt.UnavailableBefore = nil
 	evt.UnavailableAfter = nil
@@ -132,6 +140,7 @@ func ReleaseWALEvent(evt *WALEvent) {
 
 // CDCEvent is the normalized event ready for publication.
 type CDCEvent struct {
+	SourceID      string                 `json:"source_id,omitempty"`
 	SchemaVersion int                    `json:"schema_version"`
 	SeqInTx       uint32                 `json:"seq_in_tx"`
 	EventID       string                 `json:"event_id"`
@@ -168,6 +177,7 @@ func ReleaseCDCEvent(evt *CDCEvent) {
 		return
 	}
 	// Reset all fields
+	evt.SourceID = ""
 	evt.SchemaVersion = 0
 	evt.SeqInTx = 0
 	evt.EventID = ""

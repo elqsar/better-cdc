@@ -12,6 +12,7 @@ import (
 // Load reads configuration from environment variables, falling back to defaults.
 func Load() (Config, error) {
 	cfg := DefaultConfig()
+	cfg.SourceID = os.Getenv("CDC_SOURCE_ID")
 
 	if v := os.Getenv("CDC_SLOT_NAME"); v != "" {
 		cfg.SlotName = v

@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"better-cdc/internal/model"
-	"better-cdc/internal/subject"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/subject"
 
 	"go.uber.org/zap"
 )

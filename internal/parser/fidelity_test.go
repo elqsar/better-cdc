@@ -6,7 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/transformer"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -162,5 +163,48 @@ func TestKeyOnlyBeforeDoesNotInventNulls(t *testing.T) {
 	}
 	if len(events[0].UnavailableBefore) != 1 || events[0].UnavailableBefore[0] != "value" {
 		t.Fatal("missing unavailable column metadata")
+	}
+}
+
+func TestIdentitySurvivesSpillAndRecovery(t *testing.T) {
+	identity := model.Identity{SourceID: "a", Slot: "slot", Decoder: "pgoutput"}
+	var baseline []string
+	for _, limit := range []int{100, 1} {
+		p := NewPGOutputParser(PGOutputConfig{MaxTxBufferSize: limit, SpillDir: t.TempDir()})
+		p.tx = &txBuffer{xid: 7}
+		p.relations[1] = relationInfo{ID: 1, Schema: "public", Table: "t", Columns: []string{"value"}, ColumnTypes: []uint32{pgtype.TextOID}}
+		out := make(chan *model.WALEvent, 4)
+		for _, value := range []string{"first", "second"} {
+			raw := encodeInsertMessage(1, value)
+			logical, err := parseLogical(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.handlePGOutputMessage(context.Background(), raw, logical, out); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := p.handlePGOutputMessage(context.Background(), nil, &pglogrepl.CommitMessage{CommitLSN: 42, TransactionEndLSN: 43}, out); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			evt := <-out
+			id := transformer.EventIDFor(identity, evt)
+			if limit == 100 {
+				baseline = append(baseline, id)
+			} else if id != baseline[i] {
+				t.Fatal("spill changed ID")
+			}
+			restored, err := RestoreChange(evt.Recovery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if transformer.EventIDFor(identity, restored) != id {
+				t.Fatal("capsule reconstruction changed ID")
+			}
+			model.ReleaseWALEvent(restored)
+			model.ReleaseWALEvent(evt)
+		}
+		model.ReleaseWALEvent(<-out)
 	}
 }

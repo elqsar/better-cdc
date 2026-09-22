@@ -5,7 +5,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
 )
 
 // Plugin enumerates supported logical decoding plugins.

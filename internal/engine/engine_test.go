@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/checkpoint"
-	"better-cdc/internal/metrics"
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
-	"better-cdc/internal/publisher"
-	"better-cdc/internal/wal"
+	"github.com/elqsar/better-cdc/internal/checkpoint"
+	"github.com/elqsar/better-cdc/internal/metrics"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
+	"github.com/elqsar/better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/wal"
 
 	"go.uber.org/zap"
 )
@@ -71,7 +71,7 @@ var (
 
 func getTestMetrics() *metrics.Metrics {
 	testMetricsOnce.Do(func() {
-		testMetrics = metrics.GlobalMetrics
+		testMetrics = metrics.NewMetrics()
 	})
 	return testMetrics
 }

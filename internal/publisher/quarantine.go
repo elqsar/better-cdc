@@ -11,7 +11,7 @@ import (
 	"io"
 	"time"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
 	"github.com/nats-io/nats.go"
 )
 
@@ -19,6 +19,7 @@ import (
 var quarantineStage = func(string) {}
 
 type RecoveryObject struct {
+	Identity model.Identity        `json:"identity,omitempty"`
 	Version  int                   `json:"version"`
 	EventID  string                `json:"event_id"`
 	Database string                `json:"database"`
@@ -77,7 +78,11 @@ func (p *JetStreamPublisher) Quarantine(ctx context.Context, prefix string, rec 
 	if rec.EventID == "" || (len(rec.Payload) == 0 && rec.Recovery == nil) {
 		return fmt.Errorf("missing complete recovery data")
 	}
-	object := RecoveryObject{Version: 1, EventID: rec.EventID, Database: rec.Database, Subject: rec.Subject, Payload: rec.Payload, Recovery: rec.Recovery}
+	version := 1
+	if rec.Identity.SourceID != "" {
+		version = 2
+	}
+	object := RecoveryObject{Version: version, Identity: rec.Identity, EventID: rec.EventID, Database: rec.Database, Subject: rec.Subject, Payload: rec.Payload, Recovery: rec.Recovery}
 	data, err := json.Marshal(object)
 	if err != nil {
 		return err
@@ -143,8 +148,11 @@ func (p *JetStreamPublisher) LoadRecovery(ctx context.Context, index DeadLetterR
 	if err = json.Unmarshal(data, &obj); err != nil {
 		return nil, err
 	}
-	if obj.Version != 1 || obj.EventID != index.EventID || obj.Database != index.Database {
+	if (obj.Version != 1 && obj.Version != 2) || obj.EventID != index.EventID || obj.Database != index.Database {
 		return nil, fmt.Errorf("recovery identity/version mismatch")
+	}
+	if obj.Version == 2 && (obj.Identity.SourceID == "" || obj.Identity.Slot == "" || obj.Identity.Decoder == "" || obj.Identity != index.Identity) {
+		return nil, fmt.Errorf("recovery source identity mismatch")
 	}
 	return &obj, nil
 }
@@ -177,12 +185,15 @@ func (p *JetStreamPublisher) WalkDLQ(ctx context.Context, visit func(uint64, Dea
 // RedriveDLQ uses one persistent consumer; a crash after publish but before its
 // acknowledgement can replay the original EventID, so downstream dedup remains required.
 func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, publish func(context.Context, *RecoveryObject) error) error {
-	_, err := p.js.ConsumerInfo(p.opts.DLQStream, "redrive", nats.Context(ctx))
+	info, err := p.js.ConsumerInfo(p.opts.DLQStream, "redrive", nats.Context(ctx))
 	if errors.Is(err, nats.ErrConsumerNotFound) {
-		_, err = p.js.AddConsumer(p.opts.DLQStream, &nats.ConsumerConfig{Durable: "redrive", FilterSubject: p.opts.DLQSubjectPrefix + ".>", AckPolicy: nats.AckExplicitPolicy, MaxAckPending: 1, AckWait: 5 * time.Minute}, nats.Context(ctx))
+		info, err = p.js.AddConsumer(p.opts.DLQStream, &nats.ConsumerConfig{Durable: "redrive", FilterSubject: p.opts.DLQSubjectPrefix + ".>", AckPolicy: nats.AckExplicitPolicy, MaxAckPending: 1, AckWait: 5 * time.Minute}, nats.Context(ctx))
 	}
 	if err != nil {
 		return err
+	}
+	if info.Config.AckPolicy != nats.AckExplicitPolicy || info.Config.MaxAckPending != 1 || info.Config.FilterSubject != p.opts.DLQSubjectPrefix+".>" || info.Config.DeliverSubject != "" {
+		return fmt.Errorf("redrive consumer requires explicit acknowledgements, one outstanding message, and the configured pull filter")
 	}
 	sub, err := p.js.PullSubscribe(p.opts.DLQSubjectPrefix+".>", "redrive", nats.Bind(p.opts.DLQStream, "redrive"))
 	if err != nil {
@@ -190,16 +201,33 @@ func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, publish func(contex
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 	for {
-		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
-		if errors.Is(err, nats.ErrTimeout) {
-			return nil
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		fetchCtx, cancel := context.WithTimeout(ctx, time.Second)
+		msgs, err := sub.Fetch(1, nats.Context(fetchCtx))
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			info, err := p.js.ConsumerInfo(p.opts.DLQStream, "redrive", nats.Context(ctx))
+			if err != nil {
+				return err
+			}
+			if info.NumPending == 0 && info.NumAckPending == 0 {
+				return nil
+			}
+			continue
 		}
 		if err != nil {
 			return err
 		}
 		msg := msgs[0]
+		quarantineStage("redrive_delivered")
 		var rec DeadLetterRecord
 		if err = json.Unmarshal(msg.Data, &rec); err != nil {
+			_ = msg.Nak()
 			return err
 		}
 		object, err := p.LoadRecovery(ctx, rec)

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
 
 	"go.uber.org/zap"
 )

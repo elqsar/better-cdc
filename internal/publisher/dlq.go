@@ -6,13 +6,14 @@ import (
 	"strings"
 	"time"
 
-	"better-cdc/internal/model"
-	"better-cdc/internal/subject"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/subject"
 )
 
 // DeadLetterRecord retains a complete event or a value-independent replay capsule.
 // Payload and Recovery live in Object Store, never inside the small index message.
 type DeadLetterRecord struct {
+	Identity      model.Identity        `json:"identity,omitempty"`
 	EventID       string                `json:"event_id"`
 	Subject       string                `json:"subject"`
 	Database      string                `json:"database"`

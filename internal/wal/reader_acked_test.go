@@ -7,14 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestPGReader_SetAckedPosition_Monotonic(t *testing.T) {
@@ -314,15 +313,14 @@ func TestPGReader_LoopPGOutput_DoesNotSendStandbyStatusOnReceiveTimeoutWhenAckIs
 	}
 }
 
-func TestPGReader_LoopPGOutput_LogsAndContinuesWhenIdleStandbyStatusFails(t *testing.T) {
+func TestPGReader_LoopPGOutput_ReconnectsWhenIdleStandbyStatusFails(t *testing.T) {
 	restoreReceive, restoreSend, restoreTimeoutCheck, restoreTimeout := stubReplicationTimeoutHooks(t, 5*time.Millisecond)
 	defer restoreReceive()
 	defer restoreSend()
 	defer restoreTimeoutCheck()
 	defer restoreTimeout()
 
-	core, logs := observer.New(zap.WarnLevel)
-	r := NewPGReader(SlotConfig{}, 0, zap.New(core))
+	r := NewPGReader(SlotConfig{}, 0, zap.NewNop())
 	r.conn = &pgconn.PgConn{}
 	acked, _ := pglogrepl.ParseLSN("0/42")
 	r.setAckedLSN(acked)
@@ -349,23 +347,17 @@ func TestPGReader_LoopPGOutput_LogsAndContinuesWhenIdleStandbyStatusFails(t *tes
 	}
 
 	lastLSN, err := r.loopPGOutput(ctx, 0, make(chan *parser.RawMessage))
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context canceled, got %v", err)
+	if !errors.Is(err, wantErr) || isFatalReplicationError(err) {
+		t.Fatalf("expected retryable feedback error, got %v", err)
 	}
 	if lastLSN != acked {
 		t.Fatalf("lastLSN = %s, want %s", lastLSN, acked)
 	}
-	if calls != 2 {
-		t.Fatalf("expected loop to continue after timeout send failure, got %d receive calls", calls)
+	if calls != 1 {
+		t.Fatalf("expected immediate reconnect, got %d receives", calls)
 	}
 	if r.errs.Value() != 1 {
 		t.Fatalf("expected replication error counter to be 1, got %d", r.errs.Value())
-	}
-	if logs.Len() != 1 {
-		t.Fatalf("expected 1 warning log, got %d", logs.Len())
-	}
-	if logs.All()[0].Message != "send standby status failed" {
-		t.Fatalf("unexpected warning message %q", logs.All()[0].Message)
 	}
 }
 
