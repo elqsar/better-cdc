@@ -2,12 +2,15 @@ package transformer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
 )
 
 var stringBuilderPool = sync.Pool{
@@ -23,11 +26,16 @@ type Transformer interface {
 
 // SimpleTransformer constructs a CDCEvent with deterministic EventID using lsn:txid:op:table:seq.
 type SimpleTransformer struct {
-	source string
+	source   string
+	identity model.Identity
 }
 
-func NewSimpleTransformer(source string) *SimpleTransformer {
-	return &SimpleTransformer{source: source}
+func NewSimpleTransformer(source string, identity ...model.Identity) *SimpleTransformer {
+	t := &SimpleTransformer{source: source}
+	if len(identity) > 0 {
+		t.identity = identity[0]
+	}
+	return t
 }
 
 func (t *SimpleTransformer) Transform(ctx context.Context, evt *model.WALEvent) (*model.CDCEvent, error) {
@@ -40,7 +48,23 @@ func (t *SimpleTransformer) Transform(ctx context.Context, evt *model.WALEvent) 
 	cdcEvt := model.AcquireCDCEvent()
 
 	// Build EventID with strings.Builder for efficiency
-	cdcEvt.EventID = buildEventID(evt)
+	identity := evt.Identity
+	if identity.SourceID == "" {
+		identity = t.identity
+	}
+	cdcEvt.EventID = EventIDFor(identity, evt)
+	cdcEvt.SchemaVersion = 1
+	if identity.SourceID != "" {
+		cdcEvt.SchemaVersion = 2
+		cdcEvt.SourceID = identity.SourceID
+	}
+	cdcEvt.SeqInTx = evt.SeqInTx
+	if len(evt.UnavailableBefore) > 0 {
+		cdcEvt.Metadata["unavailable_before"] = evt.UnavailableBefore
+	}
+	if len(evt.UnavailableAfter) > 0 {
+		cdcEvt.Metadata["unavailable_after"] = evt.UnavailableAfter
+	}
 	cdcEvt.EventType = eventType(evt.Operation)
 	cdcEvt.Source = t.source
 	cdcEvt.Timestamp = evt.Timestamp
@@ -103,4 +127,17 @@ func buildEventID(evt *model.WALEvent) string {
 	sb.WriteString(strconv.FormatUint(uint64(evt.SeqInTx), 10))
 
 	return sb.String()
+}
+
+// EventID returns the identity used for publication and recovery.
+func EventID(evt *model.WALEvent) string { return EventIDFor(evt.Identity, evt) }
+
+// EventIDFor preserves legacy IDs only when reconstructing legacy records.
+func EventIDFor(identity model.Identity, evt *model.WALEvent) string {
+	if identity.SourceID == "" {
+		return buildEventID(evt)
+	}
+	data, _ := json.Marshal([]any{identity.SourceID, identity.Slot, identity.Decoder, evt.LSN, evt.TxID, string(evt.Operation), evt.Schema, evt.Table, evt.SeqInTx})
+	sum := sha256.Sum256(data)
+	return "v2:" + hex.EncodeToString(sum[:])
 }

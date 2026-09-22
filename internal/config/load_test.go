@@ -99,8 +99,8 @@ func TestLoad_DefaultPublishFailurePolicyUsesDLQ(t *testing.T) {
 	if cfg.PublishFailurePolicy != "dlq" {
 		t.Fatalf("expected default PublishFailurePolicy %q, got %q", "dlq", cfg.PublishFailurePolicy)
 	}
-	if cfg.DLQSubjectPrefix != "cdc.dlq" {
-		t.Fatalf("expected default DLQSubjectPrefix %q, got %q", "cdc.dlq", cfg.DLQSubjectPrefix)
+	if cfg.DLQSubjectPrefix != "cdc_dlq" {
+		t.Fatalf("expected default DLQSubjectPrefix %q, got %q", "cdc_dlq", cfg.DLQSubjectPrefix)
 	}
 }
 
@@ -120,6 +120,7 @@ func TestLoad_PublishFailurePolicyOverride(t *testing.T) {
 
 func TestConfigEffectivePublishAsyncMaxPending_UsesBatchSizeWhenLarger(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.BatchSize = 500
 	cfg.PublishAsyncMaxPending = 0
 
@@ -130,6 +131,7 @@ func TestConfigEffectivePublishAsyncMaxPending_UsesBatchSizeWhenLarger(t *testin
 
 func TestConfigEffectivePublishAsyncMaxPending_UsesFloorWhenBatchSizeIsZero(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.BatchSize = 0
 	cfg.PublishAsyncMaxPending = 0
 
@@ -140,6 +142,7 @@ func TestConfigEffectivePublishAsyncMaxPending_UsesFloorWhenBatchSizeIsZero(t *t
 
 func TestConfigEffectivePublishAsyncMaxPending_UsesExplicitOverride(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.BatchSize = 500
 	cfg.PublishAsyncMaxPending = 64
 
@@ -150,6 +153,7 @@ func TestConfigEffectivePublishAsyncMaxPending_UsesExplicitOverride(t *testing.T
 
 func TestConfigValidate_RejectsNegativeBatchSize(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.BatchSize = -1
 
 	err := cfg.Validate()
@@ -160,6 +164,7 @@ func TestConfigValidate_RejectsNegativeBatchSize(t *testing.T) {
 
 func TestConfigValidate_AllowsZeroBatchSize(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.BatchSize = 0
 
 	if err := cfg.Validate(); err != nil {
@@ -169,6 +174,7 @@ func TestConfigValidate_AllowsZeroBatchSize(t *testing.T) {
 
 func TestConfigValidate_RejectsNegativePublishAsyncMaxPending(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.PublishAsyncMaxPending = -1
 
 	err := cfg.Validate()
@@ -177,7 +183,7 @@ func TestConfigValidate_RejectsNegativePublishAsyncMaxPending(t *testing.T) {
 	}
 }
 
-func TestConfigValidate_AcceptsDLQSubjectCoveredByStreamSubjects(t *testing.T) {
+func TestConfigValidate_AcceptsSeparateDLQSubjects(t *testing.T) {
 	tests := []struct {
 		name           string
 		streamSubjects []string
@@ -190,6 +196,7 @@ func TestConfigValidate_AcceptsDLQSubjectCoveredByStreamSubjects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := DefaultConfig()
+			cfg.SourceID = "test"
 			cfg.StreamSubjects = tt.streamSubjects
 
 			if err := cfg.Validate(); err != nil {
@@ -199,31 +206,20 @@ func TestConfigValidate_AcceptsDLQSubjectCoveredByStreamSubjects(t *testing.T) {
 	}
 }
 
-func TestConfigValidate_RejectsDLQSubjectOutsideStreamSubjects(t *testing.T) {
-	tests := []struct {
-		name           string
-		streamSubjects []string
-		dlqPrefix      string
-	}{
-		{name: "original cdc stream only", streamSubjects: []string{"cdc.postgres.>"}, dlqPrefix: "cdc.dlq"},
-		{name: "different root", streamSubjects: []string{"cdc.>"}, dlqPrefix: "dead.cdc"},
-		{name: "too narrow schema", streamSubjects: []string{"cdc.dlq.postgres.public.*"}, dlqPrefix: "cdc.dlq"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			cfg.StreamSubjects = tt.streamSubjects
-			cfg.DLQSubjectPrefix = tt.dlqPrefix
-
-			if err := cfg.Validate(); err == nil {
-				t.Fatal("expected validation error for uncovered DLQ subject")
-			}
-		})
+func TestConfigValidate_RejectsOverlappingDLQSubjects(t *testing.T) {
+	for _, filter := range []string{"cdc_dlq.>", ">", "*.>", "cdc_dlq.postgres.public.*"} {
+		cfg := DefaultConfig()
+		cfg.SourceID = "test"
+		cfg.StreamSubjects = []string{filter}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("accepted overlap %s", filter)
+		}
 	}
 }
 
 func TestConfigValidate_DoesNotRequireDLQSubjectCoverageWhenPolicyCrashes(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.PublishFailurePolicy = "crash"
 	cfg.StreamSubjects = []string{"cdc.postgres.>"}
 	cfg.DLQSubjectPrefix = "dead.cdc"
@@ -267,6 +263,7 @@ func TestLoad_RejectsInvalidUnsafeUnorderedAsyncPublish(t *testing.T) {
 
 func TestConfigValidate_RejectsInvalidPlugin(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.Plugin = "decoderbufs"
 
 	if err := cfg.Validate(); err == nil {
@@ -276,6 +273,7 @@ func TestConfigValidate_RejectsInvalidPlugin(t *testing.T) {
 
 func TestConfigValidate_RejectsNonPositiveBatchTimeout(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.BatchTimeout = 0
 
 	if err := cfg.Validate(); err == nil {
@@ -285,6 +283,7 @@ func TestConfigValidate_RejectsNonPositiveBatchTimeout(t *testing.T) {
 
 func TestConfigValidate_RejectsNegativeBufferSize(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.RawMessageBufferSize = -1
 
 	if err := cfg.Validate(); err == nil {
@@ -294,6 +293,7 @@ func TestConfigValidate_RejectsNegativeBufferSize(t *testing.T) {
 
 func TestConfigValidate_RejectsInvalidStreamStorage(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.StreamStorage = "disk"
 
 	if err := cfg.Validate(); err == nil {
@@ -303,6 +303,7 @@ func TestConfigValidate_RejectsInvalidStreamStorage(t *testing.T) {
 
 func TestConfigValidate_RejectsNonPositiveStreamReplicas(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.SourceID = "test"
 	cfg.StreamReplicas = 0
 
 	if err := cfg.Validate(); err == nil {

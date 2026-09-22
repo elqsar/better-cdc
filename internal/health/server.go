@@ -19,11 +19,12 @@ type Check struct {
 }
 
 type Options struct {
-	Addr         string
-	EnablePprof  bool
-	CheckTimeout time.Duration
-	Readiness    []Check
-	Logger       *zap.Logger
+	MetricsHandler http.Handler
+	Addr           string
+	EnablePprof    bool
+	CheckTimeout   time.Duration
+	Readiness      []Check
+	Logger         *zap.Logger
 }
 
 // NewHandler builds the health HTTP handler.
@@ -39,7 +40,7 @@ func NewHandler(opts Options) http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, request *http.Request) {
 		if len(opts.Readiness) == 0 {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ready"))
@@ -51,7 +52,7 @@ func NewHandler(opts Options) http.Handler {
 			if check.Func == nil {
 				continue
 			}
-			checkCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			checkCtx, cancel := context.WithTimeout(request.Context(), timeout)
 			err := check.Func(checkCtx)
 			cancel()
 			if err != nil {
@@ -86,7 +87,11 @@ func NewHandler(opts Options) http.Handler {
 		mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
 	}
 
-	mux.Handle("/metrics", promhttp.Handler())
+	handler := opts.MetricsHandler
+	if handler == nil {
+		handler = promhttp.Handler()
+	}
+	mux.Handle("/metrics", handler)
 	return mux
 }
 
@@ -106,13 +111,17 @@ func Start(ctx context.Context, opts Options) error {
 	}
 
 	srv := &http.Server{
-		Addr:    ln.Addr().String(),
-		Handler: NewHandler(opts),
+		Addr:              ln.Addr().String(),
+		Handler:           NewHandler(opts),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	go func() {
 		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
 	}()
 
 	go func() {

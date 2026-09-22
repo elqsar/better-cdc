@@ -12,6 +12,7 @@ import (
 // Load reads configuration from environment variables, falling back to defaults.
 func Load() (Config, error) {
 	cfg := DefaultConfig()
+	cfg.SourceID = os.Getenv("CDC_SOURCE_ID")
 
 	if v := os.Getenv("CDC_SLOT_NAME"); v != "" {
 		cfg.SlotName = v
@@ -186,6 +187,32 @@ func Load() (Config, error) {
 		cfg.EnablePprof = enabled
 	}
 
+	for name, target := range map[string]*int64{
+		"RAW_MESSAGE_BUFFER_BYTES": &cfg.RawBufferBytes, "PARSED_EVENT_BUFFER_BYTES": &cfg.ParsedBufferBytes,
+		"MAX_TX_BUFFER_BYTES": &cfg.MaxTxBytes, "MAX_SPILL_BYTES": &cfg.MaxSpillBytes,
+		"DLQ_MAX_BYTES": &cfg.DLQMaxBytes, "DLQ_INDEX_MAX_BYTES": &cfg.DLQIndexMaxBytes,
+	} {
+		if v := os.Getenv(name); v != "" {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return cfg, fmt.Errorf("%s must be an integer", name)
+			}
+			*target = n
+		}
+	}
+	cfg.SpillDir = os.Getenv("SPILL_DIR")
+	cfg.NATSCredentialsFile = os.Getenv("NATS_CREDENTIALS_FILE")
+	cfg.NATSTLSCA = os.Getenv("NATS_TLS_CA")
+	cfg.NATSTLSCert = os.Getenv("NATS_TLS_CERT")
+	cfg.NATSTLSKey = os.Getenv("NATS_TLS_KEY")
+	cfg.DLQStream = cfg.StreamName + "_DLQ"
+	cfg.DLQBucket = cfg.StreamName + "_RECOVERY"
+	if v := os.Getenv("DLQ_STREAM_NAME"); v != "" {
+		cfg.DLQStream = v
+	}
+	if v := os.Getenv("DLQ_BUCKET"); v != "" {
+		cfg.DLQBucket = v
+	}
 	return cfg, nil
 }
 

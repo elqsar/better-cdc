@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/model"
 
 	"github.com/jackc/pglogrepl"
 	"go.uber.org/zap"
@@ -36,6 +36,7 @@ func TestPGOutputParser_CommitIncludesPosition(t *testing.T) {
 	case evt := <-out:
 		if evt == nil {
 			t.Fatal("expected commit event, got nil")
+			return
 		}
 		if !evt.Commit {
 			t.Fatalf("expected commit event, got %+v", evt)
@@ -73,6 +74,7 @@ func TestPGOutputParser_CommitUsesTransactionEndLSNForCheckpointPosition(t *test
 	case evt := <-out:
 		if evt == nil {
 			t.Fatal("expected commit event, got nil")
+			return
 		}
 		if evt.Position.LSN != endLSN.String() {
 			t.Fatalf("unexpected checkpoint position: got %q want %q", evt.Position.LSN, endLSN.String())
@@ -256,11 +258,14 @@ func TestPGOutputParser_EmptyStringIsNotNull(t *testing.T) {
 	}
 
 	out := make(map[string]interface{}, 2)
-	p.populateTupleColumnMap(out, rel, []*pglogrepl.TupleDataColumn{
+	_, err := p.populateTupleColumnMap(out, rel, []*pglogrepl.TupleDataColumn{
 		{DataType: 't', Data: []byte("")}, // empty string
 		{DataType: 'n'},                   // SQL NULL
 	})
 
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, ok := out["empty"]
 	if !ok {
 		t.Fatalf("empty column missing from decoded tuple")

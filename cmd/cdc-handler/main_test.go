@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/config"
-	"better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/config"
+	"github.com/elqsar/better-cdc/internal/publisher"
 
 	"go.uber.org/zap"
 )

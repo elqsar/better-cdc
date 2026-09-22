@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/publisher"
 )
 
 func TestNewHandler_HealthEndpoint(t *testing.T) {

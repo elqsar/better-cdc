@@ -45,7 +45,7 @@ tasks:
   test:integration:
     desc: Run Docker-backed integration tests
     cmds:
-      - go test -tags=integration -v -timeout=3m ./tests/integration/
+      - go test -tags=integration -v -timeout=5m ./tests/integration/
 
   bench:
     desc: Run benchmarks
@@ -68,9 +68,10 @@ tasks:
     desc: Run the CDC handler with local defaults
     cmds:
       - |
+        CDC_SOURCE_ID="${CDC_SOURCE_ID:-local-postgres}" \
         DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/postgres}" \
         CDC_SLOT_NAME="${CDC_SLOT_NAME:-better_cdc_slot}" \
-        CDC_PLUGIN="${CDC_PLUGIN:-wal2json}" \
+        CDC_PLUGIN="${CDC_PLUGIN:-pgoutput}" \
         CDC_PUBLICATIONS="${CDC_PUBLICATIONS:-better_cdc_pub}" \
         go run ./cmd/cdc-handler
 

@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"better-cdc/internal/checkpoint"
-	"better-cdc/internal/config"
-	"better-cdc/internal/engine"
-	"better-cdc/internal/model"
-	"better-cdc/internal/parser"
-	"better-cdc/internal/publisher"
-	"better-cdc/internal/transformer"
-	"better-cdc/internal/wal"
+	"github.com/elqsar/better-cdc/internal/checkpoint"
+	"github.com/elqsar/better-cdc/internal/config"
+	"github.com/elqsar/better-cdc/internal/engine"
+	"github.com/elqsar/better-cdc/internal/model"
+	"github.com/elqsar/better-cdc/internal/parser"
+	"github.com/elqsar/better-cdc/internal/publisher"
+	"github.com/elqsar/better-cdc/internal/transformer"
+	"github.com/elqsar/better-cdc/internal/wal"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
@@ -41,7 +41,11 @@ func randomSlotName() string {
 
 // startPostgres boots a Postgres 17 container with wal2json, logical replication,
 // init SQL, and creates a test-specific replication slot.
-func startPostgres(t *testing.T, plugin string) (connString string, slotName string) {
+func startPostgres(t *testing.T, plugin string) (string, string) {
+	db, slot, _ := startPostgresContainer(t, plugin)
+	return db, slot
+}
+func startPostgresContainer(t *testing.T, plugin string) (connString string, slotName string, pgContainer testcontainers.Container) {
 	t.Helper()
 	ctx := context.Background()
 	root := projectRoot()
@@ -102,7 +106,7 @@ func startPostgres(t *testing.T, plugin string) (connString string, slotName str
 	slotName = randomSlotName()
 	createSlot(t, connString, slotName, plugin)
 
-	return connString, slotName
+	return connString, slotName, container
 }
 
 func buildConnString(ctx context.Context, container testcontainers.Container) (string, error) {
@@ -150,7 +154,8 @@ func dropSlot(ctx context.Context, connString, slotName string) {
 }
 
 // startNATS boots a NATS container with JetStream enabled.
-func startNATS(t *testing.T) string {
+func startNATS(t *testing.T) string { url, _ := startNATSContainer(t); return url }
+func startNATSContainer(t *testing.T) (string, testcontainers.Container) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -178,7 +183,7 @@ func startNATS(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("nats port: %v", err)
 	}
-	return fmt.Sprintf("nats://%s:%s", host, port.Port())
+	return fmt.Sprintf("nats://%s:%s", host, port.Port()), container
 }
 
 // execSQL runs SQL statements against Postgres using a standard (non-replication) connection.
@@ -329,7 +334,8 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 		})
 	}
 
-	trans := transformer.NewSimpleTransformer("postgres")
+	identity := model.Identity{SourceID: "integration", Slot: cfg.SlotName, Decoder: cfg.Plugin}
+	trans := transformer.NewSimpleTransformer("postgres", identity)
 
 	streamName := cfg.StreamName
 	if streamName == "" {
@@ -360,7 +366,21 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 	store := checkpoint.NewSlotStore(cfg.ConnString, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, 1*time.Second, logger)
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, "postgres", batchSize, 100*time.Millisecond, 3, false, engine.FailurePolicyCrash, "cdc.dlq", logger)
+	eng := engine.NewEngine(engine.Options{
+		Identity:          identity,
+		Reader:            reader,
+		Parser:            parse,
+		Transformer:       trans,
+		Publisher:         pub,
+		Checkpointer:      ckpt,
+		Database:          "postgres",
+		BatchSize:         batchSize,
+		BatchTimeout:      100 * time.Millisecond,
+		MaxPublishRetries: 3,
+		FailurePolicy:     engine.FailurePolicyCrash,
+		DLQSubjectPrefix:  "cdc.dlq",
+		Logger:            logger,
+	})
 
 	startPos, err := store.Load(ctx)
 	if err != nil {
