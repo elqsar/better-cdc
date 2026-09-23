@@ -218,6 +218,18 @@ func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, skip map[string]boo
 	for {
 		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
 		if errors.Is(err, nats.ErrTimeout) {
+			// A quiet fetch is not proof of completion: a record can still be
+			// pending delivery or held in flight by an interrupted earlier run.
+			info, err := sub.ConsumerInfo()
+			if err != nil {
+				return skipped, err
+			}
+			if info.NumPending > 0 {
+				continue
+			}
+			if info.NumAckPending > 0 {
+				return skipped, fmt.Errorf("a DLQ record is still in flight from an interrupted redrive; it is redelivered after the %s ack wait", info.Config.AckWait)
+			}
 			return skipped, nil
 		}
 		if err != nil {
@@ -226,7 +238,7 @@ func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, skip map[string]boo
 		msg := msgs[0]
 		var rec DeadLetterRecord
 		if err = json.Unmarshal(msg.Data, &rec); err != nil {
-			_ = msg.Nak()
+			nakRedrive(ctx, msg)
 			return skipped, fmt.Errorf("decode DLQ index record: %w", err)
 		}
 		if skip[rec.EventID] {
@@ -241,11 +253,21 @@ func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, skip map[string]boo
 			err = publish(ctx, object)
 		}
 		if err != nil {
-			_ = msg.Nak()
+			nakRedrive(ctx, msg)
 			return skipped, fmt.Errorf("redrive %s: %w (fix the cause, or pass --skip %s to leave it in the index and continue)", rec.EventID, err, rec.EventID)
 		}
 		if err = msg.AckSync(nats.Context(ctx)); err != nil {
 			return skipped, err
 		}
 	}
+}
+
+// nakRedrive returns a record for immediate redelivery and waits for the server
+// to confirm. A fire-and-forget Nak can be lost when the CLI exits right after,
+// leaving the record in flight until the ack wait expires and blocking the
+// single-slot redrive consumer.
+func nakRedrive(ctx context.Context, msg *nats.Msg) {
+	nakCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = msg.Nak(nats.Context(nakCtx))
 }

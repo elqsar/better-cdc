@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -58,7 +59,7 @@ func startPostgresContainer(t *testing.T, plugin string) (connString string, slo
 			Context:    dockerfilePath,
 			Dockerfile: "Dockerfile",
 		},
-		ExposedPorts: []string{"5432/tcp"},
+		ExposedPorts: []string{fixedHostPort(t, "5432/tcp")},
 		Env: map[string]string{
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "postgres",
@@ -153,6 +154,21 @@ func dropSlot(ctx context.Context, connString, slotName string) {
 	))
 }
 
+// fixedHostPort binds containerPort to a free host port chosen up front.
+// Docker assigns a new random host port when a container restarts, which would
+// strand the processes under test on the old address; a fixed binding keeps
+// restart tests valid on both Docker and Podman.
+func fixedHostPort(t *testing.T, containerPort string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve host port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return fmt.Sprintf("%d:%s", port, containerPort)
+}
+
 // startNATS boots a NATS container with JetStream enabled.
 func startNATS(t *testing.T) string { url, _ := startNATSContainer(t); return url }
 func startNATSContainer(t *testing.T) (string, testcontainers.Container) {
@@ -161,7 +177,7 @@ func startNATSContainer(t *testing.T) (string, testcontainers.Container) {
 
 	req := testcontainers.ContainerRequest{
 		Image:        "nats:2.10-alpine",
-		ExposedPorts: []string{"4222/tcp"},
+		ExposedPorts: []string{fixedHostPort(t, "4222/tcp")},
 		Cmd:          []string{"-js"},
 		WaitingFor:   wait.ForListeningPort("4222/tcp").WithStartupTimeout(30 * time.Second),
 	}
