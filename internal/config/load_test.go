@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func loadConfig(t *testing.T) Config {
 	t.Helper()
@@ -93,11 +96,11 @@ func TestLoad_UnsafeUnorderedAsyncPublish(t *testing.T) {
 	}
 }
 
-func TestLoad_DefaultPublishFailurePolicyUsesDLQ(t *testing.T) {
+func TestLoad_DefaultPublishFailurePolicyUsesCrash(t *testing.T) {
 	cfg := loadConfig(t)
 
-	if cfg.PublishFailurePolicy != "dlq" {
-		t.Fatalf("expected default PublishFailurePolicy %q, got %q", "dlq", cfg.PublishFailurePolicy)
+	if cfg.PublishFailurePolicy != "crash" {
+		t.Fatalf("expected default PublishFailurePolicy %q, got %q", "crash", cfg.PublishFailurePolicy)
 	}
 	if cfg.DLQSubjectPrefix != "cdc_dlq" {
 		t.Fatalf("expected default DLQSubjectPrefix %q, got %q", "cdc_dlq", cfg.DLQSubjectPrefix)
@@ -202,6 +205,7 @@ func TestConfigValidate_AcceptsSeparateDLQSubjects(t *testing.T) {
 func TestConfigValidate_RejectsOverlappingDLQSubjects(t *testing.T) {
 	for _, filter := range []string{"cdc_dlq.>", ">", "*.>", "cdc_dlq.postgres.public.*"} {
 		cfg := DefaultConfig()
+		cfg.PublishFailurePolicy = "dlq"
 		cfg.StreamSubjects = []string{filter}
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("accepted overlap %s", filter)
@@ -294,5 +298,24 @@ func TestConfigValidate_RejectsNonPositiveStreamReplicas(t *testing.T) {
 
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected validation error for non-positive stream replicas")
+	}
+}
+
+func TestLoad_DLQTimeout(t *testing.T) {
+	if got := loadConfig(t).DLQTimeout; got != time.Minute {
+		t.Fatalf("expected default DLQTimeout 1m, got %v", got)
+	}
+	t.Setenv("DLQ_TIMEOUT", "3m")
+	if got := loadConfig(t).DLQTimeout; got != 3*time.Minute {
+		t.Fatalf("expected DLQTimeout 3m, got %v", got)
+	}
+}
+
+func TestConfigValidate_RejectsNonPositiveDLQTimeout(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PublishFailurePolicy = "dlq"
+	cfg.DLQTimeout = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected DLQ_TIMEOUT validation error")
 	}
 }

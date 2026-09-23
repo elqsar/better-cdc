@@ -28,8 +28,8 @@ func TestExpectedStreamConfig_AppliesDefaults(t *testing.T) {
 	if cfg.MaxAge != 72*time.Hour {
 		t.Fatalf("expected 72h max age, got %v", cfg.MaxAge)
 	}
-	if cfg.Duplicates != 2*time.Minute {
-		t.Fatalf("expected 2m duplicate window, got %v", cfg.Duplicates)
+	if cfg.Duplicates != 10*time.Minute {
+		t.Fatalf("expected 10m duplicate window, got %v", cfg.Duplicates)
 	}
 }
 

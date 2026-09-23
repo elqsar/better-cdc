@@ -165,6 +165,13 @@ func Load() (Config, error) {
 		}
 		cfg.DuplicateWindow = d
 	}
+	if v := os.Getenv("DLQ_TIMEOUT"); v != "" {
+		d, err := parseEnvDuration("DLQ_TIMEOUT", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.DLQTimeout = d
+	}
 	if v := os.Getenv("PUBLISH_FAILURE_POLICY"); v != "" {
 		cfg.PublishFailurePolicy = strings.ToLower(strings.TrimSpace(v))
 	}

@@ -29,9 +29,10 @@ type FailurePolicy string
 
 const (
 	// FailurePolicyCrash stops the engine (default). The process exits and
-	// replays the same events on restart.
+	// replays the same events on restart, preserving per-row ordering.
 	FailurePolicyCrash FailurePolicy = "crash"
-	// FailurePolicyDLQ publishes a dead-letter record and continues.
+	// FailurePolicyDLQ persists a complete recovery record and continues.
+	// Redriven events arrive after newer changes to the same row.
 	FailurePolicyDLQ FailurePolicy = "dlq"
 	// FailurePolicySkip logs, counts, and continues.
 	FailurePolicySkip FailurePolicy = "skip"

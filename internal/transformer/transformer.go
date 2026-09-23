@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"better-cdc/internal/model"
+	"better-cdc/internal/subject"
 )
 
 var stringBuilderPool = sync.Pool{
@@ -89,7 +90,8 @@ func eventType(op model.OperationType) string {
 // IDs and the second would be silently deduped by JetStream. seq is a
 // deterministic WAL-order ordinal, so genuine replayed duplicates still collapse
 // to the same ID. Row values are intentionally excluded so large payload fields
-// never become NATS message-id headers.
+// never become NATS message-id headers. Schema and table use the subject token
+// encoding so quoted identifiers cannot inject header bytes or ambiguous dots.
 func buildEventID(evt *model.WALEvent) string {
 	sb := stringBuilderPool.Get().(*strings.Builder)
 	sb.Reset()
@@ -104,9 +106,9 @@ func buildEventID(evt *model.WALEvent) string {
 	sb.WriteByte(':')
 	sb.WriteString(string(evt.Operation))
 	sb.WriteByte(':')
-	sb.WriteString(evt.Schema)
+	sb.WriteString(subject.Token(evt.Schema))
 	sb.WriteByte('.')
-	sb.WriteString(evt.Table)
+	sb.WriteString(subject.Token(evt.Table))
 	sb.WriteByte(':')
 	sb.WriteString(strconv.FormatUint(uint64(evt.SeqInTx), 10))
 

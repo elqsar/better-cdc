@@ -235,3 +235,16 @@ func TestBuildEventID_SameTxDistinctEvents(t *testing.T) {
 		t.Errorf("two inserts collided: %q", buildEventID(a))
 	}
 }
+
+func TestBuildEventID_EncodesUnsafeIdentifiers(t *testing.T) {
+	evt := newWALEvent(model.OperationInsert, nil, map[string]interface{}{"id": 1})
+	evt.Schema = "my.schema"
+	evt.Table = "bad\r\nX-Header: 1"
+
+	got := buildEventID(evt)
+
+	want := "0/16A1B8:42:INSERT:my%2Eschema.bad%0D%0AX-Header%3A%201:0"
+	if got != want {
+		t.Errorf("buildEventID = %q, want %q", got, want)
+	}
+}

@@ -12,6 +12,7 @@ type Config struct {
 	SpillDir                                                     string
 	DLQStream, DLQBucket                                         string
 	DLQMaxBytes, DLQIndexMaxBytes                                int64
+	DLQTimeout                                                   time.Duration
 	NATSCredentialsFile, NATSTLSCA, NATSTLSCert, NATSTLSKey      string
 
 	Database                    string
@@ -49,12 +50,12 @@ type Config struct {
 	StreamStorage   string        // "file" or "memory" (default: "file")
 	StreamReplicas  int           // Number of replicas (default: 1)
 	StreamMaxAge    time.Duration // Max age for messages (default: 72h)
-	DuplicateWindow time.Duration // De-duplication window (default: 2m)
+	DuplicateWindow time.Duration // De-duplication window (default: 10m)
 
 	// PublishFailurePolicy controls what happens when an event fails to
 	// publish with a permanent (non-retryable) error such as an oversized
 	// payload or invalid subject:
-	//   "crash" - stop the engine (the process exits and replays on restart)
+	//   "crash" - stop the engine (default; the process exits and replays on restart)
 	//   "dlq"   - persist complete recovery data and its index, then continue
 	//   "skip"  - log, count, and continue
 	// Transient failures (timeouts, disconnects) always crash after retries
@@ -102,10 +103,10 @@ func DefaultConfig() Config {
 		StreamStorage:               "file",
 		StreamReplicas:              1,
 		StreamMaxAge:                72 * time.Hour,
-		DuplicateWindow:             2 * time.Minute,
-		PublishFailurePolicy:        "dlq",
+		DuplicateWindow:             10 * time.Minute,
+		PublishFailurePolicy:        "crash",
 		DLQSubjectPrefix:            "cdc_dlq",
-		DLQStream:                   "CDC_DLQ", DLQBucket: "CDC_RECOVERY", DLQMaxBytes: 1 << 30, DLQIndexMaxBytes: 64 << 20,
+		DLQStream:                   "CDC_DLQ", DLQBucket: "CDC_RECOVERY", DLQMaxBytes: 1 << 30, DLQIndexMaxBytes: 64 << 20, DLQTimeout: time.Minute,
 		RawBufferBytes: 64 << 20, ParsedBufferBytes: 64 << 20, MaxTxBytes: 64 << 20, MaxSpillBytes: 1 << 30,
 	}
 }
@@ -184,6 +185,9 @@ func (c Config) Validate() error {
 	if c.PublishFailurePolicy == "dlq" {
 		if c.DLQMaxBytes <= 0 || c.DLQIndexMaxBytes <= 0 || c.DLQStream == "" || c.DLQBucket == "" {
 			return fmt.Errorf("DLQ storage names and positive byte limits are required")
+		}
+		if c.DLQTimeout <= 0 {
+			return fmt.Errorf("DLQ_TIMEOUT must be > 0")
 		}
 		if c.DLQStream == c.StreamName {
 			return fmt.Errorf("DLQ index requires a separate stream")

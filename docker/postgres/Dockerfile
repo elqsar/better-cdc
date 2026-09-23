@@ -1,4 +1,4 @@
-FROM postgres:17
+FROM docker.io/library/postgres:17
 
 # Install wal2json plugin for logical replication
 RUN apt-get update && apt-get install -y \

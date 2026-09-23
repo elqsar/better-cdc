@@ -6,7 +6,9 @@ supported. This project does not implement other source or destination connector
 
 ## Local quickstart
 
-Requires Go 1.26.8+, Task, and Docker or a Docker-compatible Podman socket.
+Requires Go 1.26.8+, Task, and Podman with `podman-compose` (set
+`COMPOSE="docker compose"` to use Docker instead). Integration tests need a
+Docker-compatible socket, such as Podman's.
 
 ```sh
 task up
@@ -39,12 +41,15 @@ Replay can revisit older events. Source transactions are not applied atomically 
 downstream consumers. `UNSAFE_UNORDERED_ASYNC_PUBLISH=true` explicitly gives up the
 ordered live path and is not part of the pilot configuration.
 
-The default `PUBLISH_FAILURE_POLICY=dlq` retains the full event in NATS Object Store,
+The default `PUBLISH_FAILURE_POLICY=crash` stops on permanent event failures and
+replays them after restart, so per-row order is never broken. Opt-in
+`PUBLISH_FAILURE_POLICY=dlq` retains the full event in NATS Object Store,
 verifies its checksum, then acknowledges a small record in a separate DLQ stream.
 Only then may PostgreSQL advance. Objects and indexes have no automatic expiry and
 reject new writes when their configured capacity is exhausted. They need durable
 broker storage, monitoring, and an operator retention policy. A full/unavailable DLQ
-stops CDC; it never authorizes dropping a change.
+stops CDC; it never authorizes dropping a change. Each quarantine write, including
+the object upload, must finish within `DLQ_TIMEOUT`.
 
 ```sh
 # Uses the same source/NATS environment as the producer.
@@ -61,7 +66,7 @@ Redrive arrives **after newer changes**; consumers must handle stale changes as 
 as duplicates. Retained index records include successfully redriven records; inspect
 the `redrive` consumer's pending and ack-pending counts for outstanding work.
 
-`PUBLISH_FAILURE_POLICY=crash` stops on permanent event failures. `skip` intentionally
+`PUBLISH_FAILURE_POLICY=skip` intentionally
 loses events and is outside the delivery guarantee. Transient failures stop the
 engine after retries under every policy. `ALLOW_NOOP_PUBLISHER` is only for local
 testing and always reports unready when the noop publisher is actually selected.
@@ -117,11 +122,12 @@ All settings are environment variables. Defaults favor a local stack; use the
 | `NATS_TIMEOUT`, `MAX_PUBLISH_RETRIES` | `5s` per acknowledgement, `3` retries |
 | `STREAM_NAME`, `STREAM_SUBJECTS` | `CDC`, `cdc.>` |
 | `STREAM_STORAGE`, `STREAM_REPLICAS`, `STREAM_MAX_AGE` | `file`, `1`, `72h`; production example uses three replicas |
-| `DUPLICATE_WINDOW` | `2m`; consumers still need replay deduplication |
-| `PUBLISH_FAILURE_POLICY` | `dlq`; alternatives `crash`, lossy `skip` |
+| `DUPLICATE_WINDOW` | `10m`; must match an existing stream; consumers still need replay deduplication |
+| `PUBLISH_FAILURE_POLICY` | `crash`; alternatives `dlq` (reorders redriven rows), lossy `skip` |
 | `DLQ_STREAM_NAME`, `DLQ_BUCKET` | `<STREAM_NAME>_DLQ`, `<STREAM_NAME>_RECOVERY` |
 | `DLQ_SUBJECT_PREFIX` | `cdc_dlq`; must not overlap normal stream subjects |
 | `DLQ_MAX_BYTES`, `DLQ_INDEX_MAX_BYTES` | `1073741824`, `67108864`; no expiry or eviction |
+| `DLQ_TIMEOUT` | `1m`; deadline for one quarantine write, including the object upload |
 | `PUBLISH_ASYNC_MAX_PENDING` | `max(256,BATCH_SIZE)`; primarily relevant to unsafe unordered mode |
 | `HEALTH_ADDR` | `:8080`: `/health`, `/ready`, `/metrics` |
 | `DEBUG`, `ENABLE_PPROF`, `ENABLE_PROFILING` | `false`; profiling is opt-in |

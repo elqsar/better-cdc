@@ -202,7 +202,7 @@ func buildPublisher(cfg config.Config, logger *zap.Logger) (publisher.Publisher,
 	return publisher.NewJetStreamPublisher(publisher.JetStreamOptions{
 		URLs:      urls,
 		EnableDLQ: cfg.PublishFailurePolicy == "dlq", DLQStream: cfg.DLQStream, DLQBucket: cfg.DLQBucket, DLQSubjectPrefix: cfg.DLQSubjectPrefix,
-		DLQMaxBytes: cfg.DLQMaxBytes, DLQIndexMaxBytes: cfg.DLQIndexMaxBytes,
+		DLQMaxBytes: cfg.DLQMaxBytes, DLQIndexMaxBytes: cfg.DLQIndexMaxBytes, DLQTimeout: cfg.DLQTimeout,
 		CredentialsFile: cfg.NATSCredentialsFile, TLSCA: cfg.NATSTLSCA, TLSCert: cfg.NATSTLSCert, TLSKey: cfg.NATSTLSKey,
 		Username:               cfg.NATSUsername,
 		Password:               cfg.NATSPassword,

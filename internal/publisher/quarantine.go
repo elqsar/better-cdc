@@ -68,8 +68,10 @@ func validateQuarantineStream(actual, expected *nats.StreamConfig) error {
 	return nil
 }
 
+// Quarantine uses DLQTimeout rather than the per-message publish timeout: the
+// object upload is chunked and can be far larger than a normal event.
 func (p *JetStreamPublisher) Quarantine(ctx context.Context, prefix string, rec *DeadLetterRecord) error {
-	ctx, cancel := context.WithTimeout(ctx, p.publishTimeout())
+	ctx, cancel := context.WithTimeout(ctx, p.opts.DLQTimeout)
 	defer cancel()
 	if p.objects == nil || prefix != p.opts.DLQSubjectPrefix {
 		return fmt.Errorf("durable quarantine is not configured")

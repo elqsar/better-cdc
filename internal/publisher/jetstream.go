@@ -38,6 +38,7 @@ type JetStreamOptions struct {
 	EnableDLQ                               bool
 	DLQStream, DLQBucket, DLQSubjectPrefix  string
 	DLQMaxBytes, DLQIndexMaxBytes           int64
+	DLQTimeout                              time.Duration // Deadline for one quarantine write (default: 1m)
 	CredentialsFile, TLSCA, TLSCert, TLSKey string
 
 	URLs                   []string
@@ -51,7 +52,7 @@ type JetStreamOptions struct {
 	StreamStorage          string        // "file" or "memory" (default: file)
 	StreamReplicas         int           // Number of replicas (default: 1)
 	StreamMaxAge           time.Duration // Max age for messages (default: 72h)
-	DuplicateWindow        time.Duration // De-duplication window (default: 2m)
+	DuplicateWindow        time.Duration // De-duplication window (default: 10m)
 }
 
 func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStreamPublisher {
@@ -65,7 +66,10 @@ func NewJetStreamPublisher(opts JetStreamOptions, logger *zap.Logger) *JetStream
 		opts.StreamReplicas = 1
 	}
 	if opts.DuplicateWindow <= 0 {
-		opts.DuplicateWindow = 2 * time.Minute
+		opts.DuplicateWindow = 10 * time.Minute
+	}
+	if opts.DLQTimeout <= 0 {
+		opts.DLQTimeout = time.Minute
 	}
 	if opts.DLQStream == "" {
 		opts.DLQStream = opts.StreamName + "_DLQ"
@@ -390,7 +394,7 @@ func validateStreamConfig(actual *nats.StreamConfig, expected *nats.StreamConfig
 		return fmt.Errorf("max age mismatch: got %v want %v", actual.MaxAge, expected.MaxAge)
 	}
 	if actual.Duplicates != expected.Duplicates {
-		return fmt.Errorf("duplicate window mismatch: got %v want %v", actual.Duplicates, expected.Duplicates)
+		return fmt.Errorf("duplicate window mismatch: got %v want %v (set DUPLICATE_WINDOW=%v or edit the stream)", actual.Duplicates, expected.Duplicates, actual.Duplicates)
 	}
 	return nil
 }
