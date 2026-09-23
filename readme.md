@@ -153,7 +153,7 @@ snapshotting or leader election is implemented.
 ```sh
 task check
 go test -race ./...
-task test:integration    # isolated containers; five-minute suite timeout
+task test:integration    # isolated containers; ten-minute suite timeout
 task bench
 podman build -t better-cdc:pilot .
 ```

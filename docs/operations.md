@@ -8,6 +8,9 @@ provide leader election. A second instance is unready while waiting for the slot
 
 Provision PostgreSQL logical replication (`wal_level=logical`, sufficient senders
 and slots), a publication listing captured tables, and a logical `pgoutput` slot.
+From PostgreSQL 17.11, `output_plugin_libraries` (default `pgoutput, test_decoding`)
+restricts which plugins slots may use; add `wal2json` there if you keep a `wal2json`
+slot.
 Use a dedicated login with REPLICATION and the required database/schema privileges.
 A DBA should create publications and slots; normal CDC startup never changes them.
 Choose replica identity deliberately: default primary-key identity provides partial

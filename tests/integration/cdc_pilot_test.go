@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -88,7 +89,12 @@ func waitPilotReady(t *testing.T, p *pilotProcess, env []string) {
 		}
 	}
 	client := http.Client{Timeout: time.Second}
-	eventuallyPilot(t, 15*time.Second, func() bool {
+	// Reconnect backoff is 1s doubling to a 30s cap with up to 50% jitter, and a
+	// restarted container may accept connections several seconds after it is
+	// reported ready, so allow more than one full backoff step.
+	deadline := time.Now().Add(45 * time.Second)
+	lastReady := "no response"
+	for time.Now().Before(deadline) {
 		select {
 		case err := <-p.done:
 			body, _ := os.ReadFile(p.log)
@@ -96,12 +102,20 @@ func waitPilotReady(t *testing.T, p *pilotProcess, env []string) {
 		default:
 		}
 		resp, err := client.Get("http://" + addr + "/ready")
-		if err != nil {
-			return false
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return
+			}
+			lastReady = fmt.Sprintf("%d %s", resp.StatusCode, body)
+		} else {
+			lastReady = err.Error()
 		}
-		defer func() { _ = resp.Body.Close() }()
-		return resp.StatusCode == 200
-	})
+		time.Sleep(100 * time.Millisecond)
+	}
+	body, _ := os.ReadFile(p.log)
+	t.Fatalf("pilot not ready: last /ready: %s\n%s", lastReady, body)
 }
 func eventuallyPilot(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Helper()

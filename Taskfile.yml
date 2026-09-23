@@ -52,7 +52,7 @@ tasks:
   test:integration:
     desc: Run container-backed integration tests (needs a Docker-compatible socket)
     cmds:
-      - go test -tags=integration -v -timeout=5m ./tests/integration/
+      - go test -tags=integration -v -timeout=10m ./tests/integration/
 
   bench:
     desc: Run benchmarks
