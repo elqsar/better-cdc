@@ -80,7 +80,7 @@ const defaultPublishAsyncMaxPendingFloor = 256
 
 // DefaultConfig provides safe defaults for local prototyping.
 func DefaultConfig() Config {
-	return Config{
+	cfg := Config{
 		Database:                    "postgres",
 		SlotName:                    "better_cdc_slot",
 		Plugin:                      "pgoutput",
@@ -106,9 +106,17 @@ func DefaultConfig() Config {
 		DuplicateWindow:             10 * time.Minute,
 		PublishFailurePolicy:        "crash",
 		DLQSubjectPrefix:            "cdc_dlq",
-		DLQStream:                   "CDC_DLQ", DLQBucket: "CDC_RECOVERY", DLQMaxBytes: 1 << 30, DLQIndexMaxBytes: 64 << 20, DLQTimeout: time.Minute,
+		DLQMaxBytes:                 1 << 30, DLQIndexMaxBytes: 64 << 20, DLQTimeout: time.Minute,
 		RawBufferBytes: 64 << 20, ParsedBufferBytes: 64 << 20, MaxTxBytes: 64 << 20, MaxSpillBytes: 1 << 30,
 	}
+	cfg.DLQStream, cfg.DLQBucket = defaultDLQNames(cfg.StreamName)
+	return cfg
+}
+
+// defaultDLQNames derives the DLQ index stream and recovery bucket names from
+// the live stream name. It is the single source of that naming rule.
+func defaultDLQNames(streamName string) (stream, bucket string) {
+	return streamName + "_DLQ", streamName + "_RECOVERY"
 }
 
 // Validate rejects configuration values that would crash or degrade the engine.

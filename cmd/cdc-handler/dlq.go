@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 
 	"better-cdc/internal/config"
 	"better-cdc/internal/model"
@@ -16,7 +18,7 @@ import (
 
 func runDLQ(ctx context.Context, cfg config.Config, logger *zap.Logger, args []string, out io.Writer) error {
 	if len(args) == 0 || (args[0] != "list" && args[0] != "inspect" && args[0] != "redrive") {
-		return fmt.Errorf("usage: cdc-handler dlq list | inspect <event-id> | redrive")
+		return fmt.Errorf("usage: cdc-handler dlq list | inspect <event-id> | redrive [--skip <event-id>]...")
 	}
 	cfg.PublishFailurePolicy = "dlq"
 	pub, err := buildPublisher(cfg, logger)
@@ -64,10 +66,11 @@ func runDLQ(ctx context.Context, cfg config.Config, logger *zap.Logger, args []s
 		}
 		return err
 	case "redrive":
-		if len(args) != 1 {
-			return fmt.Errorf("usage: dlq redrive")
+		skip, err := parseRedriveSkips(args[1:])
+		if err != nil {
+			return err
 		}
-		return p.RedriveDLQ(ctx, func(ctx context.Context, obj *publisher.RecoveryObject) error {
+		skipped, err := p.RedriveDLQ(ctx, skip, func(ctx context.Context, obj *publisher.RecoveryObject) error {
 			data, subject := obj.Payload, obj.Subject
 			if len(data) == 0 {
 				evt, err := parser.RestoreChange(obj.Recovery)
@@ -97,6 +100,36 @@ func runDLQ(ctx context.Context, cfg config.Config, logger *zap.Logger, args []s
 			}
 			return p.PublishWithRetries(ctx, subject, data, cfg.MaxPublishRetries, obj.EventID)
 		})
+		for _, id := range skipped {
+			delete(skip, id)
+			if encErr := encode.Encode(struct {
+				Skipped string `json:"skipped"`
+			}{id}); encErr != nil && err == nil {
+				err = encErr
+			}
+		}
+		if err == nil && len(skip) > 0 {
+			missing := make([]string, 0, len(skip))
+			for id := range skip {
+				missing = append(missing, id)
+			}
+			sort.Strings(missing)
+			return fmt.Errorf("--skip event IDs not found among pending records: %s", strings.Join(missing, ", "))
+		}
+		return err
 	}
 	return nil
+}
+
+// parseRedriveSkips reads repeated "--skip <event-id>" arguments.
+func parseRedriveSkips(args []string) (map[string]bool, error) {
+	skip := make(map[string]bool)
+	for i := 0; i < len(args); i++ {
+		if args[i] != "--skip" || i+1 >= len(args) || args[i+1] == "" {
+			return nil, fmt.Errorf("usage: dlq redrive [--skip <event-id>]...")
+		}
+		skip[args[i+1]] = true
+		i++
+	}
+	return skip, nil
 }

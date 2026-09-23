@@ -319,3 +319,13 @@ func TestConfigValidate_RejectsNonPositiveDLQTimeout(t *testing.T) {
 		t.Fatal("expected DLQ_TIMEOUT validation error")
 	}
 }
+
+func TestDLQNamesDerivedFromStreamName(t *testing.T) {
+	if cfg := DefaultConfig(); cfg.DLQStream != "CDC_DLQ" || cfg.DLQBucket != "CDC_RECOVERY" {
+		t.Fatalf("unexpected default DLQ names %q %q", cfg.DLQStream, cfg.DLQBucket)
+	}
+	t.Setenv("STREAM_NAME", "ORDERS")
+	if cfg := loadConfig(t); cfg.DLQStream != "ORDERS_DLQ" || cfg.DLQBucket != "ORDERS_RECOVERY" {
+		t.Fatalf("DLQ names not derived from STREAM_NAME: %q %q", cfg.DLQStream, cfg.DLQBucket)
+	}
+}

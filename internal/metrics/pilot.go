@@ -19,3 +19,7 @@ var Pilot = struct {
 	NewPrometheusGauge("dlq", "records", "Retained quarantine index records, including redriven records"),
 	NewPrometheusGauge("dlq", "oldest_seconds", "Unix time of oldest retained quarantine record"),
 }
+
+// OversizedRecords counts records larger than a whole pipeline byte budget.
+// They are admitted one at a time instead of stopping capture.
+var OversizedRecords = NewPrometheusCounter("pipeline", "oversized_records_total", "Records admitted exclusively because they exceed a pipeline byte budget")

@@ -314,7 +314,11 @@ func (p *PGOutputParser) handlePGOutputMessage(ctx context.Context, rawData []by
 					continue
 				}
 				p.enrichEventForCommit(evt, checkpointPos, seq)
-				if err := p.reserveEvent(ctx, evt); err != nil {
+				recoveryLen, err := p.tx.recoveryLen(i, evt)
+				if err != nil {
+					return err
+				}
+				if err := p.reserveEvent(ctx, evt, recoveryLen); err != nil {
 					return err
 				}
 				select {
@@ -450,7 +454,7 @@ func (p *PGOutputParser) emitSpilledEvents(ctx context.Context, checkpointPos mo
 			return err
 		}
 		p.enrichEventForCommit(evt, checkpointPos, seq)
-		if err := p.reserveEvent(ctx, evt); err != nil {
+		if err := p.reserveEvent(ctx, evt, len(raw)); err != nil {
 			model.ReleaseWALEvent(evt)
 			return err
 		}
@@ -643,11 +647,7 @@ func (p *PGOutputParser) populateTupleColumnMap(out map[string]interface{}, rel 
 	if len(cols) != len(rel.Columns) {
 		return nil, fmt.Errorf("tuple column count %d differs from relation %d", len(cols), len(rel.Columns))
 	}
-	length := len(rel.Columns)
-	if len(cols) < length {
-		length = len(cols)
-	}
-	for i := 0; i < length; i++ {
+	for i := range cols {
 		col := cols[i]
 		var oid uint32
 		if i < len(rel.ColumnTypes) {
@@ -700,15 +700,30 @@ func unavailableColumns(rel relationInfo, cols []*pglogrepl.TupleDataColumn) []s
 	return names
 }
 
-func (p *PGOutputParser) reserveEvent(ctx context.Context, evt *model.WALEvent) error {
+// recoveryLen returns the encoded size of event i's recovery capsule, reusing
+// the bytes buffered alongside it instead of marshaling it again.
+func (tx *txBuffer) recoveryLen(i int, evt *model.WALEvent) (int, error) {
+	if i < len(tx.rawMsgs) {
+		return len(tx.rawMsgs[i]), nil
+	}
+	raw, err := json.Marshal(evt.Recovery)
+	return len(raw), err
+}
+
+// reserveEvent accounts an event against the output budget. recoveryLen is the
+// size of its already-encoded recovery capsule, so it is not marshaled again.
+func (p *PGOutputParser) reserveEvent(ctx context.Context, evt *model.WALEvent, recoveryLen int) error {
 	if p.outputBudget == nil {
 		return nil
 	}
-	raw, err := json.Marshal(evt.Recovery)
-	if err != nil {
-		return err
+	n := int64(recoveryLen)*4 + 512
+	if p.outputBudget.Oversized(n) {
+		metrics.OversizedRecords.Inc()
+		p.logger.Warn("event exceeds PARSED_EVENT_BUFFER_BYTES; admitting it alone",
+			zap.Int64("accounted_bytes", n), zap.Int64("budget_bytes", p.outputBudget.Limit()),
+			zap.String("schema", evt.Schema), zap.String("table", evt.Table), zap.Uint64("txid", evt.TxID))
 	}
-	release, err := p.outputBudget.Acquire(ctx, int64(len(raw))*4+512)
+	release, err := p.outputBudget.Acquire(ctx, n)
 	if err == nil {
 		evt.ReleaseBytes = release
 	}

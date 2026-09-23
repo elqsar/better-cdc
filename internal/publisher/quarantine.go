@@ -33,7 +33,7 @@ func (p *JetStreamPublisher) ensureQuarantine() error {
 	if !p.opts.EnableDLQ {
 		return nil
 	}
-	expected := &nats.StreamConfig{Name: p.opts.DLQStream, Subjects: []string{p.opts.DLQSubjectPrefix + ".>"}, Storage: nats.FileStorage, Replicas: p.opts.StreamReplicas, Retention: nats.LimitsPolicy, Discard: nats.DiscardNew, MaxBytes: p.opts.DLQIndexMaxBytes, Duplicates: p.opts.DuplicateWindow}
+	expected := p.expectedQuarantineStreamConfig()
 	info, err := p.js.StreamInfo(expected.Name)
 	if errors.Is(err, nats.ErrStreamNotFound) {
 		info, err = p.js.AddStream(expected)
@@ -56,7 +56,25 @@ func (p *JetStreamPublisher) ensureQuarantine() error {
 	if err != nil {
 		return err
 	}
-	if bucketInfo.Config.Storage != nats.FileStorage || bucketInfo.Config.MaxAge != 0 || bucketInfo.Config.Discard != nats.DiscardNew || bucketInfo.Config.MaxBytes != p.opts.DLQMaxBytes || bucketInfo.Config.Replicas != p.opts.StreamReplicas {
+	return p.validateQuarantineBucket(&bucketInfo.Config)
+}
+
+func (p *JetStreamPublisher) expectedQuarantineStreamConfig() *nats.StreamConfig {
+	return &nats.StreamConfig{
+		Name:       p.opts.DLQStream,
+		Subjects:   []string{p.opts.DLQSubjectPrefix + ".>"},
+		Storage:    nats.FileStorage,
+		Replicas:   p.opts.StreamReplicas,
+		Retention:  nats.LimitsPolicy,
+		Discard:    nats.DiscardNew,
+		MaxBytes:   p.opts.DLQIndexMaxBytes,
+		Duplicates: p.opts.DuplicateWindow,
+	}
+}
+
+// validateQuarantineBucket checks the Object Store's backing stream config.
+func (p *JetStreamPublisher) validateQuarantineBucket(actual *nats.StreamConfig) error {
+	if actual.Storage != nats.FileStorage || actual.MaxAge != 0 || actual.Discard != nats.DiscardNew || actual.MaxBytes != p.opts.DLQMaxBytes || actual.Replicas != p.opts.StreamReplicas {
 		return fmt.Errorf("DLQ bucket must use file storage, matching replicas/capacity, no expiry and discard-new")
 	}
 	return nil
@@ -178,31 +196,45 @@ func (p *JetStreamPublisher) WalkDLQ(ctx context.Context, visit func(uint64, Dea
 
 // RedriveDLQ uses one persistent consumer; a crash after publish but before its
 // acknowledgement can replay the original EventID, so downstream dedup remains required.
-func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, publish func(context.Context, *RecoveryObject) error) error {
+//
+// It stops at the first record that cannot be replayed and names it. Records whose
+// EventID is in skip are terminated on the redrive consumer instead of replayed, so
+// one unrecoverable record cannot block the backlog behind it; they stay in the
+// index stream for inspection. It returns the skipped EventIDs.
+func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, skip map[string]bool, publish func(context.Context, *RecoveryObject) error) ([]string, error) {
+	var skipped []string
 	_, err := p.js.ConsumerInfo(p.opts.DLQStream, "redrive", nats.Context(ctx))
 	if errors.Is(err, nats.ErrConsumerNotFound) {
 		_, err = p.js.AddConsumer(p.opts.DLQStream, &nats.ConsumerConfig{Durable: "redrive", FilterSubject: p.opts.DLQSubjectPrefix + ".>", AckPolicy: nats.AckExplicitPolicy, MaxAckPending: 1, AckWait: 5 * time.Minute}, nats.Context(ctx))
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sub, err := p.js.PullSubscribe(p.opts.DLQSubjectPrefix+".>", "redrive", nats.Bind(p.opts.DLQStream, "redrive"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 	for {
 		msgs, err := sub.Fetch(1, nats.MaxWait(time.Second))
 		if errors.Is(err, nats.ErrTimeout) {
-			return nil
+			return skipped, nil
 		}
 		if err != nil {
-			return err
+			return skipped, err
 		}
 		msg := msgs[0]
 		var rec DeadLetterRecord
 		if err = json.Unmarshal(msg.Data, &rec); err != nil {
-			return err
+			_ = msg.Nak()
+			return skipped, fmt.Errorf("decode DLQ index record: %w", err)
+		}
+		if skip[rec.EventID] {
+			if err = msg.Term(nats.Context(ctx)); err != nil {
+				return skipped, fmt.Errorf("skip %s: %w", rec.EventID, err)
+			}
+			skipped = append(skipped, rec.EventID)
+			continue
 		}
 		object, err := p.LoadRecovery(ctx, rec)
 		if err == nil {
@@ -210,10 +242,10 @@ func (p *JetStreamPublisher) RedriveDLQ(ctx context.Context, publish func(contex
 		}
 		if err != nil {
 			_ = msg.Nak()
-			return err
+			return skipped, fmt.Errorf("redrive %s: %w (fix the cause, or pass --skip %s to leave it in the index and continue)", rec.EventID, err, rec.EventID)
 		}
 		if err = msg.AckSync(nats.Context(ctx)); err != nil {
-			return err
+			return skipped, err
 		}
 	}
 }

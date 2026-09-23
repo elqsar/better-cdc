@@ -18,6 +18,11 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "Repair quarantined events and run redrive"
+      - alert: CDCOversizedRecords
+        expr: increase(cdc_pipeline_oversized_records_total[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Records exceed a pipeline byte budget; check memory headroom or raise the budget"
       - alert: CDCRecoveryStorageNearCapacity
         expr: cdc_dlq_storage_bytes > 858993459
         for: 5m

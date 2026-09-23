@@ -236,6 +236,8 @@ func TestPilotExecutableKillReplayAndLosslessDLQ(t *testing.T) {
 			redrive.Env = env
 			if out, err := redrive.CombinedOutput(); err == nil {
 				t.Fatalf("oversized redrive unexpectedly succeeded: %s", out)
+			} else if !bytes.Contains(out, []byte("--skip "+index.EventID)) {
+				t.Fatalf("redrive failure does not name the blocking record: %s", out)
 			}
 			info, err = js.StreamInfo(stream)
 			if err != nil {
@@ -260,6 +262,45 @@ func TestPilotExecutableKillReplayAndLosslessDLQ(t *testing.T) {
 			}
 			if last.Header.Get("Nats-Msg-Id") != index.EventID || !bytes.Equal(last.Data, object.Payload) {
 				t.Fatal("redrive changed identity or payload")
+			}
+			// An unrecoverable record must not block the backlog: --skip terminates it
+			// on the redrive consumer while keeping it in the index for inspection.
+			info, err = js.StreamInfo(stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info.Config.MaxMsgSize = 64 << 10
+			if _, err = js.UpdateStream(&info.Config); err != nil {
+				t.Fatal(err)
+			}
+			execSQL(t, db, `INSERT INTO public.accounts(email,status) VALUES ('poison',repeat('y',200000))`)
+			eventuallyPilot(t, 10*time.Second, func() bool { info, err := js.StreamInfo(stream + "_DLQ"); return err == nil && info.State.Msgs == 2 })
+			poisonMsg, err := js.GetMsg(stream+"_DLQ", 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var poison publisher.DeadLetterRecord
+			if err = json.Unmarshal(poisonMsg.Data, &poison); err != nil {
+				t.Fatal(err)
+			}
+			redrive = exec.Command(binary, "dlq", "redrive")
+			redrive.Env = env
+			if out, err := redrive.CombinedOutput(); err == nil || !bytes.Contains(out, []byte("--skip "+poison.EventID)) {
+				t.Fatalf("poison redrive should fail naming the record: %v\n%s", err, out)
+			}
+			redrive = exec.Command(binary, "dlq", "redrive", "--skip", poison.EventID)
+			redrive.Env = env
+			if out, err := redrive.CombinedOutput(); err != nil || !bytes.Contains(out, []byte(`"skipped":"`+poison.EventID+`"`)) {
+				t.Fatalf("redrive --skip: %v\n%s", err, out)
+			}
+			eventuallyPilot(t, 5*time.Second, func() bool {
+				info, err := js.ConsumerInfo(stream+"_DLQ", "redrive")
+				return err == nil && info.NumPending == 0 && info.NumAckPending == 0
+			})
+			inspect = exec.Command(binary, "dlq", "inspect", poison.EventID)
+			inspect.Env = env
+			if out, err := inspect.Output(); err != nil {
+				t.Fatalf("skipped record no longer inspectable: %v\n%s", err, out)
 			}
 			if err = p2.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 				t.Fatal(err)
@@ -434,6 +475,35 @@ func TestPilotRestartsAndSlotOwnership(t *testing.T) {
 		msg, err := js.GetLastMsg("RESTART", "cdc.postgres.public.accounts")
 		return err == nil && bytes.Contains(msg.Data, []byte("post-restart"))
 	})
+	// Out-of-band stream edits must fail readiness, not drift silently.
+	info, err := js.StreamInfo("RESTART")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := info.Config.Duplicates
+	info.Config.Duplicates = 5 * time.Second
+	if _, err = js.UpdateStream(&info.Config); err != nil {
+		t.Fatal(err)
+	}
+	var readyAddr string
+	for _, v := range env {
+		if strings.HasPrefix(v, "HEALTH_ADDR=") {
+			readyAddr = strings.TrimPrefix(v, "HEALTH_ADDR=")
+		}
+	}
+	eventuallyPilot(t, 5*time.Second, func() bool {
+		response, err := http.Get("http://" + readyAddr + "/ready")
+		if err != nil {
+			return false
+		}
+		defer func() { _ = response.Body.Close() }()
+		return response.StatusCode == 503
+	})
+	info.Config.Duplicates = original
+	if _, err = js.UpdateStream(&info.Config); err != nil {
+		t.Fatal(err)
+	}
+	waitPilotReady(t, p, env)
 	_ = p.cmd.Process.Signal(syscall.SIGTERM)
 	if err := <-p.done; err != nil {
 		t.Fatal(err)

@@ -396,7 +396,14 @@ func (r *PGReader) loopMessages(ctx context.Context, plugin parser.Plugin, out c
 				}
 				r.receivedLSN.Store(uint64(xld.WALStart))
 				r.lastReceived.Store(time.Now().Unix())
-				release, err := r.rawBudget.Acquire(ctx, int64(len(xld.WALData))+128)
+				n := int64(len(xld.WALData)) + 128
+				if r.rawBudget.Oversized(n) {
+					metrics.OversizedRecords.Inc()
+					r.logger.Warn("WAL message exceeds RAW_MESSAGE_BUFFER_BYTES; admitting it alone",
+						zap.Int64("accounted_bytes", n), zap.Int64("budget_bytes", r.rawBudget.Limit()),
+						zap.String("wal_start", xld.WALStart.String()))
+				}
+				release, err := r.rawBudget.Acquire(ctx, n)
 				if err != nil {
 					return r.currentAckedLSN(), fatalReplicationError{err}
 				}

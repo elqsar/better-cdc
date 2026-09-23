@@ -243,12 +243,21 @@ func (p *JetStreamPublisher) Ready(ctx context.Context) error {
 	if !p.nc.IsConnected() {
 		return fmt.Errorf("nats connection status is %s", p.nc.Status().String())
 	}
-	if _, err := p.js.StreamInfo(p.streamName(), nats.Context(ctx)); err != nil {
+	// Re-validate on every probe so out-of-band stream edits (duplicate window,
+	// retention, storage, subjects) fail readiness instead of drifting silently.
+	live, err := p.js.StreamInfo(p.streamName(), nats.Context(ctx))
+	if err != nil {
 		return err
+	}
+	if err := validateStreamConfig(&live.Config, p.expectedStreamConfig()); err != nil {
+		return fmt.Errorf("stream %q no longer matches configuration: %w", p.streamName(), err)
 	}
 	if p.opts.EnableDLQ {
 		index, err := p.js.StreamInfo(p.opts.DLQStream, nats.Context(ctx))
 		if err != nil {
+			return err
+		}
+		if err := validateQuarantineStream(&index.Config, p.expectedQuarantineStreamConfig()); err != nil {
 			return err
 		}
 		metrics.Pilot.DLQRecords.Set(int64(index.State.Msgs))
@@ -262,6 +271,9 @@ func (p *JetStreamPublisher) Ready(ctx context.Context) error {
 		}
 		bucket, err := p.js.StreamInfo("OBJ_"+p.opts.DLQBucket, nats.Context(ctx))
 		if err != nil {
+			return err
+		}
+		if err := p.validateQuarantineBucket(&bucket.Config); err != nil {
 			return err
 		}
 		metrics.Pilot.DLQBytes.Set(int64(bucket.State.Bytes))
@@ -354,7 +366,7 @@ func (p *JetStreamPublisher) expectedStreamConfig() *nats.StreamConfig {
 	}
 	dupWindow := p.opts.DuplicateWindow
 	if dupWindow <= 0 {
-		dupWindow = 2 * time.Minute
+		dupWindow = 10 * time.Minute
 	}
 
 	return &nats.StreamConfig{

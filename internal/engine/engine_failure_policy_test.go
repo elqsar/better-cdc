@@ -300,3 +300,21 @@ func (m *mockBatchPublisher) Quarantine(ctx context.Context, prefix string, rec 
 	}
 	return m.Publish(ctx, publisher.DeadLetterSubject(prefix, rec.Database, rec.Schema, rec.Table), data, "dlq-"+rec.EventID)
 }
+
+func TestPrepareFailure_ReportsQuarantineError(t *testing.T) {
+	e := newFailurePolicyEngine(newMockBatchPublisher(), FailurePolicyDLQ)
+	cause := errors.New("transform event: unsupported column type")
+
+	// No recovery capsule, so the durable quarantine write itself is rejected.
+	evt := &model.WALEvent{Operation: model.OperationInsert, Schema: "public", Table: "accounts", LSN: "0/35", TxID: 2}
+	skip, err := e.prepareFailure(context.Background(), evt, cause)
+	if skip {
+		t.Fatal("event reported as quarantined")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("original cause lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), "quarantine failed: event has no complete recovery representation") {
+		t.Fatalf("quarantine failure hidden: %v", err)
+	}
+}

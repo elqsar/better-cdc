@@ -14,13 +14,27 @@ type Budget struct {
 }
 
 func New(limit int64) *Budget { return &Budget{limit: limit, changed: make(chan struct{})} }
+
+// Limit returns the configured byte limit.
+func (b *Budget) Limit() int64 { return b.limit }
+
+// Oversized reports whether a record of n bytes exceeds the whole budget and
+// will be admitted exclusively by Acquire.
+func (b *Budget) Oversized(n int64) bool { return n > b.limit }
+
+// Acquire blocks until n bytes fit and returns an idempotent release func.
+//
+// A record larger than the whole budget is admitted exclusively: it waits
+// until nothing else is held, then holds the budget alone until released.
+// Such a record is already in memory by the time it is accounted, so refusing
+// it would only turn a memory spike into a restart loop on the same WAL.
 func (b *Budget) Acquire(ctx context.Context, n int64) (func(), error) {
-	if n < 0 || n > b.limit {
-		return nil, fmt.Errorf("record accounting size %d exceeds byte budget %d", n, b.limit)
+	if n < 0 {
+		return nil, fmt.Errorf("negative record accounting size %d", n)
 	}
 	for {
 		b.mu.Lock()
-		if b.used+n <= b.limit {
+		if b.used+n <= b.limit || (n > b.limit && b.used == 0) {
 			b.used += n
 			b.mu.Unlock()
 			var once sync.Once

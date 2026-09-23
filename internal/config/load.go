@@ -211,8 +211,7 @@ func Load() (Config, error) {
 	cfg.NATSTLSCA = os.Getenv("NATS_TLS_CA")
 	cfg.NATSTLSCert = os.Getenv("NATS_TLS_CERT")
 	cfg.NATSTLSKey = os.Getenv("NATS_TLS_KEY")
-	cfg.DLQStream = cfg.StreamName + "_DLQ"
-	cfg.DLQBucket = cfg.StreamName + "_RECOVERY"
+	cfg.DLQStream, cfg.DLQBucket = defaultDLQNames(cfg.StreamName)
 	if v := os.Getenv("DLQ_STREAM_NAME"); v != "" {
 		cfg.DLQStream = v
 	}

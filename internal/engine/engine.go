@@ -311,9 +311,11 @@ func deadLetterRecordFromWALEvent(evt *model.WALEvent, cause error) *publisher.D
 // cause when the engine must stop.
 func (e *Engine) prepareFailure(ctx context.Context, evt *model.WALEvent, cause error) (bool, error) {
 	if e.quarantinesPoison() {
-		if qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, cause)); qErr == nil {
+		qErr := e.quarantine(ctx, deadLetterRecordFromWALEvent(evt, cause))
+		if qErr == nil {
 			return true, nil
 		}
+		return false, fmt.Errorf("%w; quarantine failed: %w", cause, qErr)
 	}
 	return false, cause
 }

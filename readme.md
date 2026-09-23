@@ -59,7 +59,10 @@ go run ./cmd/cdc-handler dlq redrive
 ```
 
 Redrive uses a persistent consumer and the original event identity. It stops on the
-first unsuccessful replay and acknowledges work only after a publish acknowledgement.
+first unsuccessful replay, naming that event, and acknowledges work only after a
+publish acknowledgement. `dlq redrive --skip <event_id>` (repeatable) removes an
+unrecoverable record from the redrive backlog so later records can proceed; it stays
+in the index for `dlq list`/`inspect`.
 Fix destination payload limits before replaying oversized events. Input capsules
 for serialization/transform failures can be replayed after the underlying code fix.
 Redrive arrives **after newer changes**; consumers must handle stale changes as well
@@ -134,8 +137,9 @@ All settings are environment variables. Defaults favor a local stack; use the
 
 Byte budgets account conservatively for payloads and their decoded representations;
 they are not a hard RSS limit. Keep container headroom for codecs, maps, transient
-serialization copies, broker buffers and the Go runtime. A record too large for a
-pipeline budget stops capture without acknowledging its transaction. Spill files
+serialization copies, broker buffers and the Go runtime. A record larger than a
+whole pipeline budget is admitted alone once that budget drains, logged, and counted
+in `cdc_pipeline_oversized_records_total`; size memory headroom for it. Spill files
 are private, source-specific and locked; a later process removes orphaned spill
 files only after acquiring that directory lock, then replays from PostgreSQL.
 

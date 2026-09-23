@@ -40,8 +40,10 @@ named volume. One process holds an exclusive advisory lock for its slot director
 The sample container has 768 MiB memory headroom and a 1 GiB spill cap. Set broker
 storage and PostgreSQL WAL limits against measured event sizes, transaction sizes,
 outage duration and retained DLQ volume. Pipeline budgets bound accounted bytes,
-not exact heap allocation. A giant individual record may stop capture even if it
-would fit on disk. Increase budgets only with corresponding process headroom.
+not exact heap allocation. A record larger than a whole budget is admitted alone
+after that budget drains, so peak memory is roughly the budget plus the largest
+record; watch `cdc_pipeline_oversized_records_total`. Increase budgets only with
+corresponding process headroom.
 
 ## Readiness and alerts
 
@@ -75,9 +77,12 @@ limits can invalidate a slot instead of protecting capture continuity.
 2. Repair the root cause. An oversized event requires larger destination limits;
    a transform/serialization bug requires a corrected binary. Do not modify stored
    recovery bytes or identities to hide the failure.
-3. Run one `cdc-handler dlq redrive` per source. Failed replay remains pending.
-   Redrive publishes original payload bytes when present; otherwise it reconstructs
-   the event from its original plugin bytes and relation revision.
+3. Run one `cdc-handler dlq redrive` per source. Failed replay remains pending and
+   the error names the blocking `event_id`. Redrive publishes original payload bytes
+   when present; otherwise it reconstructs the event from its original plugin bytes
+   and relation revision. If a record cannot be repaired, record the decision and run
+   `dlq redrive --skip <event-id>`: it leaves the redrive backlog, stays in the index
+   for audit, and downstream reconciliation for that change becomes manual.
 4. Consumers deduplicate by `event_id` and reject/apply stale events according to
    their own business rules. Redrive does not restore source ordering or atomicity.
 5. Verify the durable consumer has no pending work and reconcile downstream state.

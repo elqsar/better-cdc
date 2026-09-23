@@ -124,7 +124,14 @@ func (p *Wal2JSONParser) Parse(ctx context.Context, stream <-chan *RawMessage) (
 					if p.logger != nil {
 						p.logger.Debug("wal2json event", zap.String("lsn", evt.LSN), zap.Uint64("txid", evt.TxID), zap.String("table", evt.Table), zap.String("op", string(evt.Operation)))
 					}
-					release, err := bytesBudget.Acquire(ctx, int64(len(msg.Data))*4+512)
+					n := int64(len(msg.Data))*4 + 512
+					if bytesBudget.Oversized(n) {
+						metrics.OversizedRecords.Inc()
+						p.logger.Warn("event exceeds PARSED_EVENT_BUFFER_BYTES; admitting it alone",
+							zap.Int64("accounted_bytes", n), zap.Int64("budget_bytes", bytesBudget.Limit()),
+							zap.String("schema", evt.Schema), zap.String("table", evt.Table), zap.Uint64("txid", evt.TxID))
+					}
+					release, err := bytesBudget.Acquire(ctx, n)
 					if err != nil {
 						model.ReleaseWALEvent(evt)
 						p.setFatalError(err)

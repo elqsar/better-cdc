@@ -61,3 +61,21 @@ func TestBuildPublisher_TrimsConfiguredNATSURLs(t *testing.T) {
 		t.Fatalf("expected jetstream publisher, got %T", pub)
 	}
 }
+
+func TestParseRedriveSkips(t *testing.T) {
+	skip, err := parseRedriveSkips([]string{"--skip", "a", "--skip", "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skip) != 2 || !skip["a"] || !skip["b"] {
+		t.Fatalf("unexpected skips: %v", skip)
+	}
+	if skip, err = parseRedriveSkips(nil); err != nil || len(skip) != 0 {
+		t.Fatalf("empty args: %v %v", skip, err)
+	}
+	for _, bad := range [][]string{{"--skip"}, {"--skip", ""}, {"a"}, {"--force", "a"}} {
+		if _, err := parseRedriveSkips(bad); err == nil {
+			t.Fatalf("accepted %v", bad)
+		}
+	}
+}
