@@ -1,7 +1,9 @@
 package publisher
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -37,30 +39,16 @@ func TestIsPermanentPublishError(t *testing.T) {
 	}
 }
 
-func TestDeadLetterRecordSetPayloadTruncates(t *testing.T) {
+func TestDeadLetterRecordSetPayloadIsLossless(t *testing.T) {
 	rec := &DeadLetterRecord{}
-	big := make([]byte, DLQPayloadPrefixLimit+100)
-	for i := range big {
-		big[i] = 'a'
+	payload := bytes.Repeat([]byte("x"), 2<<20)
+	rec.SetPayload(payload)
+	if rec.PayloadSize != len(payload) || !bytes.Equal(rec.Payload, payload) {
+		t.Fatal("recovery payload changed")
 	}
-	rec.SetPayload(big)
-	if !rec.Truncated {
-		t.Error("expected Truncated=true for oversized payload")
-	}
-	if rec.PayloadSize != len(big) {
-		t.Errorf("PayloadSize = %d, want %d", rec.PayloadSize, len(big))
-	}
-	if len(rec.PayloadPrefix) != DLQPayloadPrefixLimit {
-		t.Errorf("PayloadPrefix length = %d, want %d", len(rec.PayloadPrefix), DLQPayloadPrefixLimit)
-	}
-
-	rec = &DeadLetterRecord{}
-	rec.SetPayload([]byte("small"))
-	if rec.Truncated {
-		t.Error("expected Truncated=false for small payload")
-	}
-	if rec.PayloadPrefix != "small" || rec.PayloadSize != 5 {
-		t.Errorf("unexpected record: %+v", rec)
+	payload[0] = 'y'
+	if rec.Payload[0] != 'x' {
+		t.Fatal("recovery bytes alias caller buffer")
 	}
 }
 
@@ -69,8 +57,8 @@ func TestDeadLetterSubject(t *testing.T) {
 		prefix, db, schema, table, want string
 	}{
 		{"cdc.dlq", "appdb", "public", "users", "cdc.dlq.appdb.public.users"},
-		{"cdc.dlq", "appdb", "", "", "cdc.dlq.appdb._._"},
-		{"", "db", "s", "bad table*", "_.db.s.bad_table_"},
+		{"cdc.dlq", "appdb", "", "", "cdc.dlq.appdb.%00.%00"},
+		{"", "db", "s", "bad table*", ".db.s.bad%20table%2A"},
 	}
 	for _, tt := range tests {
 		if got := DeadLetterSubject(tt.prefix, tt.db, tt.schema, tt.table); got != tt.want {
@@ -101,6 +89,7 @@ func TestPublishDeadLetter(t *testing.T) {
 	pub := &capturingPublisher{}
 	rec := &DeadLetterRecord{
 		EventID:  "evt-1",
+		Payload:  []byte("complete event"),
 		Database: "appdb",
 		Schema:   "public",
 		Table:    "users",
@@ -119,5 +108,24 @@ func TestPublishDeadLetter(t *testing.T) {
 	pub = &capturingPublisher{err: errors.New("down")}
 	if err := PublishDeadLetter(context.Background(), pub, "cdc.dlq", rec); err == nil {
 		t.Error("expected error when DLQ publish fails")
+	}
+}
+
+func (c *capturingPublisher) Quarantine(ctx context.Context, prefix string, rec *DeadLetterRecord) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return c.Publish(ctx, DeadLetterSubject(prefix, rec.Database, rec.Schema, rec.Table), data, "dlq-"+rec.EventID)
+}
+func TestPublishDeadLetterRefusesDiagnosticOnlyRecord(t *testing.T) {
+	if err := PublishDeadLetter(context.Background(), &capturingPublisher{}, "cdc_dlq", &DeadLetterRecord{EventID: "x"}); err == nil {
+		t.Fatal("accepted missing recovery data")
+	}
+}
+
+func TestConnectionURLRedaction(t *testing.T) {
+	if got := redactURL("tls://user:secret@example.com:4222?token=secret"); got != "tls://example.com:4222" {
+		t.Fatalf("URL leaks credentials: %s", got)
 	}
 }

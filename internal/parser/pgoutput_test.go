@@ -256,11 +256,14 @@ func TestPGOutputParser_EmptyStringIsNotNull(t *testing.T) {
 	}
 
 	out := make(map[string]interface{}, 2)
-	p.populateTupleColumnMap(out, rel, []*pglogrepl.TupleDataColumn{
+	_, err := p.populateTupleColumnMap(out, rel, []*pglogrepl.TupleDataColumn{
 		{DataType: 't', Data: []byte("")}, // empty string
 		{DataType: 'n'},                   // SQL NULL
 	})
 
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, ok := out["empty"]
 	if !ok {
 		t.Fatalf("empty column missing from decoded tuple")

@@ -165,6 +165,13 @@ func Load() (Config, error) {
 		}
 		cfg.DuplicateWindow = d
 	}
+	if v := os.Getenv("DLQ_TIMEOUT"); v != "" {
+		d, err := parseEnvDuration("DLQ_TIMEOUT", v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.DLQTimeout = d
+	}
 	if v := os.Getenv("PUBLISH_FAILURE_POLICY"); v != "" {
 		cfg.PublishFailurePolicy = strings.ToLower(strings.TrimSpace(v))
 	}
@@ -186,6 +193,31 @@ func Load() (Config, error) {
 		cfg.EnablePprof = enabled
 	}
 
+	for name, target := range map[string]*int64{
+		"RAW_MESSAGE_BUFFER_BYTES": &cfg.RawBufferBytes, "PARSED_EVENT_BUFFER_BYTES": &cfg.ParsedBufferBytes,
+		"MAX_TX_BUFFER_BYTES": &cfg.MaxTxBytes, "MAX_SPILL_BYTES": &cfg.MaxSpillBytes,
+		"DLQ_MAX_BYTES": &cfg.DLQMaxBytes, "DLQ_INDEX_MAX_BYTES": &cfg.DLQIndexMaxBytes,
+	} {
+		if v := os.Getenv(name); v != "" {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return cfg, fmt.Errorf("%s must be an integer", name)
+			}
+			*target = n
+		}
+	}
+	cfg.SpillDir = os.Getenv("SPILL_DIR")
+	cfg.NATSCredentialsFile = os.Getenv("NATS_CREDENTIALS_FILE")
+	cfg.NATSTLSCA = os.Getenv("NATS_TLS_CA")
+	cfg.NATSTLSCert = os.Getenv("NATS_TLS_CERT")
+	cfg.NATSTLSKey = os.Getenv("NATS_TLS_KEY")
+	cfg.DLQStream, cfg.DLQBucket = defaultDLQNames(cfg.StreamName)
+	if v := os.Getenv("DLQ_STREAM_NAME"); v != "" {
+		cfg.DLQStream = v
+	}
+	if v := os.Getenv("DLQ_BUCKET"); v != "" {
+		cfg.DLQBucket = v
+	}
 	return cfg, nil
 }
 

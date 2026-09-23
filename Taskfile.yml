@@ -1,5 +1,12 @@
 version: "3"
 
+silent: true
+
+vars:
+  # Override with COMPOSE="docker compose" task up
+  COMPOSE:
+    sh: echo "${COMPOSE:-podman-compose}"
+
 tasks:
   default:
     desc: List available tasks
@@ -43,9 +50,9 @@ tasks:
       - go test ./...
 
   test:integration:
-    desc: Run Docker-backed integration tests
+    desc: Run container-backed integration tests (needs a Docker-compatible socket)
     cmds:
-      - go test -tags=integration -v -timeout=3m ./tests/integration/
+      - go test -tags=integration -v -timeout=10m ./tests/integration/
 
   bench:
     desc: Run benchmarks
@@ -70,29 +77,29 @@ tasks:
       - |
         DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:5432/postgres}" \
         CDC_SLOT_NAME="${CDC_SLOT_NAME:-better_cdc_slot}" \
-        CDC_PLUGIN="${CDC_PLUGIN:-wal2json}" \
+        CDC_PLUGIN="${CDC_PLUGIN:-pgoutput}" \
         CDC_PUBLICATIONS="${CDC_PUBLICATIONS:-better_cdc_pub}" \
         go run ./cmd/cdc-handler
 
   up:
-    desc: Start local Docker Compose stack
+    desc: Start local compose stack (podman-compose by default)
     cmds:
-      - docker compose up -d
+      - "{{.COMPOSE}} up -d"
 
   down:
-    desc: Stop local Docker Compose stack
+    desc: Stop local compose stack
     cmds:
-      - docker compose down
+      - "{{.COMPOSE}} down"
 
   logs:
-    desc: Follow Docker Compose logs
+    desc: Follow local compose logs
     cmds:
-      - docker compose logs -f
+      - "{{.COMPOSE}} logs -f"
 
   ps:
-    desc: Show Docker Compose service status
+    desc: Show local compose service status
     cmds:
-      - docker compose ps
+      - "{{.COMPOSE}} ps"
 
   load-test:
     desc: Run the E2E load test; pass options after --

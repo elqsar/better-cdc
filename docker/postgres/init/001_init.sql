@@ -52,10 +52,10 @@ DROP PUBLICATION IF EXISTS better_cdc_pub;
 CREATE PUBLICATION better_cdc_pub FOR TABLE public.accounts, public.orders;
 
 -- Logical replication slot used by the Go CDC reader.
--- Using wal2json plugin by default (avoids pglogrepl TupleData.Decode bug).
+-- pgoutput is the default; never replace an existing slot automatically.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'better_cdc_slot') THEN
-        PERFORM pg_create_logical_replication_slot('better_cdc_slot', 'wal2json');
+        PERFORM pg_create_logical_replication_slot('better_cdc_slot', 'pgoutput');
     END IF;
 END$$;

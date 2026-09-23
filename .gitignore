@@ -42,3 +42,7 @@ build/
 # Certificates
 certs/
 report-*.md
+
+# Pilot secrets/configuration
+deploy/pilot.env
+deploy/secrets/

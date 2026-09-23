@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -21,7 +22,28 @@ const (
 )
 
 // WALEvent is the raw event parsed from logical decoding output.
+// RecoveryChange is a versioned, value-independent replay capsule. Data and
+// relation metadata preserve the input even when normalized JSON cannot be built.
+type RecoveryChange struct {
+	Version    int             `json:"version"`
+	Plugin     string          `json:"plugin"`
+	Data       []byte          `json:"data"`
+	Relations  json.RawMessage `json:"relations,omitempty"`
+	WALStart   uint64          `json:"wal_start"`
+	Index      int             `json:"index"`
+	LSN        string          `json:"lsn"`
+	Position   WALPosition     `json:"position"`
+	TxID       uint64          `json:"txid"`
+	CommitTime time.Time       `json:"commit_time"`
+	SeqInTx    uint32          `json:"seq_in_tx"`
+}
+
 type WALEvent struct {
+	Recovery          *RecoveryChange
+	UnavailableBefore []string
+	UnavailableAfter  []string
+	ReleaseBytes      func() `json:"-"`
+
 	Position      WALPosition
 	Timestamp     time.Time
 	Operation     OperationType
@@ -66,6 +88,13 @@ func ReleaseWALEvent(evt *WALEvent) {
 	if evt == nil {
 		return
 	}
+	if evt.ReleaseBytes != nil {
+		evt.ReleaseBytes()
+		evt.ReleaseBytes = nil
+	}
+	evt.Recovery = nil
+	evt.UnavailableBefore = nil
+	evt.UnavailableAfter = nil
 	// Reset scalar fields
 	evt.Position = WALPosition{}
 	evt.Timestamp = time.Time{}
@@ -103,19 +132,21 @@ func ReleaseWALEvent(evt *WALEvent) {
 
 // CDCEvent is the normalized event ready for publication.
 type CDCEvent struct {
-	EventID    string                 `json:"event_id"`
-	EventType  string                 `json:"event_type"`
-	Source     string                 `json:"source"`
-	Timestamp  time.Time              `json:"timestamp"`
-	CommitTime time.Time              `json:"commit_time"`
-	LSN        string                 `json:"lsn"`
-	TxID       uint64                 `json:"txid"`
-	Schema     string                 `json:"schema"`
-	Table      string                 `json:"table"`
-	Operation  string                 `json:"operation"`
-	Before     map[string]interface{} `json:"before,omitempty"`
-	After      map[string]interface{} `json:"after,omitempty"`
-	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	SchemaVersion int                    `json:"schema_version"`
+	SeqInTx       uint32                 `json:"seq_in_tx"`
+	EventID       string                 `json:"event_id"`
+	EventType     string                 `json:"event_type"`
+	Source        string                 `json:"source"`
+	Timestamp     time.Time              `json:"timestamp"`
+	CommitTime    time.Time              `json:"commit_time"`
+	LSN           string                 `json:"lsn"`
+	TxID          uint64                 `json:"txid"`
+	Schema        string                 `json:"schema"`
+	Table         string                 `json:"table"`
+	Operation     string                 `json:"operation"`
+	Before        map[string]interface{} `json:"before,omitempty"`
+	After         map[string]interface{} `json:"after,omitempty"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
 }
 
 var cdcEventPool = sync.Pool{
@@ -137,6 +168,8 @@ func ReleaseCDCEvent(evt *CDCEvent) {
 		return
 	}
 	// Reset all fields
+	evt.SchemaVersion = 0
+	evt.SeqInTx = 0
 	evt.EventID = ""
 	evt.EventType = ""
 	evt.Source = ""
@@ -150,6 +183,9 @@ func ReleaseCDCEvent(evt *CDCEvent) {
 	evt.Before = nil
 	evt.After = nil
 	// Clear and reuse metadata map
+	if evt.Metadata == nil {
+		evt.Metadata = make(map[string]interface{})
+	}
 	for k := range evt.Metadata {
 		delete(evt.Metadata, k)
 	}

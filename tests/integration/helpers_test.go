@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -41,7 +42,11 @@ func randomSlotName() string {
 
 // startPostgres boots a Postgres 17 container with wal2json, logical replication,
 // init SQL, and creates a test-specific replication slot.
-func startPostgres(t *testing.T, plugin string) (connString string, slotName string) {
+func startPostgres(t *testing.T, plugin string) (string, string) {
+	db, slot, _ := startPostgresContainer(t, plugin)
+	return db, slot
+}
+func startPostgresContainer(t *testing.T, plugin string) (connString string, slotName string, pgContainer testcontainers.Container) {
 	t.Helper()
 	ctx := context.Background()
 	root := projectRoot()
@@ -54,7 +59,7 @@ func startPostgres(t *testing.T, plugin string) (connString string, slotName str
 			Context:    dockerfilePath,
 			Dockerfile: "Dockerfile",
 		},
-		ExposedPorts: []string{"5432/tcp"},
+		ExposedPorts: []string{fixedHostPort(t, "5432/tcp")},
 		Env: map[string]string{
 			"POSTGRES_PASSWORD": "postgres",
 			"POSTGRES_DB":       "postgres",
@@ -102,7 +107,7 @@ func startPostgres(t *testing.T, plugin string) (connString string, slotName str
 	slotName = randomSlotName()
 	createSlot(t, connString, slotName, plugin)
 
-	return connString, slotName
+	return connString, slotName, container
 }
 
 func buildConnString(ctx context.Context, container testcontainers.Container) (string, error) {
@@ -149,14 +154,30 @@ func dropSlot(ctx context.Context, connString, slotName string) {
 	))
 }
 
+// fixedHostPort binds containerPort to a free host port chosen up front.
+// Docker assigns a new random host port when a container restarts, which would
+// strand the processes under test on the old address; a fixed binding keeps
+// restart tests valid on both Docker and Podman.
+func fixedHostPort(t *testing.T, containerPort string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve host port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return fmt.Sprintf("%d:%s", port, containerPort)
+}
+
 // startNATS boots a NATS container with JetStream enabled.
-func startNATS(t *testing.T) string {
+func startNATS(t *testing.T) string { url, _ := startNATSContainer(t); return url }
+func startNATSContainer(t *testing.T) (string, testcontainers.Container) {
 	t.Helper()
 	ctx := context.Background()
 
 	req := testcontainers.ContainerRequest{
 		Image:        "nats:2.10-alpine",
-		ExposedPorts: []string{"4222/tcp"},
+		ExposedPorts: []string{fixedHostPort(t, "4222/tcp")},
 		Cmd:          []string{"-js"},
 		WaitingFor:   wait.ForListeningPort("4222/tcp").WithStartupTimeout(30 * time.Second),
 	}
@@ -178,7 +199,7 @@ func startNATS(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("nats port: %v", err)
 	}
-	return fmt.Sprintf("nats://%s:%s", host, port.Port())
+	return fmt.Sprintf("nats://%s:%s", host, port.Port()), container
 }
 
 // execSQL runs SQL statements against Postgres using a standard (non-replication) connection.
@@ -360,7 +381,20 @@ func startEngine(t *testing.T, cfg engineConfig) (context.CancelFunc, <-chan err
 	store := checkpoint.NewSlotStore(cfg.ConnString, cfg.SlotName)
 	ckpt := checkpoint.NewManager(store, 1*time.Second, logger)
 
-	eng := engine.NewEngine(reader, parse, trans, pub, ckpt, "postgres", batchSize, 100*time.Millisecond, 3, false, engine.FailurePolicyCrash, "cdc.dlq", logger)
+	eng := engine.NewEngine(engine.Options{
+		Reader:            reader,
+		Parser:            parse,
+		Transformer:       trans,
+		Publisher:         pub,
+		Checkpointer:      ckpt,
+		Database:          "postgres",
+		BatchSize:         batchSize,
+		BatchTimeout:      100 * time.Millisecond,
+		MaxPublishRetries: 3,
+		FailurePolicy:     engine.FailurePolicyCrash,
+		DLQSubjectPrefix:  "cdc.dlq",
+		Logger:            logger,
+	})
 
 	startPos, err := store.Load(ctx)
 	if err != nil {

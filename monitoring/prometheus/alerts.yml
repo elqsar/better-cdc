@@ -1,0 +1,43 @@
+groups:
+  - name: better-cdc
+    rules:
+      - alert: CDCSlotWALAtRisk
+        expr: cdc_wal_slot_at_risk == 1 or (cdc_wal_safe_bytes >= 0 and cdc_wal_safe_bytes < 1073741824)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "CDC slot is approaching or has lost required WAL"
+      - alert: CDCRetainedWALGrows
+        expr: cdc_wal_retained_bytes > 1073741824 and delta(cdc_wal_retained_bytes[10m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "CDC is retaining more than 1 GiB of growing WAL"
+      - alert: CDCQuarantineNeedsRepair
+        expr: increase(cdc_engine_events_quarantined_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Repair quarantined events and run redrive"
+      - alert: CDCOversizedRecords
+        expr: increase(cdc_pipeline_oversized_records_total[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Records exceed a pipeline byte budget; check memory headroom or raise the budget"
+      - alert: CDCRecoveryStorageNearCapacity
+        expr: cdc_dlq_storage_bytes > 858993459
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Recovery storage exceeds 80% of the default 1 GiB limit; adjust threshold for your configured limit"
+      - alert: CDCReplicationInactive
+        expr: cdc_wal_slot_active == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "No process owns the CDC slot"
+      - alert: CDCReplicationStale
+        expr: time() - cdc_wal_last_receive_seconds > 90 and time() - cdc_wal_last_ack_seconds > 90
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Neither replication traffic nor acknowledged commits have progressed"

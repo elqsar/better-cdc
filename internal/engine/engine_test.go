@@ -140,7 +140,7 @@ func (m *mockBatchPublisher) PublishBatchAsync(ctx context.Context, items []publ
 	return pending, nil
 }
 
-func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publisher.PendingAck, items []publisher.PublishItem, timeout time.Duration) (*publisher.BatchResult, error) {
+func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publisher.PendingAck, _ []publisher.PublishItem, timeout time.Duration) (*publisher.BatchResult, error) {
 	attempt := int(m.waitForAcksCalls.Add(1)) - 1
 
 	result := &publisher.BatchResult{
@@ -156,8 +156,6 @@ func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publish
 		}
 	}
 
-	var lastContiguousIdx = -1
-	var contiguousBroken bool
 	for i, pend := range pending {
 		if failSet[i] {
 			result.Failed++
@@ -166,20 +164,11 @@ func (m *mockBatchPublisher) WaitForAcks(ctx context.Context, pending []*publish
 			if result.FirstError == nil {
 				result.FirstError = m.itemFailureErr()
 			}
-			contiguousBroken = true
 		} else {
 			pend.SetAcked(true)
 			result.Succeeded++
-			if !contiguousBroken {
-				lastContiguousIdx = i
-			}
 		}
 		pend.Close()
-	}
-
-	if lastContiguousIdx >= 0 && len(items) > lastContiguousIdx {
-		pos := items[lastContiguousIdx].Position
-		result.LastSuccessPosition = &pos
 	}
 
 	var err error
@@ -486,11 +475,6 @@ func TestBuildFinalResult(t *testing.T) {
 	if result.FirstError != testErr {
 		t.Errorf("expected test error, got %v", result.FirstError)
 	}
-	// Last successful position should be item 0 (last contiguous success from start)
-	// Item 1 failed, so we cannot checkpoint past it even though item 2 succeeded.
-	if result.LastSuccessPosition == nil || result.LastSuccessPosition.LSN != "0/0" {
-		t.Errorf("expected last success position 0/0 (contiguous prefix), got %v", result.LastSuccessPosition)
-	}
 }
 
 func TestFlushWithBatchPublish_PartialFailureDoesNotCheckpoint(t *testing.T) {
@@ -509,9 +493,6 @@ func TestFlushWithBatchPublish_PartialFailureDoesNotCheckpoint(t *testing.T) {
 		batchTimeout:      time.Second,
 		maxPublishRetries: 0,
 		eventsProcessed:   metrics.NewRateCounter("events_per_second"),
-		batchesPublished:  metrics.NewCounter("batches_published"),
-		batchLatency:      metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
-		transformLatency:  metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
 		promMetrics:       getTestMetrics(),
 	}
 
@@ -576,9 +557,6 @@ func TestFlushWithBatchPublish_FullSuccessCheckpointsCommit(t *testing.T) {
 		batchTimeout:      time.Second,
 		maxPublishRetries: 0,
 		eventsProcessed:   metrics.NewRateCounter("events_per_second"),
-		batchesPublished:  metrics.NewCounter("batches_published"),
-		batchLatency:      metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
-		transformLatency:  metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
 		promMetrics:       getTestMetrics(),
 	}
 
@@ -778,19 +756,16 @@ func TestRunBatched_GracefulShutdownUsesShutdownContextForFinalFlush(t *testing.
 	ckpt := checkpoint.NewManager(store, time.Hour, zap.NewNop())
 
 	e := &Engine{
-		reader:           reader,
-		transformer:      &mockTransformer{},
-		publisher:        pub,
-		checkpointer:     ckpt,
-		database:         "postgres",
-		logger:           zap.NewNop(),
-		batchSize:        100,
-		batchTimeout:     time.Hour,
-		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
-		batchesPublished: metrics.NewCounter("batches_published"),
-		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
-		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
-		promMetrics:      getTestMetrics(),
+		reader:          reader,
+		transformer:     &mockTransformer{},
+		publisher:       pub,
+		checkpointer:    ckpt,
+		database:        "postgres",
+		logger:          zap.NewNop(),
+		batchSize:       100,
+		batchTimeout:    time.Hour,
+		eventsProcessed: metrics.NewRateCounter("events_per_second"),
+		promMetrics:     getTestMetrics(),
 	}
 
 	stream := make(chan *model.WALEvent, 1)
@@ -834,16 +809,13 @@ func TestRunBatched_GracefulShutdownFlushesPendingCheckpoint(t *testing.T) {
 	ckpt.Init(model.WALPosition{LSN: "0/05"}, time.Now())
 
 	e := &Engine{
-		reader:           reader,
-		checkpointer:     ckpt,
-		logger:           zap.NewNop(),
-		batchSize:        100,
-		batchTimeout:     time.Hour,
-		eventsProcessed:  metrics.NewRateCounter("events_per_second"),
-		batchesPublished: metrics.NewCounter("batches_published"),
-		batchLatency:     metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000}),
-		transformLatency: metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000}),
-		promMetrics:      getTestMetrics(),
+		reader:          reader,
+		checkpointer:    ckpt,
+		logger:          zap.NewNop(),
+		batchSize:       100,
+		batchTimeout:    time.Hour,
+		eventsProcessed: metrics.NewRateCounter("events_per_second"),
+		promMetrics:     getTestMetrics(),
 	}
 
 	stream := make(chan *model.WALEvent, 1)
@@ -918,4 +890,45 @@ func TestCheckpointPositionForCommit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Idle timeouts must not permanently disable later timer-driven flushes.
+func TestRunBatchedTimerRearmsAfterIdle(t *testing.T) {
+	pub := &notifyingPublisher{published: make(chan struct{}, 2)}
+	e := NewEngine(Options{
+		Transformer:   &mockTransformer{},
+		Publisher:     pub,
+		Database:      "db",
+		BatchSize:     100,
+		BatchTimeout:  15 * time.Millisecond,
+		FailurePolicy: FailurePolicyCrash,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input := make(chan *model.WALEvent)
+	done := make(chan error, 1)
+	go func() { done <- e.runBatched(ctx, input) }()
+	for i := 0; i < 2; i++ {
+		time.Sleep(50 * time.Millisecond)
+		input <- &model.WALEvent{Operation: model.OperationInsert}
+		select {
+		case <-pub.published:
+		case <-time.After(time.Second):
+			t.Fatal("timer failed to flush after idle")
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type notifyingPublisher struct {
+	shutdownPublisher
+	published chan struct{}
+}
+
+func (p *notifyingPublisher) PublishWithRetries(context.Context, string, []byte, int, string) error {
+	p.published <- struct{}{}
+	return nil
 }

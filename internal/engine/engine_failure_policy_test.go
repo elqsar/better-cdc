@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -96,13 +98,17 @@ func TestPublishWithRetry_PermanentErrorDLQPolicyQuarantinesAndContinues(t *test
 		t.Errorf("expected dedup msg id dlq-1, got %q", mock.publishMsgIDs[0])
 	}
 	record := string(mock.publishPayloads[0])
-	for _, want := range []string{`"event_id":"1"`, `"lsn":"0/1"`, `"txid":7`, `"table":"accounts"`, "maximum payload exceeded", `{\"big\":\"payload\"}`} {
+	for _, want := range []string{`"event_id":"1"`, `"lsn":"0/1"`, `"txid":7`, `"table":"accounts"`, "maximum payload exceeded"} {
 		if !strings.Contains(record, want) {
 			t.Errorf("dead-letter record missing %q: %s", want, record)
 		}
 	}
-	if result.LastSuccessPosition == nil || result.LastSuccessPosition.LSN != "0/2" {
-		t.Errorf("expected last success position 0/2, got %v", result.LastSuccessPosition)
+	var captured publisher.DeadLetterRecord
+	if err := json.Unmarshal(mock.publishPayloads[0], &captured); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(captured.Payload, poisonItems()[1].Data) {
+		t.Fatal("quarantine payload changed")
 	}
 }
 
@@ -193,9 +199,6 @@ func TestFlushWithBatchPublish_PermanentFailureDLQAdvancesCheckpoint(t *testing.
 	e.transformer = &mockTransformer{}
 	e.checkpointer = ckpt
 	e.eventsProcessed = metrics.NewRateCounter("events_per_second")
-	e.batchesPublished = metrics.NewCounter("batches_published")
-	e.batchLatency = metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000})
-	e.transformLatency = metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000})
 
 	commitPos := model.WALPosition{LSN: "0/30"}
 	batch := []*model.WALEvent{
@@ -246,13 +249,11 @@ func TestFlushWithBatchPublish_TransformFailureQuarantinedUnderDLQ(t *testing.T)
 	e.transformer = failingTransformer{}
 	e.checkpointer = ckpt
 	e.eventsProcessed = metrics.NewRateCounter("events_per_second")
-	e.batchesPublished = metrics.NewCounter("batches_published")
-	e.batchLatency = metrics.NewHistogram("batch_latency_us", []uint64{100, 500, 1000})
-	e.transformLatency = metrics.NewHistogram("transform_latency_ns", []uint64{100, 500, 1000})
 
 	commitPos := model.WALPosition{LSN: "0/40"}
 	batch := []*model.WALEvent{
 		{
+			Recovery:  &model.RecoveryChange{Version: 1, Plugin: "wal2json", Data: []byte(`{"action":"I","schema":"public","table":"accounts","columns":[{"name":"id","value":1}]}`)},
 			Operation: model.OperationInsert,
 			Schema:    "public",
 			Table:     "accounts",
@@ -287,8 +288,33 @@ func TestFlushWithBatchPublish_TransformFailureQuarantinedUnderDLQ(t *testing.T)
 	crashEngine := newFailurePolicyEngine(newMockBatchPublisher(), FailurePolicyCrash)
 	crashEngine.transformer = failingTransformer{}
 	crashEngine.checkpointer = ckpt
-	crashEngine.transformLatency = metrics.NewHistogram("transform_latency_ns", []uint64{100})
 	if err := crashEngine.flushWithBatchPublish(context.Background(), batch[:1], batch[0], newMockBatchPublisher()); err == nil {
 		t.Fatal("expected transform failure to be fatal under crash policy")
+	}
+}
+
+func (m *mockBatchPublisher) Quarantine(ctx context.Context, prefix string, rec *publisher.DeadLetterRecord) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return m.Publish(ctx, publisher.DeadLetterSubject(prefix, rec.Database, rec.Schema, rec.Table), data, "dlq-"+rec.EventID)
+}
+
+func TestPrepareFailure_ReportsQuarantineError(t *testing.T) {
+	e := newFailurePolicyEngine(newMockBatchPublisher(), FailurePolicyDLQ)
+	cause := errors.New("transform event: unsupported column type")
+
+	// No recovery capsule, so the durable quarantine write itself is rejected.
+	evt := &model.WALEvent{Operation: model.OperationInsert, Schema: "public", Table: "accounts", LSN: "0/35", TxID: 2}
+	skip, err := e.prepareFailure(context.Background(), evt, cause)
+	if skip {
+		t.Fatal("event reported as quarantined")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("original cause lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), "quarantine failed: event has no complete recovery representation") {
+		t.Fatalf("quarantine failure hidden: %v", err)
 	}
 }

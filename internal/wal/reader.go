@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"better-cdc/internal/budget"
 	"better-cdc/internal/metrics"
 	"better-cdc/internal/model"
 	"better-cdc/internal/parser"
@@ -79,11 +80,13 @@ type Reader interface {
 
 // SlotConfig captures replication slot settings to align with Postgres 15 logical decoding.
 type SlotConfig struct {
-	SlotName     string
-	Plugin       string // pgoutput or wal2json
-	Publications []string
-	DatabaseURL  string
-	TableFilter  map[string]struct{} // schema.table allowlist; empty means all
+	FeedbackInterval time.Duration
+	MaxBufferBytes   int64
+	SlotName         string
+	Plugin           string // pgoutput or wal2json
+	Publications     []string
+	DatabaseURL      string
+	TableFilter      map[string]struct{} // schema.table allowlist; empty means all
 }
 
 // PGReader streams logical replication; supports wal2json (today) and leaves a hook for pgoutput.
@@ -95,7 +98,12 @@ type PGReader struct {
 	bufferSize  int // Output channel buffer size for throughput optimization
 	promMetrics *metrics.Metrics
 
-	ackedLSN atomic.Uint64
+	ackedLSN     atomic.Uint64
+	active       atomic.Bool
+	receivedLSN  atomic.Uint64
+	lastReceived atomic.Int64
+	lastAcked    atomic.Int64
+	rawBudget    *budget.Budget
 
 	// After ReadWAL spawns the replication goroutine, that goroutine is the
 	// sole owner of conn: it reconnects, sends the final standby status, and
@@ -112,7 +120,12 @@ func NewPGReader(slot SlotConfig, bufferSize int, logger *zap.Logger) *PGReader 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	limit := slot.MaxBufferBytes
+	if limit <= 0 {
+		limit = 64 << 20
+	}
 	return &PGReader{
+		rawBudget:   budget.New(limit),
 		slot:        slot,
 		errs:        metrics.NewCounter("replication_errors"),
 		logger:      logger,
@@ -154,9 +167,11 @@ func (r *PGReader) ReadWAL(ctx context.Context, position model.WALPosition) (<-c
 
 	startLSN := pglogrepl.LSN(0)
 	if position.LSN != "" {
-		if lsn, err := pglogrepl.ParseLSN(position.LSN); err == nil {
-			startLSN = lsn
+		lsn, err := pglogrepl.ParseLSN(position.LSN)
+		if err != nil {
+			return nil, fmt.Errorf("invalid start LSN: %w", err)
 		}
+		startLSN = lsn
 	}
 	r.setAckedLSN(startLSN)
 
@@ -222,9 +237,9 @@ func (r *PGReader) Stop(ctx context.Context) error {
 
 func (r *PGReader) replicationHandlers() (replicationStartFunc, replicationLoopFunc, string, error) {
 	switch r.slot.Plugin {
-	case "", "wal2json":
+	case "wal2json":
 		return r.startWal2JSON, r.loopWal2JSON, "wal2json", nil
-	case "pgoutput":
+	case "", "pgoutput":
 		return r.startPGOutput, r.loopPGOutput, "pgoutput", nil
 	}
 	return nil, nil, "", fmt.Errorf("unsupported plugin: %s", r.slot.Plugin)
@@ -232,6 +247,7 @@ func (r *PGReader) replicationHandlers() (replicationStartFunc, replicationLoopF
 
 func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LSN, plugin string, startFn replicationStartFunc, loopFn replicationLoopFunc, out chan<- *parser.RawMessage) {
 	defer close(out)
+	defer r.active.Store(false)
 	defer r.cleanupConnection()
 
 	resumeLSN := startLSN
@@ -270,8 +286,14 @@ func (r *PGReader) runReplicationLoop(ctx context.Context, startLSN pglogrepl.LS
 			continue
 		}
 		backoff = time.Second
-
+		select {
+		case <-ctx.Done():
+			return
+		case out <- &parser.RawMessage{Reset: true}:
+		}
+		r.active.Store(true)
 		lastLSN, err := loopFn(ctx, resumeLSN, out)
+		r.active.Store(false)
 		if ctx.Err() != nil {
 			return
 		}
@@ -309,87 +331,7 @@ func (r *PGReader) startWal2JSON(ctx context.Context, startLSN pglogrepl.LSN) er
 }
 
 func (r *PGReader) loopWal2JSON(ctx context.Context, startLSN pglogrepl.LSN, out chan<- *parser.RawMessage) (pglogrepl.LSN, error) {
-	standbyTimeout := r.standbyTimeout()
-	standbyDeadline := time.Now().Add(standbyTimeout)
-
-	for {
-		if ctx.Err() != nil {
-			return r.currentAckedLSN(), ctx.Err()
-		}
-		msgCtx, cancel := context.WithDeadline(ctx, standbyDeadline)
-		msg, err := receiveReplicationMessage(msgCtx, r.conn)
-		cancel()
-		if err != nil {
-			if isReplicationReceiveTimeout(err) {
-				if ctx.Err() != nil {
-					return r.currentAckedLSN(), ctx.Err()
-				}
-				standbyDeadline = r.handleStandbyTimeout(ctx, standbyTimeout)
-				continue
-			}
-			if ctx.Err() != nil {
-				return r.currentAckedLSN(), ctx.Err()
-			}
-			return r.currentAckedLSN(), fmt.Errorf("receive replication message: %w", err)
-		}
-
-		switch m := msg.(type) {
-		case *pgproto3.ErrorResponse:
-			return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("replication error response: %s", m.Message)}
-		case *pgproto3.CopyData:
-			if len(m.Data) == 0 {
-				r.logger.Info("replication copydata empty payload")
-				continue
-			}
-			switch m.Data[0] {
-			case pglogrepl.XLogDataByteID:
-				xld, err := pglogrepl.ParseXLogData(m.Data[1:])
-				if err != nil {
-					r.errs.Inc()
-					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("parse xlog data failed", zap.Error(err))
-					continue
-				}
-				// Copy data to avoid race condition - pglogrepl reuses the buffer
-				dataCopy := make([]byte, len(xld.WALData))
-				copy(dataCopy, xld.WALData)
-				raw := &parser.RawMessage{
-					Plugin:   parser.PluginWal2JSON,
-					WALStart: xld.WALStart,
-					Data:     dataCopy,
-				}
-				select {
-				case <-ctx.Done():
-					return r.currentAckedLSN(), ctx.Err()
-				case out <- raw:
-				}
-				standbyDeadline = time.Now().Add(standbyTimeout)
-				if err := r.sendStandbyStatus(ctx, false); err != nil {
-					r.errs.Inc()
-					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("send standby status failed", zap.Error(err))
-				}
-			case pglogrepl.PrimaryKeepaliveMessageByteID:
-				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(m.Data[1:])
-				if err != nil {
-					r.errs.Inc()
-					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("parse keepalive failed", zap.Error(err))
-					continue
-				}
-				standbyDeadline = time.Now().Add(standbyTimeout)
-				if err := r.sendStandbyStatus(ctx, pkm.ReplyRequested); err != nil {
-					r.errs.Inc()
-					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("send standby status failed", zap.Error(err))
-				}
-			default:
-				r.logger.Warn("unexpected replication copydata", zap.Uint8("id", m.Data[0]))
-			}
-		default:
-			r.logger.Warn("unexpected replication message", zap.String("type", fmt.Sprintf("%T", m)))
-		}
-	}
+	return r.loopMessages(ctx, parser.PluginWal2JSON, out)
 }
 
 func (r *PGReader) startPGOutput(ctx context.Context, startLSN pglogrepl.LSN) error {
@@ -406,7 +348,14 @@ func (r *PGReader) startPGOutput(ctx context.Context, startLSN pglogrepl.LSN) er
 }
 
 func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out chan<- *parser.RawMessage) (pglogrepl.LSN, error) {
+	return r.loopMessages(ctx, parser.PluginPGOutput, out)
+}
+
+func (r *PGReader) loopMessages(ctx context.Context, plugin parser.Plugin, out chan<- *parser.RawMessage) (pglogrepl.LSN, error) {
 	standbyTimeout := r.standbyTimeout()
+	if r.slot.FeedbackInterval > 0 && r.slot.FeedbackInterval < standbyTimeout {
+		standbyTimeout = r.slot.FeedbackInterval
+	}
 	standbyDeadline := time.Now().Add(standbyTimeout)
 
 	for {
@@ -432,10 +381,10 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 
 		switch m := msg.(type) {
 		case *pgproto3.ErrorResponse:
-			return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("replication error response: %s", m.Message)}
+			return r.currentAckedLSN(), pgconn.ErrorResponseToPgError(m)
 		case *pgproto3.CopyData:
 			if len(m.Data) == 0 {
-				continue
+				return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("empty replication frame")}
 			}
 			switch m.Data[0] {
 			case pglogrepl.XLogDataByteID:
@@ -443,47 +392,71 @@ func (r *PGReader) loopPGOutput(ctx context.Context, startLSN pglogrepl.LSN, out
 				if err != nil {
 					r.errs.Inc()
 					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("parse xlog data failed", zap.Error(err))
-					continue
+					return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("parse xlog data: %w", err)}
+				}
+				r.receivedLSN.Store(uint64(xld.WALStart))
+				r.lastReceived.Store(time.Now().Unix())
+				n := int64(len(xld.WALData)) + 128
+				if r.rawBudget.Oversized(n) {
+					metrics.OversizedRecords.Inc()
+					r.logger.Warn("WAL message exceeds RAW_MESSAGE_BUFFER_BYTES; admitting it alone",
+						zap.Int64("accounted_bytes", n), zap.Int64("budget_bytes", r.rawBudget.Limit()),
+						zap.String("wal_start", xld.WALStart.String()))
+				}
+				release, err := r.rawBudget.Acquire(ctx, n)
+				if err != nil {
+					return r.currentAckedLSN(), fatalReplicationError{err}
 				}
 				// Copy data to avoid race condition - pglogrepl reuses the buffer
 				dataCopy := make([]byte, len(xld.WALData))
 				copy(dataCopy, xld.WALData)
 				raw := &parser.RawMessage{
-					Plugin:   parser.PluginPGOutput,
-					WALStart: xld.WALStart,
-					Data:     dataCopy,
+					Plugin:       plugin,
+					ReleaseBytes: release,
+					WALStart:     xld.WALStart,
+					Data:         dataCopy,
 				}
 				select {
 				case <-ctx.Done():
+					release()
 					return r.currentAckedLSN(), ctx.Err()
 				case out <- raw:
 				}
-				standbyDeadline = time.Now().Add(standbyTimeout)
-				if err := r.sendStandbyStatus(ctx, false); err != nil {
-					r.errs.Inc()
-					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("send standby status failed", zap.Error(err))
+				if time.Now().After(standbyDeadline) {
+					standbyDeadline = time.Now().Add(standbyTimeout)
+					if err := r.sendStandbyStatus(ctx, false); err != nil {
+						r.errs.Inc()
+						r.promMetrics.ReplicationErrors.Inc()
+						r.logger.Warn("send standby status failed", zap.Error(err))
+					}
 				}
 			case pglogrepl.PrimaryKeepaliveMessageByteID:
 				pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(m.Data[1:])
 				if err != nil {
 					r.errs.Inc()
 					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("parse keepalive failed", zap.Error(err))
-					continue
+					return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("parse keepalive: %w", err)}
 				}
-				standbyDeadline = time.Now().Add(standbyTimeout)
-				if err := r.sendStandbyStatus(ctx, pkm.ReplyRequested); err != nil {
-					r.errs.Inc()
-					r.promMetrics.ReplicationErrors.Inc()
-					r.logger.Warn("send standby status failed", zap.Error(err))
+				r.lastReceived.Store(time.Now().Unix())
+				if pkm.ReplyRequested || time.Now().After(standbyDeadline) {
+					standbyDeadline = time.Now().Add(standbyTimeout)
+					if err := r.sendStandbyStatus(ctx, pkm.ReplyRequested); err != nil {
+						r.errs.Inc()
+						r.promMetrics.ReplicationErrors.Inc()
+						r.logger.Warn("send standby status failed", zap.Error(err))
+					}
 				}
 			default:
-				r.logger.Warn("unexpected replication copydata", zap.Uint8("id", m.Data[0]))
+				return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("unexpected replication frame %q", m.Data[0])}
 			}
+		case *pgproto3.CommandComplete, *pgproto3.CopyDone, *pgproto3.ReadyForQuery:
+			// PostgreSQL may finish CopyBoth cleanly during shutdown. Replay from
+			// the acknowledged commit on a new session, never from received WAL.
+			return r.currentAckedLSN(), fmt.Errorf("replication session completed")
+		case *pgproto3.NoticeResponse:
+		// Notices contain no change data.
 		default:
-			r.logger.Warn("unexpected replication message", zap.String("type", fmt.Sprintf("%T", m)))
+			return r.currentAckedLSN(), fatalReplicationError{fmt.Errorf("unexpected replication message %T", m)}
 		}
 	}
 }
@@ -564,7 +537,9 @@ func isFatalPgError(err *pgconn.PgError) bool {
 	}
 	switch err.Code {
 	case "42501", // insufficient privilege
-		"42704": // undefined object (e.g., slot missing)
+		"42704", // undefined object (e.g., slot missing)
+		"55000", // required WAL removed / invalid slot state
+		"22023": // invalid replication configuration
 		return true
 	default:
 		return false
@@ -605,7 +580,7 @@ func (r *PGReader) sendStandbyStatus(ctx context.Context, requestReply bool) err
 }
 
 func joinPublications(pubs []string) string {
-	return strings.Join(pubs, ",")
+	return strings.ReplaceAll(strings.Join(pubs, ","), "'", "''")
 }
 
 func (r *PGReader) SetAckedPosition(pos model.WALPosition) error {
@@ -631,6 +606,7 @@ func (r *PGReader) setAckedLSN(lsn pglogrepl.LSN) {
 			return
 		}
 		if r.ackedLSN.CompareAndSwap(uint64(current), uint64(lsn)) {
+			r.lastAcked.Store(time.Now().Unix())
 			return
 		}
 	}
@@ -649,4 +625,21 @@ func (r *PGReader) Err() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.fatalErr
+}
+
+// Ready reflects this instance's streaming session, not merely database reachability.
+func (r *PGReader) Ready(context.Context) error {
+	if err := r.Err(); err != nil {
+		return err
+	}
+	if last := max(r.lastReceived.Load(), r.lastAcked.Load()); last > 0 && time.Now().Unix()-last > 90 {
+		return fmt.Errorf("replication progress is stale")
+	}
+	if !r.active.Load() {
+		return fmt.Errorf("replication session is not active")
+	}
+	return nil
+}
+func (r *PGReader) Progress() (uint64, uint64, int64, int64) {
+	return r.receivedLSN.Load(), r.ackedLSN.Load(), r.lastReceived.Load(), r.lastAcked.Load()
 }
