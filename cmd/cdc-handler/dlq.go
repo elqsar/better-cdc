@@ -18,7 +18,7 @@ import (
 
 func runDLQ(ctx context.Context, cfg config.Config, logger *zap.Logger, args []string, out io.Writer) error {
 	if len(args) == 0 || (args[0] != "list" && args[0] != "inspect" && args[0] != "redrive") {
-		return fmt.Errorf("usage: cdc-handler dlq list | inspect <event-id> | redrive [--skip <event-id>]...")
+		return fmt.Errorf("usage: cdc-handler dlq list | inspect <event-id> | redrive [--skip <event-id>] (repeatable)")
 	}
 	cfg.PublishFailurePolicy = "dlq"
 	pub, err := buildPublisher(cfg, logger)
@@ -126,7 +126,7 @@ func parseRedriveSkips(args []string) (map[string]bool, error) {
 	skip := make(map[string]bool)
 	for i := 0; i < len(args); i++ {
 		if args[i] != "--skip" || i+1 >= len(args) || args[i+1] == "" {
-			return nil, fmt.Errorf("usage: dlq redrive [--skip <event-id>]...")
+			return nil, fmt.Errorf("usage: dlq redrive [--skip <event-id>] (repeatable)")
 		}
 		skip[args[i+1]] = true
 		i++
